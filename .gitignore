@@ -1,0 +1,9 @@
+node_modules/
+.expo/
+dist/
+*.log
+ledger.json
+.env
+*.lnk
+logo_b64.txt
+preview.html
