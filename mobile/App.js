@@ -1,300 +1,278 @@
 import React, { useState, useEffect, useRef } from 'react';
 import {
   View, Text, TextInput, Alert, StyleSheet, ScrollView,
-  SafeAreaView, TouchableOpacity, Share, Image, AppState
+  TouchableOpacity, Share, Image, AppState, SafeAreaView,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import nacl from 'tweetnacl';
+import { BACKEND_URL, BASE_PENALTY, DISCONNECT_GRACE_MS, RESERVE_ADDRESS } from './config';
 
-import {
-  BACKEND_URL, BASE_PENALTY, DISCONNECT_GRACE_MS, RESERVE_ADDRESS
-} from './config';
-
-// ── Keypair helpers ────────────────────────────────────────────────────────
-const uint8ToHex = (arr) =>
-  Array.from(arr).map(b => b.toString(16).padStart(2, '0')).join('');
-
-const generateKeypair = () => {
-  const kp = nacl.sign.keyPair();
-  // Address = "M_" + first 32 hex chars of public key (readable, unique)
-  const address = 'M_' + uint8ToHex(kp.publicKey).substring(0, 32).toUpperCase();
-  return {
-    address,
-    publicKey: uint8ToHex(kp.publicKey),
-    secretKey: uint8ToHex(kp.secretKey),
-  };
+// ── Wallet ─────────────────────────────────────────────────────────────────
+const createAddress = () => {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  let id = 'M_';
+  for (let i = 0; i < 32; i++) id += chars[Math.floor(Math.random() * chars.length)];
+  return id;
 };
 
-const formatMoney = (num) =>
-  Number(num).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+// ── Faucet reward formula ───────────────────────────────────────────────────
+// First 1,000,000 users → 1,000,000 MONEY each (everyone a millionaire)
+// After that → decays 20% per additional million users
+const calcReward = (count) => {
+  const tiers = Math.floor(count / 1_000_000);
+  let r = 1_000_000;
+  for (let i = 0; i < tiers; i++) r *= 0.8;
+  return Math.max(Math.floor(r), 1);
+};
 
+const fmt = (n) =>
+  Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+// ── App ────────────────────────────────────────────────────────────────────
 export default function App() {
-  const [address, setAddress]           = useState('');
-  const [balance, setBalance]           = useState(0);
-  const [recipient, setRecipient]       = useState('');
-  const [amount, setAmount]             = useState('');
-  const [userCount]                     = useState(1_240_000);
-  const [allTransactions, setAllTransactions] = useState([]);
-  const [claimed, setClaimed]           = useState(false);
-  const [penaltyWarning, setPenaltyWarning] = useState(false);
+  const [address,  setAddress]  = useState('');
+  const [balance,  setBalance]  = useState(0);
+  const [userCount, setUserCount] = useState(0);
+  const [txs,      setTxs]      = useState([]);
+  const [claimed,  setClaimed]  = useState(false);
+  const [recipient, setRecipient] = useState('');
+  const [amount,   setAmount]   = useState('');
 
-  const backgroundTimer = useRef(null);
-  const appState        = useRef(AppState.currentState);
-  const addressRef      = useRef(''); // stable ref for AppState callbacks
+  const addrRef    = useRef('');
+  const bgTimer    = useRef(null);
+  const appStateRef = useRef(AppState.currentState);
 
-  // ── Load or create real keypair ────────────────────────────────────────
+  // ── Load or create wallet ─────────────────────────────────────────────
   useEffect(() => {
-    const init = async () => {
+    (async () => {
       try {
-        let stored = await AsyncStorage.getItem('wallet_address');
-        if (!stored) {
-          const kp = generateKeypair();
-          await AsyncStorage.multiSet([
-            ['wallet_address', kp.address],
-            ['wallet_pubkey',  kp.publicKey],
-            ['wallet_seckey',  kp.secretKey],
-          ]);
-          stored = kp.address;
+        let addr = await AsyncStorage.getItem('wallet_v3');
+        if (!addr) {
+          addr = createAddress();
+          await AsyncStorage.setItem('wallet_v3', addr);
         }
-        setAddress(stored);
-        addressRef.current = stored;
+        setAddress(addr);
+        addrRef.current = addr;
       } catch {
-        const kp = generateKeypair();
-        setAddress(kp.address);
-        addressRef.current = kp.address;
+        // AsyncStorage unavailable — use session-only address
+        const addr = createAddress();
+        setAddress(addr);
+        addrRef.current = addr;
       }
-    };
-    init();
+    })();
   }, []);
 
-  // ── Load faucet-claimed flag ───────────────────────────────────────────
+  // ── Load claimed flag ─────────────────────────────────────────────────
   useEffect(() => {
-    AsyncStorage.getItem('faucet_claimed').then(v => { if (v === 'true') setClaimed(true); });
+    AsyncStorage.getItem('claimed_v3')
+      .then(v => { if (v === '1') setClaimed(true); })
+      .catch(() => {});
   }, []);
 
-  // ── Sync ledger & balance ──────────────────────────────────────────────
-  const loadLedger = async () => {
-    const addr = addressRef.current;
+  // ── Sync ledger + user count ──────────────────────────────────────────
+  const sync = async () => {
+    const addr = addrRef.current;
     if (!addr) return;
     try {
-      const res  = await fetch(`${BACKEND_URL}/ledger`);
-      const data = await res.json();
-      setAllTransactions(data);
-      let bal = 0;
-      data.forEach(tx => {
-        if (tx.to   === addr) bal += tx.amount;
-        if (tx.from === addr) bal -= tx.amount;
-      });
+      const [lr, ur] = await Promise.all([
+        fetch(`${BACKEND_URL}/ledger`),
+        fetch(`${BACKEND_URL}/usercount`),
+      ]);
+      const ledger = await lr.json();
+      const { count } = await ur.json();
+
+      setTxs(ledger);
+      setUserCount(count);
+
+      const bal = ledger.reduce((b, t) => {
+        if (t.to   === addr) return b + t.amount;
+        if (t.from === addr) return b - t.amount;
+        return b;
+      }, 0);
       setBalance(Math.max(0, parseFloat(bal.toFixed(2))));
     } catch {}
   };
 
   useEffect(() => {
     if (!address) return;
-    addressRef.current = address;
-    loadLedger();
-    const iv = setInterval(loadLedger, 3000);
+    sync();
+    const iv = setInterval(sync, 3000);
     return () => clearInterval(iv);
   }, [address]);
 
-  // ── Disconnect penalty ─────────────────────────────────────────────────
-  const applyDisconnectPenalty = async () => {
+  // ── Disconnect penalty ────────────────────────────────────────────────
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', next => {
+      if (appStateRef.current === 'active' && next === 'background') {
+        bgTimer.current = setTimeout(applyPenalty, DISCONNECT_GRACE_MS);
+      }
+      if (next === 'active') clearTimeout(bgTimer.current);
+      appStateRef.current = next;
+    });
+    return () => sub.remove();
+  }, []);
+
+  const applyPenalty = async () => {
     try {
-      const penalty = BASE_PENALTY * 2;
       await fetch(`${BACKEND_URL}/transaction`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          from: addressRef.current,
-          to: RESERVE_ADDRESS,
-          amount: penalty,
-          reason: 'disconnect_penalty',
+          from: addrRef.current, to: RESERVE_ADDRESS,
+          amount: BASE_PENALTY * 2, reason: 'disconnect_penalty',
         }),
       });
     } catch {}
   };
 
-  useEffect(() => {
-    const sub = AppState.addEventListener('change', nextState => {
-      if (appState.current === 'active' && nextState === 'background') {
-        backgroundTimer.current = setTimeout(() => {
-          setPenaltyWarning(true);
-          applyDisconnectPenalty();
-        }, DISCONNECT_GRACE_MS);
-      }
-      if (nextState === 'active') {
-        clearTimeout(backgroundTimer.current);
-        setPenaltyWarning(false);
-      }
-      appState.current = nextState;
-    });
-    return () => sub.remove();
-  }, []);
-
-  // ── Faucet ─────────────────────────────────────────────────────────────
-  const getFaucetReward = () => {
-    const millions = Math.floor(userCount / 1_000_000);
-    let reward = 1_000_000;
-    for (let i = 0; i < millions; i++) reward *= 0.8;
-    return Math.max(Math.floor(reward), 1);
-  };
-
-  const claimFaucet = async () => {
-    if (claimed) return Alert.alert('Already Claimed', 'One faucet per wallet.');
-    const reward = getFaucetReward();
+  // ── Claim faucet ──────────────────────────────────────────────────────
+  const claim = async () => {
+    if (!address) return Alert.alert('One moment', 'Wallet is still loading…');
+    if (claimed) return;
+    const reward = calcReward(userCount);
     try {
-      await fetch(`${BACKEND_URL}/transaction`, {
+      const res  = await fetch(`${BACKEND_URL}/transaction`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ from: 'FAUCET', to: address, amount: reward }),
       });
-      await AsyncStorage.setItem('faucet_claimed', 'true');
-      setClaimed(true);
-      Alert.alert('🎉 YOU ARE A MILLIONAIRE!', `${formatMoney(reward)} MONEY\nWelcome to the Swarm.`);
-    } catch {
-      Alert.alert('Error', 'Backend not reachable. Is server.js running?');
+      const data = await res.json();
+      if (data.success) {
+        await AsyncStorage.setItem('claimed_v3', '1').catch(() => {});
+        setClaimed(true);
+        Alert.alert('🎉 YOU ARE A MILLIONAIRE!', `${fmt(reward)} MONEY\nWelcome to the Swarm.`);
+      } else {
+        Alert.alert('Claim failed', data.error || 'Unknown error');
+      }
+    } catch (e) {
+      Alert.alert('Connection error', e.message);
     }
   };
 
-  // ── Send ───────────────────────────────────────────────────────────────
-  const sendMoney = async () => {
-    if (!recipient || !amount) return Alert.alert('Error', 'Fill all fields');
+  // ── Send ──────────────────────────────────────────────────────────────
+  const send = async () => {
+    if (!recipient || !amount) return Alert.alert('Missing fields', 'Enter recipient and amount');
     const amt = parseFloat(amount);
-    if (isNaN(amt) || amt <= 0) return Alert.alert('Error', 'Invalid amount');
-    if (amt > balance) return Alert.alert('Insufficient Balance');
+    if (isNaN(amt) || amt <= 0) return Alert.alert('Invalid', 'Amount must be positive');
+    if (amt > balance) return Alert.alert('Insufficient balance');
     try {
       await fetch(`${BACKEND_URL}/transaction`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ from: address, to: recipient, amount: amt }),
       });
-      Alert.alert('✅ Sent', `${formatMoney(amt)} MONEY sent`);
       setRecipient('');
       setAmount('');
-    } catch {
-      Alert.alert('Error', 'Backend not reachable. Is server.js running?');
+      Alert.alert('✅ Sent', `${fmt(amt)} MONEY sent`);
+    } catch (e) {
+      Alert.alert('Connection error', e.message);
     }
   };
 
-  // ── Share / Invite ─────────────────────────────────────────────────────
-  const inviteFriends = async () => {
-    try {
-      await Share.share({
-        message:
-          `I just joined the Swarm and became a MILLIONAIRE.\n` +
-          `No banks. No CEOs. Just people and phones.\n\n` +
-          `My address: ${address}\n\n` +
-          `Money. For Everyone. Forever.`,
-        title: 'MONEY — Proof of Swarm',
-      });
-    } catch {}
-  };
+  // ── Invite ────────────────────────────────────────────────────────────
+  const invite = () =>
+    Share.share({
+      message:
+        `I just joined the Swarm.\n` +
+        `No banks. No CEOs. Just people and phones.\n\n` +
+        `My address: ${address}\n\n` +
+        `Money. For Everyone. Forever.`,
+    }).catch(() => {});
 
-  const currentReward = getFaucetReward();
+  const reward = calcReward(userCount);
+  const isMillion = reward === 1_000_000;
 
   return (
-    <SafeAreaView style={styles.container}>
-      <ScrollView>
+    <SafeAreaView style={s.root}>
+      <ScrollView contentContainerStyle={s.scroll}>
 
         {/* HEADER */}
-        <View style={styles.header}>
-          <View style={styles.logoWrap}>
-            <Image source={require('./assets/logo.png')} style={styles.logo} resizeMode="contain" />
+        <View style={s.header}>
+          <View style={s.logoRing}>
+            <Image source={require('./assets/logo.png')} style={s.logo} resizeMode="contain" />
           </View>
-          <Text style={styles.subtitle}>Proof of Swarm</Text>
-          <Text style={styles.tagline}>Money. For Everyone. Forever.</Text>
-          <Text style={styles.swarmStatus}>
-            {Math.floor(userCount / 1_000_000)}M phones · New user reward: {formatMoney(currentReward)} MONEY
+          <Text style={s.title}>Proof of Swarm</Text>
+          <Text style={s.tagline}>Money. For Everyone. Forever.</Text>
+          <Text style={s.stat}>
+            {userCount === 0
+              ? 'Be the first — claim 1,000,000 MONEY'
+              : `${userCount.toLocaleString()} users · next reward: ${fmt(reward)} MONEY`}
           </Text>
         </View>
 
-        {/* PENALTY WARNING */}
-        {penaltyWarning && (
-          <View style={styles.penaltyBanner}>
-            <Text style={styles.penaltyText}>
-              ⚠️ Disconnecting from the Swarm costs 2× penalty. Stay connected to protect the network.
-            </Text>
-          </View>
-        )}
-
         {/* WALLET */}
-        <TouchableOpacity
-          style={styles.walletCard}
-          onPress={() => Alert.alert('Your Address', address)}
-        >
-          <Text style={styles.walletLabel}>CLAY TABLET WALLET</Text>
-          <Text style={styles.walletAddress} numberOfLines={1}>{address}</Text>
-          <Text style={styles.copyHint}>Tap to view full address · Ancient & Future</Text>
+        <TouchableOpacity style={s.card} onPress={() => Alert.alert('Your Address', address)}>
+          <Text style={s.label}>CLAY TABLET WALLET</Text>
+          <Text style={s.addr} numberOfLines={1}>{address || '…'}</Text>
+          <Text style={s.hint}>Tap to see full address</Text>
         </TouchableOpacity>
 
         {/* BALANCE */}
-        <View style={styles.balanceCard}>
-          <Text style={styles.balanceLabel}>YOUR BALANCE</Text>
-          <Text style={styles.balance}>{formatMoney(balance)} MONEY</Text>
+        <View style={s.card}>
+          <Text style={s.label}>YOUR BALANCE</Text>
+          <Text style={s.balance}>{fmt(balance)} MONEY</Text>
           {balance >= 1_000_000 && (
-            <Text style={styles.millionaire}>🎉 YOU ARE ONE OF THE FIRST MILLIONAIRES</Text>
+            <Text style={s.millionaire}>🎉 YOU ARE ONE OF THE FIRST MILLIONAIRES</Text>
           )}
         </View>
 
         {/* INVITE */}
-        <TouchableOpacity style={styles.inviteButton} onPress={inviteFriends}>
-          <Text style={styles.inviteText}>Invite Friends to the Swarm</Text>
+        <TouchableOpacity style={s.btnOrange} onPress={invite}>
+          <Text style={s.btnText}>Invite Friends to the Swarm</Text>
         </TouchableOpacity>
 
         {/* CLAIM */}
         <TouchableOpacity
-          style={[styles.claimButton, claimed && styles.claimButtonDone]}
-          onPress={claimFaucet}
-          disabled={claimed}
+          style={[s.btnGreen, claimed && s.btnDone]}
+          onPress={claim}
+          disabled={claimed || !address}
         >
-          <Text style={styles.claimText}>
-            {claimed ? '✅ FAUCET CLAIMED' : `CLAIM YOUR ${formatMoney(currentReward)} MONEY`}
+          <Text style={s.btnText}>
+            {claimed
+              ? '✅ FAUCET CLAIMED'
+              : isMillion
+                ? `CLAIM YOUR 1,000,000 MONEY — BE A MILLIONAIRE`
+                : `CLAIM YOUR ${fmt(reward)} MONEY`}
           </Text>
         </TouchableOpacity>
 
         {/* SEND */}
-        <View style={styles.sendSection}>
-          <Text style={styles.sectionTitle}>SEND & RECEIVE</Text>
+        <View style={s.section}>
+          <Text style={s.label}>SEND MONEY</Text>
           <TextInput
-            style={styles.input}
-            placeholder="Recipient Address"
+            style={s.input}
+            placeholder="Recipient address"
             placeholderTextColor="#555"
             value={recipient}
             onChangeText={setRecipient}
             autoCapitalize="none"
           />
           <TextInput
-            style={styles.input}
+            style={s.input}
             placeholder="Amount"
             placeholderTextColor="#555"
             keyboardType="numeric"
             value={amount}
             onChangeText={setAmount}
           />
-          <TouchableOpacity style={styles.sendButton} onPress={sendMoney}>
-            <Text style={styles.sendText}>SEND MONEY</Text>
+          <TouchableOpacity style={s.btnBlue} onPress={send}>
+            <Text style={s.btnText}>SEND</Text>
           </TouchableOpacity>
         </View>
 
         {/* LEDGER */}
-        <View style={styles.ledgerSection}>
-          <Text style={styles.sectionTitle}>PUBLIC LEDGER (Clay Tablets)</Text>
-          {allTransactions.length === 0 ? (
-            <Text style={styles.empty}>No Clay Tablets yet. Be the first.</Text>
-          ) : (
-            allTransactions.map((tx, i) => (
-              <View
-                key={i}
-                style={[styles.txCard, tx.reason === 'disconnect_penalty' && styles.txPenalty]}
-              >
-                <Text style={styles.txAddress} numberOfLines={1}>{tx.from} → {tx.to}</Text>
-                <Text style={styles.txAmount}>
-                  {tx.reason === 'disconnect_penalty' ? '⚠️ ' : ''}{formatMoney(tx.amount)} MONEY
+        <View style={s.section}>
+          <Text style={s.label}>PUBLIC LEDGER — CLAY TABLETS</Text>
+          {txs.length === 0
+            ? <Text style={s.empty}>No transactions yet. Be the first.</Text>
+            : txs.map((tx, i) => (
+              <View key={i} style={[s.tx, tx.reason === 'disconnect_penalty' && s.txPenalty]}>
+                <Text style={s.txAddr} numberOfLines={1}>{tx.from} → {tx.to}</Text>
+                <Text style={s.txAmt}>
+                  {tx.reason === 'disconnect_penalty' ? '⚠️ ' : ''}{fmt(tx.amount)} MONEY
                 </Text>
-                <Text style={styles.txTime}>{tx.time}</Text>
+                <Text style={s.txTime}>{tx.time}</Text>
               </View>
-            ))
-          )}
+            ))}
         </View>
 
       </ScrollView>
@@ -302,76 +280,53 @@ export default function App() {
   );
 }
 
-const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#0a0a0a' },
+// ── Styles ─────────────────────────────────────────────────────────────────
+const s = StyleSheet.create({
+  root:   { flex: 1, backgroundColor: '#0a0a0a' },
+  scroll: { paddingBottom: 60 },
 
-  header: { alignItems: 'center', padding: 30, paddingTop: 40, backgroundColor: '#111' },
-  logoWrap: {
-    width: 140, height: 140, borderRadius: 70, overflow: 'hidden',
+  header: { alignItems: 'center', paddingVertical: 36, paddingHorizontal: 20, backgroundColor: '#111' },
+  logoRing: {
+    width: 130, height: 130, borderRadius: 65, overflow: 'hidden',
     marginBottom: 16,
     shadowColor: '#D4AF37', shadowOffset: { width: 0, height: 0 },
-    shadowOpacity: 0.6, shadowRadius: 20, elevation: 12,
+    shadowOpacity: 0.7, shadowRadius: 20, elevation: 14,
   },
-  logo:       { width: 140, height: 140 },
-  subtitle:   { fontSize: 22, color: '#4CAF50', marginBottom: 6 },
-  tagline:    { fontSize: 17, color: '#D2B48C', fontStyle: 'italic' },
-  swarmStatus:{ color: '#FF9800', fontSize: 14, marginTop: 8 },
+  logo:    { width: 130, height: 130 },
+  title:   { fontSize: 24, color: '#4CAF50', fontWeight: 'bold', marginBottom: 4 },
+  tagline: { fontSize: 16, color: '#D2B48C', fontStyle: 'italic', marginBottom: 8 },
+  stat:    { fontSize: 13, color: '#FF9800', textAlign: 'center' },
 
-  penaltyBanner: {
-    backgroundColor: '#3a1a00', margin: 16, padding: 14,
-    borderRadius: 10, borderLeftWidth: 4, borderLeftColor: '#FF5722',
+  card: {
+    backgroundColor: '#1a1a1a', margin: 16, padding: 20,
+    borderRadius: 16, alignItems: 'center',
+    borderWidth: 1.5, borderColor: '#8B4513',
   },
-  penaltyText: { color: '#FF8A65', fontSize: 13 },
+  label:       { color: '#D2B48C', fontSize: 11, letterSpacing: 2, marginBottom: 8 },
+  addr:        { color: '#fff', fontSize: 13, fontFamily: 'monospace' },
+  hint:        { color: '#444', fontSize: 11, marginTop: 6 },
+  balance:     { color: '#4CAF50', fontSize: 38, fontWeight: 'bold' },
+  millionaire: { color: '#FFD700', fontSize: 12, marginTop: 8, fontWeight: 'bold', textAlign: 'center' },
 
-  walletCard: {
-    backgroundColor: '#1f1f1f', margin: 20, padding: 20,
-    borderRadius: 16, alignItems: 'center', borderWidth: 2, borderColor: '#8B4513',
-  },
-  walletLabel:   { color: '#D2B48C', fontSize: 12, letterSpacing: 2 },
-  walletAddress: { color: '#fff', fontSize: 13, marginVertical: 8, fontFamily: 'monospace' },
-  copyHint:      { color: '#444', fontSize: 11 },
+  btnOrange: { backgroundColor: '#FF9800', margin: 16, marginBottom: 8, padding: 16, borderRadius: 12, alignItems: 'center' },
+  btnGreen:  { backgroundColor: '#4CAF50', margin: 16, marginTop: 8,  padding: 16, borderRadius: 12, alignItems: 'center' },
+  btnBlue:   { backgroundColor: '#2196F3', padding: 14, borderRadius: 12, alignItems: 'center', marginTop: 8 },
+  btnDone:   { backgroundColor: '#1a3a1a' },
+  btnText:   { color: '#fff', fontWeight: 'bold', fontSize: 15 },
 
-  balanceCard: {
-    backgroundColor: '#1f1f1f', margin: 20, padding: 28,
-    borderRadius: 16, alignItems: 'center', borderWidth: 2, borderColor: '#8B4513',
-  },
-  balanceLabel: { color: '#D2B48C', fontSize: 14, letterSpacing: 2 },
-  balance:      { color: '#4CAF50', fontSize: 40, fontWeight: 'bold', marginTop: 6 },
-  millionaire:  { color: '#FFD700', fontSize: 13, marginTop: 10, fontWeight: 'bold', textAlign: 'center' },
-
-  inviteButton: {
-    backgroundColor: '#FF9800', marginHorizontal: 20, marginBottom: 10,
-    padding: 16, borderRadius: 12, alignItems: 'center',
-  },
-  inviteText: { color: '#000', fontWeight: 'bold', fontSize: 15 },
-
-  claimButton:     {
-    backgroundColor: '#4CAF50', marginHorizontal: 20, marginBottom: 20,
-    padding: 16, borderRadius: 12, alignItems: 'center',
-  },
-  claimButtonDone: { backgroundColor: '#1a3a1a' },
-  claimText:       { color: '#fff', fontWeight: 'bold', fontSize: 15 },
-
-  sendSection:  { padding: 20 },
-  sectionTitle: { color: '#D2B48C', fontSize: 16, marginBottom: 14, letterSpacing: 1 },
+  section: { paddingHorizontal: 16, paddingTop: 8, paddingBottom: 16 },
   input: {
     backgroundColor: '#1a1a1a', color: '#fff', padding: 14,
-    marginVertical: 7, borderRadius: 12, borderWidth: 1, borderColor: '#333',
+    marginVertical: 6, borderRadius: 12, borderWidth: 1, borderColor: '#333',
   },
-  sendButton: {
-    backgroundColor: '#2196F3', padding: 14, borderRadius: 12,
-    alignItems: 'center', marginTop: 6,
-  },
-  sendText: { color: '#fff', fontWeight: 'bold', fontSize: 15 },
 
-  ledgerSection: { padding: 20, paddingBottom: 40 },
-  txCard: {
-    backgroundColor: '#1f1f1f', marginVertical: 6, padding: 14,
-    borderRadius: 12, borderLeftWidth: 5, borderLeftColor: '#8B4513',
+  tx: {
+    backgroundColor: '#1a1a1a', padding: 14, marginVertical: 5,
+    borderRadius: 12, borderLeftWidth: 4, borderLeftColor: '#8B4513',
   },
-  txPenalty:  { borderLeftColor: '#FF5722' },
-  txAddress:  { color: '#888', fontSize: 12 },
-  txAmount:   { color: '#4CAF50', fontSize: 17, fontWeight: 'bold', marginVertical: 2 },
-  txTime:     { color: '#444', fontSize: 11 },
-  empty:      { color: '#444', textAlign: 'center', marginTop: 30, fontStyle: 'italic' },
+  txPenalty: { borderLeftColor: '#FF5722' },
+  txAddr:    { color: '#777', fontSize: 11 },
+  txAmt:     { color: '#4CAF50', fontSize: 16, fontWeight: 'bold', marginVertical: 2 },
+  txTime:    { color: '#444', fontSize: 11 },
+  empty:     { color: '#444', textAlign: 'center', marginTop: 20, fontStyle: 'italic' },
 });
