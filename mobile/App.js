@@ -4,14 +4,29 @@ import {
   TouchableOpacity, Share, Image, AppState, SafeAreaView,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import nacl from 'tweetnacl';
+import * as ExpoCrypto from 'expo-crypto';
 import { BACKEND_URL, BASE_PENALTY, DISCONNECT_GRACE_MS, RESERVE_ADDRESS } from './config';
 
-// ── Wallet ─────────────────────────────────────────────────────────────────
-const createAddress = () => {
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-  let id = 'M_';
-  for (let i = 0; i < 32; i++) id += chars[Math.floor(Math.random() * chars.length)];
-  return id;
+// ── Crypto ─────────────────────────────────────────────────────────────────
+const toHex   = (arr) => Array.from(arr).map(b => b.toString(16).padStart(2, '0')).join('');
+const fromHex = (hex) => new Uint8Array(hex.match(/.{2}/g).map(b => parseInt(b, 16)));
+
+const createKeypair = () => {
+  // Use expo-crypto for secure random seed — bypasses nacl's getRandomValues dependency
+  const seed = ExpoCrypto.getRandomBytes(32);
+  const kp   = nacl.sign.keyPair.fromSeed(seed);
+  return {
+    address:   'M_' + toHex(kp.publicKey).substring(0, 32).toUpperCase(),
+    publicKey: toHex(kp.publicKey),
+    secretKey: toHex(kp.secretKey),
+  };
+};
+
+const signTx = (from, to, amount, timestamp, secretKeyHex) => {
+  const msg      = `${from}:${to}:${amount}:${timestamp}`;
+  const msgBytes = Uint8Array.from(Array.from(msg).map(c => c.charCodeAt(0)));
+  return toHex(nacl.sign.detached(msgBytes, fromHex(secretKeyHex)));
 };
 
 // ── Faucet reward formula ───────────────────────────────────────────────────
@@ -37,33 +52,41 @@ export default function App() {
   const [recipient, setRecipient] = useState('');
   const [amount,   setAmount]   = useState('');
 
-  const addrRef    = useRef('');
-  const bgTimer    = useRef(null);
-  const appStateRef = useRef(AppState.currentState);
+  const addrRef      = useRef('');
+  const pubKeyRef    = useRef('');
+  const secKeyRef    = useRef('');
+  const bgTimer      = useRef(null);
+  const appStateRef  = useRef(AppState.currentState);
 
   // ── Load or create wallet ─────────────────────────────────────────────
   useEffect(() => {
     (async () => {
       try {
-        let addr = await AsyncStorage.getItem('wallet_v3');
-        if (!addr) {
-          addr = createAddress();
-          await AsyncStorage.setItem('wallet_v3', addr);
+        let stored = await AsyncStorage.getItem('keypair_v2');
+        let kp;
+        if (stored) {
+          kp = JSON.parse(stored);
+        } else {
+          kp = createKeypair();
+          await AsyncStorage.setItem('keypair_v2', JSON.stringify(kp));
         }
-        setAddress(addr);
-        addrRef.current = addr;
+        setAddress(kp.address);
+        addrRef.current   = kp.address;
+        pubKeyRef.current = kp.publicKey;
+        secKeyRef.current = kp.secretKey;
       } catch {
-        // AsyncStorage unavailable — use session-only address
-        const addr = createAddress();
-        setAddress(addr);
-        addrRef.current = addr;
+        const kp = createKeypair();
+        setAddress(kp.address);
+        addrRef.current   = kp.address;
+        pubKeyRef.current = kp.publicKey;
+        secKeyRef.current = kp.secretKey;
       }
     })();
   }, []);
 
   // ── Load claimed flag ─────────────────────────────────────────────────
   useEffect(() => {
-    AsyncStorage.getItem('claimed_v3')
+    AsyncStorage.getItem('claimed_v4')
       .then(v => { if (v === '1') setClaimed(true); })
       .catch(() => {});
   }, []);
@@ -113,12 +136,17 @@ export default function App() {
 
   const applyPenalty = async () => {
     try {
+      const from      = addrRef.current;
+      const amt       = BASE_PENALTY * 2;
+      const timestamp = Date.now();
+      const signature = signTx(from, RESERVE_ADDRESS, amt, timestamp, secKeyRef.current);
       await fetch(`${BACKEND_URL}/transaction`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          from: addrRef.current, to: RESERVE_ADDRESS,
-          amount: BASE_PENALTY * 2, reason: 'disconnect_penalty',
+          from, to: RESERVE_ADDRESS, amount: amt,
+          reason: 'disconnect_penalty',
+          signature, publicKey: pubKeyRef.current, timestamp,
         }),
       });
     } catch {}
@@ -137,7 +165,7 @@ export default function App() {
       });
       const data = await res.json();
       if (data.success) {
-        await AsyncStorage.setItem('claimed_v3', '1').catch(() => {});
+        await AsyncStorage.setItem('claimed_v4', '1').catch(() => {});
         setClaimed(true);
         Alert.alert('🎉 YOU ARE A MILLIONAIRE!', `${fmt(reward)} MONEY\nWelcome to the Swarm.`);
       } else {
@@ -155,14 +183,24 @@ export default function App() {
     if (isNaN(amt) || amt <= 0) return Alert.alert('Invalid', 'Amount must be positive');
     if (amt > balance) return Alert.alert('Insufficient balance');
     try {
-      await fetch(`${BACKEND_URL}/transaction`, {
+      const timestamp = Date.now();
+      const signature = signTx(address, recipient, amt, timestamp, secKeyRef.current);
+      const res = await fetch(`${BACKEND_URL}/transaction`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ from: address, to: recipient, amount: amt }),
+        body: JSON.stringify({
+          from: address, to: recipient, amount: amt,
+          signature, publicKey: pubKeyRef.current, timestamp,
+        }),
       });
-      setRecipient('');
-      setAmount('');
-      Alert.alert('✅ Sent', `${fmt(amt)} MONEY sent`);
+      const data = await res.json();
+      if (data.success) {
+        setRecipient('');
+        setAmount('');
+        Alert.alert('✅ Sent', `${fmt(amt)} MONEY sent`);
+      } else {
+        Alert.alert('Send failed', data.error);
+      }
     } catch (e) {
       Alert.alert('Connection error', e.message);
     }
