@@ -1,0 +1,28 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "expo-lan",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["expo", "start", "--lan", "--port", "8082"],
+      "cwd": "C:/Users/urban/Desktop/MONEY-Test",
+      "port": 8082,
+      "autoPort": false
+    },
+    {
+      "name": "expo-web",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["expo", "start", "--web"],
+      "cwd": "C:/Users/urban/Desktop/MONEY-Test",
+      "port": 8081,
+      "autoPort": true
+    },
+    {
+      "name": "preview-shapes",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["--yes", "serve", "-p", "3333", "."],
+      "cwd": "C:/Users/urban/Desktop/MONEY-Test",
+      "port": 3333
+    }
+  ]
+}

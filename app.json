@@ -1,0 +1,51 @@
+{
+  "expo": {
+    "name": "MONEY",
+    "slug": "money-proof-of-swarm",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/logo.png",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": false,
+    "splash": {
+      "image": "./assets/logo.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0a0a0a"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.fokerfeit.money"
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/logo.png",
+        "backgroundColor": "#0a0a0a"
+      },
+      "package": "com.fokerfeit.money",
+      "edgeToEdgeEnabled": true,
+      "usesCleartextTraffic": true,
+      "permissions": []
+    },
+    "web": {
+      "favicon": "./assets/logo.png"
+    },
+    "plugins": [
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "usesCleartextTraffic": true
+          }
+        }
+      ],
+      "expo-secure-store",
+      "expo-video"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "4bd2cece-f8b0-4776-b503-d0c5b1d59f83"
+      }
+    },
+    "owner": "fokerfeit"
+  }
+}
