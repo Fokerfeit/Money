@@ -1,3 +1,0 @@
-MONEY server — 3 txs | 0 sealed faces
-MONEY server listening on :3000
-Registered users: 2 | Sealed faces: 0

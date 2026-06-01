@@ -34,6 +34,10 @@ const signTx = (from, to, amount, timestamp, secretKeyHex) => {
 
 const fakeHash = () => crypto.randomBytes(32).toString('hex');
 
+// A platform recipient address that never ignites via the faucet — it is
+// allowed to receive only because it is whitelisted in MONEY_PLATFORM_ADDRESSES.
+const PLATFORM_ADDR = 'M_DEADBEEFDEADBEEFDEADBEEFDEADBEEF';
+
 const post = (body) => new Promise((resolve, reject) => {
   const data = JSON.stringify(body);
   const req  = http.request({
@@ -71,15 +75,21 @@ const expect = (label, res, expectedStatus, expectedErrorSnippet) => {
 
 // ── Spawn server + wait for it to be ready ───────────────────────────────
 const spawnServer = () => new Promise((resolve, reject) => {
-  const registryPath = path.join(__dirname, 'face_registry.json');
-  // Wipe registry so each run starts from a clean slate
-  try { fs.unlinkSync(registryPath); } catch {}
+  // Run the server against an isolated temp data dir so the simulation never
+  // touches the production ledger.json / google_accounts.json / replay_fence.json.
+  const tmpDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'money-sim-'));
 
   const srv = spawn(process.execPath, ['server.js'], {
     cwd: __dirname,
-    env: { ...process.env, NODE_ENV: 'test' }, // 1000 ignition attempts per hour in test
+    env: {
+      ...process.env,
+      NODE_ENV: 'test',                          // 1000 ignition attempts/hr in test
+      MONEY_DATA_DIR: tmpDir,
+      MONEY_PLATFORM_ADDRESSES: PLATFORM_ADDR,   // whitelisted recipient under test
+    },
     stdio: 'pipe',
   });
+  srv.on('exit', () => { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {} });
 
   let ready = false;
   const onData = (chunk) => {
@@ -124,15 +134,12 @@ const spawnServer = () => new Promise((resolve, reject) => {
   const ts2 = Date.now();
   const fakeSig = fakeHash(); // not a valid sig — will fail verifyTx, but that comes after seenSig insert
   r = await post({ from: 'FAUCET', to: kp.address, amount: 1_000_000,
-    signature: fakeSig, publicKey: kp.publicKey, timestamp: ts2,
-    faceHashes: Array.from({ length: 5 }, fakeHash) });
-  // This will fail on sig verify or face sybil (hashes are new so no sybil) or sig verify
-  // The important thing is the sig is now in seenSigs
+    signature: fakeSig, publicKey: kp.publicKey, timestamp: ts2 });
+  // This will fail on sig verify, but the important thing is the sig is now in seenSigs
 
   // Second attempt with the SAME signature (replay)
   r = await post({ from: 'FAUCET', to: kp.address, amount: 1_000_000,
-    signature: fakeSig, publicKey: kp.publicKey, timestamp: ts2,
-    faceHashes: Array.from({ length: 5 }, fakeHash) });
+    signature: fakeSig, publicKey: kp.publicKey, timestamp: ts2 });
   expect('Exact replay of same signature is rejected', r, 401, 'duplicate transaction');
 
   // ── Block 3: Signature forgery ─────────────────────────────────────────
@@ -144,59 +151,46 @@ const spawnServer = () => new Promise((resolve, reject) => {
   // Attacker tries to sign a transaction FROM victim's address using attacker's key
   const forgedSig = signTx('FAUCET', victim.address, 1_000_000, forgedTs, attacker.secretKey);
   r = await post({ from: 'FAUCET', to: victim.address, amount: 1_000_000,
-    signature: forgedSig, publicKey: attacker.publicKey, timestamp: forgedTs,
-    faceHashes: Array.from({ length: 5 }, fakeHash) });
+    signature: forgedSig, publicKey: attacker.publicKey, timestamp: forgedTs });
   expect('Mismatched publicKey → address is rejected', r, 401, 'public key does not match');
 
   const validSig = signTx('FAUCET', victim.address, 1_000_000, forgedTs, victim.secretKey);
   // Tamper with signature — flip one nibble
   const tamperedSig = validSig.slice(0, -1) + (validSig.slice(-1) === 'a' ? 'b' : 'a');
   r = await post({ from: 'FAUCET', to: victim.address, amount: 1_000_000,
-    signature: tamperedSig, publicKey: victim.publicKey, timestamp: forgedTs,
-    faceHashes: Array.from({ length: 5 }, fakeHash) });
+    signature: tamperedSig, publicKey: victim.publicKey, timestamp: forgedTs });
   expect('Tampered signature is rejected', r, 401, 'invalid');
 
-  // ── Block 4: Face hash / Sybil attacks ────────────────────────────────
-  console.log(Y('\n[ 4 ] Face hash / Sybil attacks'));
+  // ── Block 4: Google-identity Sybil gate ───────────────────────────────
+  console.log(Y('\n[ 4 ] Google-identity Sybil gate'));
 
-  const sybil1 = makeKeypair();
-  const ts4    = Date.now();
-  const sig4   = signTx('FAUCET', sybil1.address, 1_000_000, ts4, sybil1.secretKey);
+  // A google_sub may seal exactly one address. First claim succeeds.
+  const gsub      = 'google-sub-' + fakeHash().slice(0, 16);
+  const gSeal     = makeKeypair();
+  const tsg       = Date.now();
+  const sigg      = signTx('FAUCET', gSeal.address, 1_000_000, tsg, gSeal.secretKey);
+  r = await post({ from: 'FAUCET', to: gSeal.address, amount: 1_000_000,
+    signature: sigg, publicKey: gSeal.publicKey, timestamp: tsg, google_sub: gsub });
+  expect('First ignition linked to a Google identity is accepted', r, 200);
 
-  r = await post({ from: 'FAUCET', to: sybil1.address, amount: 1_000_000,
-    signature: sig4, publicKey: sybil1.publicKey, timestamp: ts4,
-    faceHashes: [] });
-  expect('Missing face hashes rejected (Sybil with no camera)', r, 400, 'face inscription incomplete');
+  // Second address claiming the SAME google_sub is rejected (Sybil firewall).
+  const gSybil    = makeKeypair();
+  const tsg2      = Date.now();
+  const sigg2     = signTx('FAUCET', gSybil.address, 1_000_000, tsg2, gSybil.secretKey);
+  r = await post({ from: 'FAUCET', to: gSybil.address, amount: 1_000_000,
+    signature: sigg2, publicKey: gSybil.publicKey, timestamp: tsg2, google_sub: gsub });
+  expect('Second address reusing same Google identity is rejected', r, 400, 'already linked');
 
-  // Each subtest needs a fresh keypair + timestamp + signature — same sig would hit replay fence
-  const sybil1b = makeKeypair();
-  const ts4b    = Date.now();
-  const sig4b   = signTx('FAUCET', sybil1b.address, 1_000_000, ts4b, sybil1b.secretKey);
-  r = await post({ from: 'FAUCET', to: sybil1b.address, amount: 1_000_000,
-    signature: sig4b, publicKey: sybil1b.publicKey, timestamp: ts4b,
-    faceHashes: ['notahex', 'alsowrong', 'badhash'] });
-  expect('Malformed face hashes (not SHA-256 hex) rejected', r, 400, 'malformed');
-
-  const sybil1c = makeKeypair();
-  const ts4c    = Date.now();
-  const sig4c   = signTx('FAUCET', sybil1c.address, 1_000_000, ts4c, sybil1c.secretKey);
-  r = await post({ from: 'FAUCET', to: sybil1c.address, amount: 1_000_000,
-    signature: sig4c, publicKey: sybil1c.publicKey, timestamp: ts4c,
-    faceHashes: Array.from({ length: 2 }, fakeHash) });
-  expect('Only 2 face hashes (< 3 minimum) rejected', r, 400, 'face inscription incomplete');
-
-  // ── Block 5: Successful ignition ──────────────────────────────────────
+  // ── Block 5: Successful ignition (no Google identity — dormant gate) ───
   console.log(Y('\n[ 5 ] Legitimate ignition'));
 
   const honest = makeKeypair();
   const tsH    = Date.now();
   const sigH   = signTx('FAUCET', honest.address, 1_000_000, tsH, honest.secretKey);
-  const hashes = Array.from({ length: 5 }, fakeHash);
 
   r = await post({ from: 'FAUCET', to: honest.address, amount: 1_000_000,
-    signature: sigH, publicKey: honest.publicKey, timestamp: tsH,
-    faceHashes: hashes });
-  expect('Valid ignition with 5 hashes is accepted', r, 200);
+    signature: sigH, publicKey: honest.publicKey, timestamp: tsH });
+  expect('Valid ignition (no google_sub) is accepted', r, 200);
 
   // ── Block 6: Double-ignition (same address) ───────────────────────────
   console.log(Y('\n[ 6 ] Double-ignition attacks'));
@@ -204,24 +198,11 @@ const spawnServer = () => new Promise((resolve, reject) => {
   const tsH2  = Date.now();
   const sigH2 = signTx('FAUCET', honest.address, 1_000_000, tsH2, honest.secretKey);
   r = await post({ from: 'FAUCET', to: honest.address, amount: 1_000_000,
-    signature: sigH2, publicKey: honest.publicKey, timestamp: tsH2,
-    faceHashes: Array.from({ length: 5 }, fakeHash) });
+    signature: sigH2, publicKey: honest.publicKey, timestamp: tsH2 });
   expect('Second ignition for same address is rejected', r, 400, 'already been ignited');
 
-  // ── Block 7: Sybil with stolen face hashes ────────────────────────────
-  console.log(Y('\n[ 7 ] Sybil with stolen/reused face hashes'));
-
-  const sybil2 = makeKeypair();
-  const tsS2   = Date.now();
-  const sigS2  = signTx('FAUCET', sybil2.address, 1_000_000, tsS2, sybil2.secretKey);
-  // Reuse the SAME hashes that were used for honest.address (the registered seal)
-  r = await post({ from: 'FAUCET', to: sybil2.address, amount: 1_000_000,
-    signature: sigS2, publicKey: sybil2.publicKey, timestamp: tsS2,
-    faceHashes: hashes /* same hashes as honest */ });
-  expect('Sybil using stolen hashes from another address is rejected', r, 400, 'duplicate seal');
-
-  // ── Block 8: Send from unregistered address ───────────────────────────
-  console.log(Y('\n[ 8 ] Sending from unregistered wallet'));
+  // ── Block 7: Send from unregistered address ───────────────────────────
+  console.log(Y('\n[ 7 ] Sending from unregistered wallet'));
 
   const ghost = makeKeypair();
   const tsG   = Date.now();
@@ -231,8 +212,8 @@ const spawnServer = () => new Promise((resolve, reject) => {
   // Ghost has 0 balance — server rejects with insufficient balance (unregistered = always 0 balance)
   expect('Unregistered sender can\'t send funds', r, 400, 'insufficient balance');
 
-  // ── Block 9: Send to unregistered address ────────────────────────────
-  console.log(Y('\n[ 9 ] Sending to unregistered wallet'));
+  // ── Block 8: Send to unregistered address ────────────────────────────
+  console.log(Y('\n[ 8 ] Sending to unregistered wallet'));
 
   const unknown = makeKeypair();
   const tsU     = Date.now();
@@ -241,6 +222,34 @@ const spawnServer = () => new Promise((resolve, reject) => {
     signature: sigU, publicKey: honest.publicKey, timestamp: tsU });
   expect('Sending to unregistered wallet is rejected', r, 400, 'not a registered swarm node');
   // Note: ghost also has no balance, but "not registered" fires first since recipient check precedes balance check
+
+  // ── Block 9: Economic integrity ───────────────────────────────────────
+  console.log(Y('\n[ 9 ] Economic integrity'));
+
+  // Over-mint: sign a FAUCET→self claim for far more than calcReward allows.
+  const greedy   = makeKeypair();
+  const tsGreedy = Date.now();
+  const sigGreedy = signTx('FAUCET', greedy.address, 999_999_999, tsGreedy, greedy.secretKey);
+  r = await post({ from: 'FAUCET', to: greedy.address, amount: 999_999_999,
+    signature: sigGreedy, publicKey: greedy.publicKey, timestamp: tsGreedy });
+  expect('Faucet claim above calcReward is rejected (no unlimited mint)', r, 400, 'exceeds');
+
+  // Forged penalty: unsigned disconnect_penalty against a registered victim.
+  // honest is registered with a balance; an attacker tries to burn it with no signature.
+  r = await post({ from: honest.address, to: 'SWARM_RESERVE', amount: 100,
+    reason: 'disconnect_penalty', timestamp: Date.now() });
+  expect('Unsigned disconnect_penalty is rejected (no unauthenticated burn)', r, 401, 'must include signature');
+
+  // ── Block 10: Platform recipient allowlist ────────────────────────────
+  console.log(Y('\n[ 10 ] Platform recipient allowlist'));
+
+  // honest is registered with a balance; pay the whitelisted (never-ignited)
+  // platform address — this is the nocopycART marketplace payment path.
+  const tsP  = Date.now();
+  const sigP = signTx(honest.address, PLATFORM_ADDR, 500, tsP, honest.secretKey);
+  r = await post({ from: honest.address, to: PLATFORM_ADDR, amount: 500,
+    signature: sigP, publicKey: honest.publicKey, timestamp: tsP });
+  expect('Payment to a whitelisted platform address is accepted', r, 200);
 
   // ── Summary ───────────────────────────────────────────────────────────
   console.log(B('\n══════════════════════════════════════════════'));

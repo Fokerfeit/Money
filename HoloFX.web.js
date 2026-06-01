@@ -1680,3 +1680,11 @@ export const glassTermBox = {
   borderColor:         'rgba(212,175,55,0.28)',
   borderRadius:        10,
 };
+
+// ── Parity stubs for the native-only 2.5D API ──────────────────────────────
+// On web the holographic background is the three.js scene above; these exist
+// only so App.js's shared imports resolve. They are never rendered on web
+// (App guards them with !IS_WEB), and useTilt has no gyroscope to read.
+export const useTilt        = () => null;
+export const HoloBackground = () => null;
+export const DepthFrame     = () => null;

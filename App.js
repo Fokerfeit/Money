@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import {
   View, Text, TextInput, Alert, StyleSheet, ScrollView,
-  TouchableOpacity, Share, Image, AppState, SafeAreaView,
+  TouchableOpacity, Pressable, Share, Image, AppState, SafeAreaView,
   Dimensions, Modal, Animated, Platform,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -80,7 +80,7 @@ import {
 } from './Icons';
 import QRCode from 'react-native-qrcode-svg';
 import {
-  useHoloBackground, useHoloTransition,
+  useHoloBackground, useHoloTransition, HoloBackground, DepthFrame, useTilt,
   glassCard, glassButton, glassOnboardCard, glassTermBox,
 } from './HoloFX';
 
@@ -205,26 +205,27 @@ const matchesNumber = (transcript, target) =>
   (NUMBER_WORDS[target] || []).some(w => transcript.toLowerCase().includes(w.toLowerCase()));
 
 // ── Seal-mark validation ──────────────────────────────────────────────────
-// ── WobbleTile — gentle oscillating rotation for 3D card illusion ────────────
-function WobbleTile({ children, delay = 0, amplitude = 1.8 }) {
+// ── WobbleTile — jiggles ONLY when touched (or hovered on web) ───────────────
+// `delay` kept for call-site compatibility; no longer used (was a looping idle
+// wobble, which read as distracting — now it reacts to interaction instead).
+function WobbleTile({ children, delay = 0, amplitude = 2.4 }) {
   const wobble = useRef(new Animated.Value(0)).current;
-  useEffect(() => {
-    const anim = Animated.loop(
-      Animated.sequence([
-        Animated.delay(delay),
-        Animated.timing(wobble, { toValue:  amplitude, duration: 2200, useNativeDriver: NATIVE_DRIVER }),
-        Animated.timing(wobble, { toValue: -amplitude, duration: 2200, useNativeDriver: NATIVE_DRIVER }),
-        Animated.timing(wobble, { toValue:  0,         duration: 1600, useNativeDriver: NATIVE_DRIVER }),
-      ])
-    );
-    anim.start();
-    return () => anim.stop();
-  }, []);
-  const rotate = wobble.interpolate({ inputRange: [-amplitude, amplitude], outputRange: [`-${amplitude}deg`, `${amplitude}deg`] });
+  const jiggle = () => {
+    wobble.stopAnimation();
+    wobble.setValue(0);
+    // quick tip, then a springy settle that overshoots back-and-forth = wobble
+    Animated.sequence([
+      Animated.timing(wobble, { toValue: 1, duration: 80, useNativeDriver: NATIVE_DRIVER }),
+      Animated.spring(wobble, { toValue: 0, friction: 3, tension: 90, useNativeDriver: NATIVE_DRIVER }),
+    ]).start();
+  };
+  const rotate = wobble.interpolate({ inputRange: [-1, 1], outputRange: [`-${amplitude}deg`, `${amplitude}deg`] });
   return (
-    <Animated.View style={{ transform: [{ rotate }] }}>
-      {children}
-    </Animated.View>
+    <Pressable onPressIn={jiggle} onHoverIn={jiggle}>
+      <Animated.View style={{ transform: [{ rotate }] }}>
+        {children}
+      </Animated.View>
+    </Pressable>
   );
 }
 
@@ -290,12 +291,17 @@ const IDENTITY_CARDS = [
 // ── Screen entry animation — every screen fades + scales in from slightly zoomed-out ─
 const ScreenWrapper = ({ children, style }) => {
   const anim = useRef(new Animated.Value(0)).current;
+  const tilt = useTilt();   // gyroscope → parallax (no-op / null on web)
   useEffect(() => {
     Animated.spring(anim, { toValue: 1, tension: 55, friction: 9, useNativeDriver: NATIVE_DRIVER }).start();
   }, []);
   const scaleInterp = anim.interpolate({ inputRange: [0, 1], outputRange: [0.96, 1] });
   return (
-    <Animated.View style={[{ flex: 1 }, style, { opacity: anim, transform: [{ scale: scaleInterp }] }]}>
+    <Animated.View style={[{ flex: 1, backgroundColor: IS_WEB ? 'transparent' : '#0E0700' }, style, { opacity: anim, transform: [{ scale: scaleInterp }] }]}>
+      {/* Anamorphic 3D box — native only (web uses HoloFX.web.js three.js scene).
+          BACK: perspective starfield parallaxed by gyro · MID: beveled frame. */}
+      {Platform.OS !== 'web' && <HoloBackground tilt={tilt} />}
+      {Platform.OS !== 'web' && <DepthFrame />}
       {children}
       {/* Domain bar — floats above all screens on native (web is handled by HoloFX CSS) */}
       {Platform.OS !== 'web' && (
@@ -386,24 +392,33 @@ const PulseRing = ({ size, color = '#D4AF37', delay = 0 }) => {
 
 // ── App ────────────────────────────────────────────────────────────────────
 // ── Animated press button — pops OUT on touch (3D lift feel) ─────────────
-const AnimatedPress = ({ onPress, style, children, disabled }) => {
+const AnimatedPress = ({ onPress, style, children, disabled, glowRadius = 16 }) => {
   const scale  = useRef(new Animated.Value(1)).current;
   const transY = useRef(new Animated.Value(0)).current;
+  const glow   = useRef(new Animated.Value(0)).current;   // 0 → 1 light-up
 
   const pressIn = () => Animated.parallel([
     Animated.spring(scale,  { toValue: 1.05, speed: 200, bounciness: 0, useNativeDriver: NATIVE_DRIVER }),
     Animated.spring(transY, { toValue: -5,   speed: 200, bounciness: 0, useNativeDriver: NATIVE_DRIVER }),
+    Animated.timing(glow,   { toValue: 1, duration: 90, useNativeDriver: NATIVE_DRIVER }),
   ]).start();
 
   const pressOut = () => Animated.parallel([
     Animated.spring(scale,  { toValue: 1.0, speed: 18, bounciness: 16, useNativeDriver: NATIVE_DRIVER }),
     Animated.spring(transY, { toValue: 0,   speed: 18, bounciness: 16, useNativeDriver: NATIVE_DRIVER }),
+    Animated.timing(glow,   { toValue: 0, duration: 280, useNativeDriver: NATIVE_DRIVER }),
   ]).start();
 
   return (
-    <TouchableOpacity onPress={onPress} onPressIn={pressIn} onPressOut={pressOut} activeOpacity={0.97} disabled={disabled}>
+    <TouchableOpacity onPress={onPress} onPressIn={pressIn} onPressOut={pressOut} activeOpacity={1} disabled={disabled}>
       <Animated.View style={[style, { transform: [{ scale }, { translateY: transY }] }]}>
         {children}
+        {/* light-up sheen — brightens the button on press */}
+        <Animated.View pointerEvents="none" style={{
+          position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, borderRadius: glowRadius,
+          backgroundColor: '#FFF1C4',
+          opacity: glow.interpolate({ inputRange: [0, 1], outputRange: [0, 0.30] }),
+        }} />
       </Animated.View>
     </TouchableOpacity>
   );
@@ -1696,7 +1711,7 @@ export default function App() {
 
   if (onboardingStep === null) {
     return (
-      <SafeAreaView style={s.root}>
+      <SafeAreaView style={[s.root, { backgroundColor: '#0E0700' }]}>
         <View style={s.fullCenter}>
           <Text style={s.loadingText}>Reading the tablets…</Text>
         </View>
@@ -1910,7 +1925,7 @@ export default function App() {
             <Text style={s.onboardTitle}>Earth's Money</Text>
             <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'center', marginBottom: 4 }}>
               <Text style={s.onboardSub}>One million </Text>
-              <MoneySymbol size={15} color="#B8956A" style={{ marginBottom: 1 }} />
+              <MoneySymbol size={14} color="#B8956A" style={{ marginHorizontal: 3 }} />
               <Text style={s.onboardSub}> MONEY per verified human.</Text>
             </View>
             <Text style={[s.onboardSub, { marginBottom: 32 }]}>No mining. No ads. No tricks.</Text>
@@ -1918,13 +1933,13 @@ export default function App() {
             <GoldDivider width={width - 80} opacity={0.4} />
 
             {/* Google Sign-In — primary action */}
-            <TouchableOpacity
+            <AnimatedPress
               style={[s.btnGold, glassButton, { marginTop: 36, marginBottom: 8, flexDirection: 'row', alignItems: 'center', gap: 12, paddingHorizontal: 28, paddingVertical: 16 }]}
               onPress={() => promptGoogleAsync()}
             >
               <Text style={[s.btnText, { fontSize: 18, fontWeight: 'bold' }]}>G</Text>
               <Text style={[s.btnText, { fontSize: 15 }]}>CONTINUE WITH GOOGLE</Text>
-            </TouchableOpacity>
+            </AnimatedPress>
 
             <Text style={{ color: '#5A3D1A', fontSize: 11, textAlign: 'center', marginTop: 8, letterSpacing: 0.3 }}>
               Sign in to link your identity. One account per human.
@@ -1981,8 +1996,8 @@ export default function App() {
               <Text style={s.onboardBody}>③ Link your authenticator app (2FA)</Text>
               <View style={{ flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', marginBottom: 4 }}>
                 <Text style={s.onboardBody}>④ IGNITION — </Text>
-                <MoneySymbol size={12} color="#B8956A" style={{ marginTop: 1, marginHorizontal: 2 }} />
-                <Text style={s.onboardBody}> 1,000,000 released 🔥</Text>
+                <MoneySymbol size={14} color="#B8956A" style={{ marginHorizontal: 3 }} />
+                <Text style={s.onboardBody}>1,000,000 released 🔥</Text>
               </View>
             </View>
 
@@ -2008,8 +2023,8 @@ export default function App() {
                       <Text style={s.termText}>{'Swear: one seal per human —'}</Text>
                       <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 2 }}>
                         <Text style={s.termText}>{'any forgery voids your '}</Text>
-                        <MoneySymbol size={13} color="#D4AF37" style={{ marginBottom: 1 }} />
-                        <Text style={[s.termText, { color: '#D4AF37', fontWeight: 'bold' }]}>{' MONEY'}</Text>
+                        <MoneySymbol size={14} color="#D4AF37" style={{ marginHorizontal: 2 }} />
+                        <Text style={[s.termText, { color: '#D4AF37', fontWeight: 'bold' }]}>{'MONEY'}</Text>
                       </View>
                     </View>
                   ) : (
@@ -2019,7 +2034,7 @@ export default function App() {
               ))}
             </View>
 
-            <TouchableOpacity
+            <AnimatedPress
               style={[s.btnGold, glassButton, { marginTop: 8 }, !allChecked && s.btnDisabled]}
               disabled={!allChecked}
               onPress={async () => {
@@ -2029,7 +2044,7 @@ export default function App() {
               }}
             >
               <Text style={s.btnText}>{allChecked ? 'BEGIN THE FORGING →' : 'SWEAR ALL OATHS TO CONTINUE'}</Text>
-            </TouchableOpacity>
+            </AnimatedPress>
 
           </View>
         </ScrollView>
@@ -2845,7 +2860,7 @@ export default function App() {
 
 // ── Styles ─────────────────────────────────────────────────────────────────
 const s = StyleSheet.create({
-  root:   { flex: 1, backgroundColor: '#0E0700' },
+  root:   { flex: 1, backgroundColor: IS_WEB ? '#0E0700' : 'transparent' },  // native: dark base + starfield come from ScreenWrapper/HoloBackground; web unchanged
   scroll: { paddingBottom: 60 },
 
   // ── Header ──────────────────────────────────────────────────────────────

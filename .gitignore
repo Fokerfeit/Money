@@ -33,6 +33,16 @@ yarn-error.*
 # local env files
 .env*.local
 
+# secrets — platform wallet private key must never be committed
+platform_wallet.secret.json
+.secrets/
+
+# dev/session artifacts — not for the repo
+*.log
+serve_preview.log
+expo_web.log
+holo_preview.html
+
 # typescript
 *.tsbuildinfo
 

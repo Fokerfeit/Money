@@ -1,58 +1,87 @@
-# MONEY — What to do and when
+# MONEY — Ship & test checklist
+
+Goal: test the app end-to-end with a second person against the live backend,
+and watch real transactions land.
 
 ---
 
-## RIGHT NOW — Restart the server (2 min)
+## STEP 1 — Deploy the hardened backend FIRST (critical)
 
-The server has new protections. You need to restart it for them to take effect.
+The app was rewritten to rely on the signed key + Google identity — it no longer
+sends face hashes. The current `server.js` matches that; an older deployed server
+that still requires face hashes will **reject every ignition**. So redeploy before testing.
 
-- [ ] On your server machine, stop the server (Ctrl+C)
-- [ ] Run: `node server.js`
-- [ ] Done. Server is now protected.
-
----
-
-## JUNE 1 — Build the app (10 min, you just wait)
-
-- [ ] Open terminal in the MONEY-Test folder
-- [ ] Run this one command:
+On the server host (api.moneyforeveryone.app):
+- [ ] Get the latest `server.js` onto the host (git pull / scp).
+- [ ] Set the platform-wallet env var so nocopycART payments are accepted:
   ```
-  npx eas build --profile preview --platform android --non-interactive
+  MONEY_PLATFORM_ADDRESSES=M_F66DCDBCD2FA68D8FCEE50A503CFBA20
+  TRUST_PROXY=1
   ```
-- [ ] Wait ~10 minutes
-- [ ] You get a link — open it on BOTH phones to install
+  (see `.env.example`; set these however the host loads env — systemd unit, PM2 ecosystem, Docker, etc.)
+- [ ] Restart the server (`node server.js`, or `pm2 restart money`, etc.).
+- [ ] Confirm it's live:
+  ```
+  curl https://api.moneyforeveryone.app/health
+  curl https://api.moneyforeveryone.app/stats
+  ```
+  `/health` should return `{ "status": "ok", ... }`.
 
 ---
 
-## JUNE 1 — Test with your girlfriend's phone (30 min)
+## STEP 2 — Build the Android APK (~10 min, you just wait)
 
-Do these in order. Each one should work.
+- [ ] Terminal in the MONEY-Test folder:
+  ```
+  npx eas build --profile preview --platform android
+  ```
+- [ ] Wait for the build; you get a link.
+- [ ] Open the link on BOTH phones to install.
+
+---
+
+## STEP 3 — Two-person test (do these in order)
 
 **She sets up the app:**
-- [ ] She completes the full setup (face scan, voice, thumbprint)
-- [ ] She lands on the main screen with a balance ✅
+- [ ] Completes setup (face scan, voice, thumbprint, PIN).
+- [ ] Lands on the main screen with a balance ✅
+  - (Watch the server log: you should see a `TX: FAUCET → M_... ` line and `/stats` users count go up.)
 
 **You two send money:**
-- [ ] She sends you 100 MONEY
+- [ ] She sends you some MONEY.
 - [ ] Her phone asks for fingerprint/face before sending ✅
-- [ ] Your balance updates within 1 minute ✅
+- [ ] Your balance updates within ~1 minute ✅
+- [ ] `curl https://api.moneyforeveryone.app/ledger` shows the transfer.
 
 **Try to cheat (these should all FAIL):**
-- [ ] She tries to claim her starting money a second time → blocked ✅
-- [ ] She tries to send more than she has → blocked ✅
-- [ ] You try to fake a faucet claim from your laptop (see below) → blocked ✅
+- [ ] She tries to claim her starting money a second time → blocked ("already been ignited") ✅
+- [ ] She tries to send more than she has → blocked ("Insufficient balance") ✅
+- [ ] Forged faucet claim from a laptop (below) → blocked ✅
 
-**Laptop cheat test** — open terminal and paste this
-(replace YOUR_IP with the server IP from config.js):
+**Laptop cheat test** — paste in a terminal:
 ```
-curl -X POST http://YOUR_IP:3000/transaction -H "Content-Type: application/json" -d "{\"from\":\"FAUCET\",\"to\":\"M_FAKEADDRESS\",\"amount\":999999}"
+curl -X POST https://api.moneyforeveryone.app/transaction -H "Content-Type: application/json" -d "{\"from\":\"FAUCET\",\"to\":\"M_FAKEADDRESS\",\"amount\":999999}"
 ```
-You should see: `Faucet claim must include recipient signature`
+Expected: a **401 rejection** — `"Transaction timestamp expired or invalid"` (no timestamp) or,
+if you add a fresh timestamp, `"Ignition must include signature, publicKey, and timestamp"`.
+The point: a faucet claim with no valid signature is **rejected**, never `success`.
+
+---
+
+## STEP 4 — Sanity-check the backend state
+
+- [ ] `GET /stats` — transactions, registeredUsers, googleSeals, replayFenceSize.
+- [ ] `GET /ledger` — every test transfer is present, amounts correct.
+- [ ] Run the local attack simulation any time: `node attack_sim.js` (should print ALL ... BLOCKED).
 
 ---
 
 ## LATER — Nice to have (no rush)
 
-- [ ] Add HTTPS so the connection is encrypted
-- [ ] Add face embedding to detect the same person on multiple phones
-- [ ] Google Sign-In as a second identity layer
+- [ ] Turn on Google Sign-In in the app to activate the Sybil gate. It's currently
+      commented out (needs a native build), so `google_sub` is undefined and the
+      "one seal per human" gate is dormant — identity falls back to the signed key,
+      which a fresh keypair defeats. This is the main thing standing between "demo"
+      and "real Sybil resistance".
+- [ ] Auth-gate or remove the `/stats` debug endpoint before a public launch.
+- [ ] Add rate limiting to `/google-lookup` and `/ledger`.
