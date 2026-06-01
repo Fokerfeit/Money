@@ -1,0 +1,566 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Earth's Money — 3D Objects v3</title>
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.152.2/build/three.module.js"}}
+</script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#080808;color:#aaa;font-family:'SF Pro Display',system-ui;padding:24px}
+h1{text-align:center;color:#fff;margin-bottom:5px;font-size:14px;letter-spacing:5px}
+p.sub{text-align:center;color:#333;font-size:11px;letter-spacing:3px;margin-bottom:28px}
+.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;max-width:1200px;margin:0 auto}
+.card{background:#000;border:1px solid #181818;border-radius:10px;overflow:hidden}
+canvas{display:block;width:100%!important;aspect-ratio:1}
+.lbl{padding:10px 12px 13px;border-top:1px solid #0f0f0f}
+.lbl b{display:block;color:#ddd;font-size:13px;font-weight:600;letter-spacing:.4px;margin-bottom:3px}
+.lbl span{color:#3a3a3a;font-size:11px;letter-spacing:.5px}
+</style>
+</head>
+<body>
+<h1>EARTH'S MONEY</h1>
+<p class="sub">3D Preview — v3 — Anamorphic</p>
+<div class="grid" id="g"></div>
+<script>
+const ITEMS=[
+  ['c1','A — Mercury Blob','Iridescent displaced sphere'],
+  ['c2','B — Brilliant Gem','Precision-cut facets'],
+  ['c3','C — Trefoil Knot','Closed knotted tube'],
+  ['c4','D — Wave Torus','Rippled chrome ring'],
+  ['c5','E — Gravity Funnel','Singularity mesh'],
+  ['c6','F — Möbius Band','One-sided parametric surface'],
+  ['c7','G — Three Orbits','Interlocked chrome rings'],
+  ['c8','H — Gyroid','Minimal surface sphere'],
+  ['c9','I — Hyperboloid','Twisted ruled-surface tower'],
+  ['c10','J — Nautilus','Logarithmic spiral tube'],
+  ['c11','K — Trumpet Bell','Exponential lathe flare'],
+  ['c12','L — Organic Vase','Sculpted lathe profile'],
+  ['c13','M — Star Polyhedron','Stellated octahedron'],
+  ['c14','N — Crystal Array','Seven shard formation'],
+  ['c15','O — Star Knot','Five-fold torus knot'],
+  ['c16','P — Saddle Surface','Hyperbolic paraboloid'],
+];
+const g=document.getElementById('g');
+ITEMS.forEach(([id,title,sub])=>{
+  g.innerHTML+=`<div class="card"><canvas id="${id}"></canvas><div class="lbl"><b>${title}</b><span>${sub}</span></div></div>`;
+});
+</script>
+<script type="module">
+import * as THREE from 'three';
+
+// ── SHARED HDR ENV ────────────────────────────────────────────────────────────
+let _E=null;
+function ENV(r){
+  if(_E)return _E;
+  const W=512,H=256,d=new Float32Array(W*H*4);
+  for(let y=0;y<H;y++)for(let x=0;x<W;x++){
+    const phi=x/W*Math.PI*2,th=y/H*Math.PI;
+    const sx=Math.sin(th)*Math.cos(phi),sy=Math.cos(th),sz=Math.sin(th)*Math.sin(phi);
+    let R=.02,G=.01,B=.02;
+    const k=Math.max(0,-.6*sx+.55*sy+.55*sz);R+=k*k*8;G+=k*k*3;B+=k*k*.3;
+    const tp=Math.max(0,sy)*.6;R+=tp*.35;G+=tp*.18;B+=tp*.04;
+    const f=Math.max(0,.52*sx-.42*sy-.74*sz);R+=f*f*.06;G+=f*f*2;B+=f*f*4;
+    const rm=Math.max(0,.92*sx+.02*sy+.38*sz);R+=rm*rm*4;G+=rm*rm*.12;B+=rm*rm*.2;
+    const fl=Math.max(0,-sy);R+=fl*fl;G+=fl*fl*.42;B+=fl*fl*.06;
+    const i=(y*W+x)*4;d[i]=R;d[i+1]=G;d[i+2]=B;d[i+3]=1;
+  }
+  const tx=new THREE.DataTexture(d,W,H,THREE.RGBAFormat,THREE.FloatType);
+  tx.mapping=THREE.EquirectangularReflectionMapping;tx.needsUpdate=true;
+  const pm=new THREE.PMREMGenerator(r);pm.compileEquirectangularShader();
+  _E=pm.fromEquirectangular(tx).texture;pm.dispose();tx.dispose();
+  return _E;
+}
+
+// ── MATERIAL + LIGHT HELPERS ──────────────────────────────────────────────────
+const CH=0xC8C8D0,GOLD=0xD4AA50,CY=0x00FFEE,AM=0xFF8840,RD=0xFF1844;
+function cm(e,o={}){
+  return new THREE.MeshPhysicalMaterial({
+    color:o.c??CH,metalness:o.m??1,roughness:o.r??0.03,
+    envMap:e,envMapIntensity:o.ei??4,clearcoat:1,clearcoatRoughness:0,
+    iridescence:o.ir??0,iridescenceIOR:o.iiOR??2,iridescenceThicknessRange:o.iR??[80,700]
+  });
+}
+function lts(S,o={}){
+  const k=new THREE.PointLight(o.wc??AM,o.wi??18,30);k.position.set(...(o.wp??[-4.5,7,4]));
+  const f=new THREE.PointLight(o.cc??CY,o.ci??10,25);f.position.set(...(o.cp??[4.5,-1.5,3.5]));
+  const rm=new THREE.PointLight(o.rc??RD,o.ri??7,20);rm.position.set(...(o.rp??[5,2,-4]));
+  S.add(new THREE.AmbientLight(0x151008,.5),k,f,rm);
+}
+function mkR(id){
+  const cv=document.getElementById(id);
+  const r=new THREE.WebGLRenderer({canvas:cv,antialias:true,powerPreference:'high-performance'});
+  r.setPixelRatio(Math.min(devicePixelRatio,2));
+  r.toneMapping=THREE.ACESFilmicToneMapping;r.toneMappingExposure=1.35;
+  r.outputEncoding=THREE.sRGBEncoding;
+  // Enable shadows for the anamorphic ledge effect
+  r.shadowMap.enabled=true;
+  r.shadowMap.type=THREE.PCFSoftShadowMap;
+  const sz=cv.parentElement.clientWidth||280;r.setSize(sz,sz);return r;
+}
+// Camera from BELOW looking UP — same as looking up at a billboard from the street
+function mkC(fov=44){
+  const c=new THREE.PerspectiveCamera(fov,1,.1,100);
+  c.position.set(0,-0.4,3.6);
+  c.lookAt(0,0.5,0);
+  return c;
+}
+
+// ── ANAMORPHIC LEDGE SYSTEM ───────────────────────────────────────────────────
+// Adds the physical grey surface (like the billboard ledge) + chrome screen-frame trim
+// The 3D object casts a shadow onto this surface — that's what creates the illusion
+function addLedge(S,E){
+  // Grey physical surface (the "ledge" — like the billboard's physical grey frame)
+  const ledge=new THREE.Mesh(
+    new THREE.PlaneGeometry(14,10),
+    new THREE.MeshStandardMaterial({
+      color:0x8a8a92,roughness:.88,metalness:.04,
+      envMap:E,envMapIntensity:.25
+    })
+  );
+  ledge.rotation.x=-Math.PI/2;
+  ledge.position.y=-0.88;
+  ledge.receiveShadow=true;
+  S.add(ledge);
+
+  // Chrome screen-frame trim — the thin edge where the display meets the ledge
+  const trim=new THREE.Mesh(
+    new THREE.BoxGeometry(14,.07,.18),
+    new THREE.MeshPhysicalMaterial({
+      color:0xC0C0C8,metalness:.94,roughness:.04,
+      envMap:E,envMapIntensity:4.5,clearcoat:1,clearcoatRoughness:0
+    })
+  );
+  trim.position.set(0,-0.845,0.55);
+  S.add(trim);
+
+  // Left and right screen-frame side edges
+  const sideGeo=new THREE.BoxGeometry(.18,.07,14);
+  const sideMat=trim.material;
+  const lSide=new THREE.Mesh(sideGeo,sideMat);lSide.position.set(-2.08,-0.845,0);
+  const rSide=new THREE.Mesh(sideGeo,sideMat);rSide.position.set(2.08,-0.845,0);
+  S.add(lSide,rSide);
+}
+
+// Shadow-casting directional light (creates the paw-shadow-on-ledge effect)
+function addShadowLight(S,o={}){
+  const dl=new THREE.DirectionalLight(o.c??0xFFF4E0,o.i??2.5);
+  dl.position.set(o.x??1,o.y??6,o.z??3);
+  dl.castShadow=true;
+  dl.shadow.mapSize.set(512,512);
+  dl.shadow.camera.near=0.5;
+  dl.shadow.camera.far=20;
+  dl.shadow.camera.left=-3;dl.shadow.camera.right=3;
+  dl.shadow.camera.top=4;dl.shadow.camera.bottom=-2;
+  dl.shadow.radius=4;
+  S.add(dl);
+  return dl;
+}
+
+// Cast shadow on mesh (and all children)
+function castShadow(obj){
+  obj.traverse(ch=>{if(ch.isMesh){ch.castShadow=true;}});
+  if(obj.isMesh)obj.castShadow=true;
+}
+
+const SC=[];
+
+// ════════════════════════════════════════════════════════════════════════════
+// A — Mercury Blob
+{
+  const R=mkR('c1'),S=new THREE.Scene(),C=mkC(44);
+  S.background=new THREE.Color(0x060608);
+  const E=ENV(R);lts(S);addShadowLight(S);addLedge(S,E);
+  const geo=new THREE.IcosahedronGeometry(1,6);
+  const p=geo.attributes.position;
+  for(let i=0;i<p.count;i++){
+    const x=p.getX(i),y=p.getY(i),z=p.getZ(i);
+    const th=Math.atan2(Math.sqrt(x*x+z*z),y),ph=Math.atan2(z,x);
+    const dv=1+.16*Math.sin(3*th)*Math.cos(2*ph)+.09*Math.cos(5*th)+.07*Math.sin(7*ph+1.2);
+    p.setXYZ(i,x*dv,y*dv,z*dv);
+  }
+  geo.computeVertexNormals();
+  const blob=new THREE.Mesh(geo,cm(E,{ir:1,iiOR:2.3,iR:[120,900],r:.04,ei:5.2}));
+  blob.position.y=0.25;blob.castShadow=true;
+  const pool=new THREE.Mesh(new THREE.CircleGeometry(2.5,80),
+    new THREE.MeshStandardMaterial({color:0x1A0800,roughness:.05,metalness:.8,envMap:E,envMapIntensity:2}));
+  pool.rotation.x=-Math.PI/2;pool.position.y=-0.87;pool.receiveShadow=true;
+  for(let i=1;i<=3;i++){
+    const rg=new THREE.Mesh(new THREE.TorusGeometry(.45+i*.3,.011,8,90),
+      new THREE.MeshStandardMaterial({color:0x602008,roughness:.2,metalness:.6,transparent:true,opacity:.7-i*.15}));
+    rg.rotation.x=-Math.PI/2;rg.position.y=-0.87;S.add(rg);
+  }
+  S.add(blob,pool);
+  SC.push({R,S,C,fn(t){blob.rotation.y=t*.3;blob.rotation.x=Math.sin(t*.2)*.1;}});
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// B — Brilliant Gem
+{
+  const R=mkR('c2'),S=new THREE.Scene(),C=mkC(40);
+  S.background=new THREE.Color(0x060608);
+  const E=ENV(R);lts(S,{wi:22,ci:14,ri:10});addShadowLight(S,{i:3});addLedge(S,E);
+  const F=10,tR=.58,cH=.42,pH=.88;
+  const v=[0,cH,0];
+  for(let i=0;i<F;i++){const a=i/F*Math.PI*2;v.push(tR*Math.cos(a),cH,tR*Math.sin(a));}
+  for(let i=0;i<F;i++){const a=(i+.5)/F*Math.PI*2;v.push(Math.cos(a),0,Math.sin(a));}
+  v.push(0,-pH,0);
+  const tO=1,gO=F+1,bot=F*2+1,ix=[];
+  for(let i=0;i<F;i++){
+    const j=(i+1)%F;
+    ix.push(0,tO+i,tO+j, tO+i,gO+i,tO+j, tO+j,gO+i,gO+j, gO+i,bot,gO+j);
+  }
+  const geo=new THREE.BufferGeometry();
+  geo.setAttribute('position',new THREE.BufferAttribute(new Float32Array(v),3));
+  geo.setIndex(ix);geo.computeVertexNormals();
+  const gem=new THREE.Mesh(geo,new THREE.MeshPhysicalMaterial({
+    color:0xD0D8FF,metalness:.05,roughness:0,envMap:E,envMapIntensity:5.5,
+    clearcoat:1,clearcoatRoughness:0,transmission:.82,thickness:1.4,ior:2.4,transparent:true
+  }));
+  gem.scale.setScalar(1.12);gem.position.y=0.22;gem.castShadow=true;
+  const base=new THREE.Mesh(new THREE.TorusGeometry(.72,.035,16,70),cm(E,{r:.02}));
+  base.rotation.x=Math.PI/2;base.position.y=-.02;base.castShadow=true;
+  S.add(gem,base);
+  SC.push({R,S,C,fn(t){gem.rotation.y=t*.22;base.rotation.y=t*.22;}});
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// C — Trefoil Knot
+{
+  const R=mkR('c3'),S=new THREE.Scene(),C=mkC(48);
+  S.background=new THREE.Color(0x060608);
+  const E=ENV(R);lts(S,{wi:16,ci:12});addShadowLight(S);addLedge(S,E);
+  const mesh=new THREE.Mesh(new THREE.TorusKnotGeometry(.65,.14,320,28,2,3),cm(E,{r:.025,ei:4.8}));
+  mesh.position.y=0.2;mesh.castShadow=true;S.add(mesh);
+  SC.push({R,S,C,fn(t){mesh.rotation.y=t*.22;mesh.rotation.x=Math.sin(t*.3)*.12;}});
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// D — Wave Torus
+{
+  const R=mkR('c4'),S=new THREE.Scene(),C=mkC(44);
+  S.background=new THREE.Color(0x060608);
+  const E=ENV(R);lts(S);addShadowLight(S);addLedge(S,E);
+  const TU=200,TV=64,maj=.9,mn=.27;
+  const wv=[],wuv=[],wix=[];
+  for(let j=0;j<=TV;j++){
+    const vj=j/TV*Math.PI*2;
+    for(let i=0;i<=TU;i++){
+      const u=i/TU*Math.PI*2;
+      const w=.1*Math.sin(8*u)*Math.cos(4*vj);
+      const rr=maj+(mn+w)*Math.cos(vj);
+      wv.push(rr*Math.cos(u),(mn+w)*Math.sin(vj),rr*Math.sin(u));
+      wuv.push(i/TU,j/TV);
+    }
+  }
+  for(let j=0;j<TV;j++)for(let i=0;i<TU;i++){
+    const a=j*(TU+1)+i,b=a+1,c=a+(TU+1),dd=c+1;
+    wix.push(a,b,dd,a,dd,c);
+  }
+  const geo=new THREE.BufferGeometry();
+  geo.setAttribute('position',new THREE.BufferAttribute(new Float32Array(wv),3));
+  geo.setAttribute('uv',new THREE.BufferAttribute(new Float32Array(wuv),2));
+  geo.setIndex(wix);geo.computeVertexNormals();
+  const mesh=new THREE.Mesh(geo,cm(E,{ir:.5,iR:[100,600],r:.03,ei:4.5}));
+  mesh.position.y=0.2;mesh.castShadow=true;S.add(mesh);
+  SC.push({R,S,C,fn(t){mesh.rotation.y=t*.2;mesh.rotation.z=Math.sin(t*.4)*.1;}});
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// E — Gravity Funnel
+{
+  const R=mkR('c5'),S=new THREE.Scene();
+  const C=new THREE.PerspectiveCamera(52,1,.1,100);
+  C.position.set(0,2.2,4.2);C.lookAt(0,-0.8,0);
+  S.background=new THREE.Color(0x030305);
+  const E=ENV(R);lts(S,{wi:12,ci:8,ri:10});addShadowLight(S,{y:8,i:2});addLedge(S,E);
+  const FN=56,fv=[],fix=[];
+  for(let j=0;j<=FN;j++)for(let i=0;i<=FN;i++){
+    const u=(i/FN-.5)*7,w=(j/FN-.5)*7;
+    const rr=Math.sqrt(u*u+w*w);
+    fv.push(u,-2.8/(rr*.5+.22)+.4,w);
+  }
+  for(let j=0;j<FN;j++)for(let i=0;i<FN;i++){
+    const a=j*(FN+1)+i,b=a+1,c=a+(FN+1),dd=c+1;
+    fix.push(a,c,b,b,c,dd);
+  }
+  const geo=new THREE.BufferGeometry();
+  geo.setAttribute('position',new THREE.BufferAttribute(new Float32Array(fv),3));
+  geo.setIndex(fix);geo.computeVertexNormals();
+  const mesh=new THREE.Mesh(geo,new THREE.MeshPhysicalMaterial({
+    color:0x303848,metalness:.95,roughness:.06,envMap:E,envMapIntensity:3.5,side:THREE.DoubleSide
+  }));
+  mesh.castShadow=true;
+  const wf=new THREE.Mesh(geo.clone(),new THREE.MeshBasicMaterial({color:0x001833,wireframe:true,opacity:.2,transparent:true}));
+  const hole=new THREE.Mesh(new THREE.SphereGeometry(.14,32,32),new THREE.MeshBasicMaterial({color:0}));
+  const gl=new THREE.PointLight(CY,18,4);
+  S.add(mesh,wf,hole,gl);
+  SC.push({R,S,C,fn(t){mesh.rotation.z=t*.07;wf.rotation.z=t*.07;}});
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// F — Möbius Band
+{
+  const R=mkR('c6'),S=new THREE.Scene(),C=mkC(42);
+  S.background=new THREE.Color(0x060608);
+  const E=ENV(R);lts(S);addShadowLight(S);addLedge(S,E);
+  const MU=220,MV=20,mv=[],muv=[],mix=[];
+  for(let j=0;j<=MV;j++){
+    const vj=(j/MV-.5)*.72;
+    for(let i=0;i<=MU;i++){
+      const u=i/MU*Math.PI*2,h=u/2,r2=1+vj*Math.cos(h);
+      mv.push(r2*Math.cos(u),vj*Math.sin(h),r2*Math.sin(u));
+      muv.push(i/MU,j/MV);
+    }
+  }
+  for(let j=0;j<MV;j++)for(let i=0;i<MU;i++){
+    const a=j*(MU+1)+i,b=a+1,c=a+(MU+1),dd=c+1;
+    mix.push(a,b,c,b,dd,c);
+  }
+  const geo=new THREE.BufferGeometry();
+  geo.setAttribute('position',new THREE.BufferAttribute(new Float32Array(mv),3));
+  geo.setAttribute('uv',new THREE.BufferAttribute(new Float32Array(muv),2));
+  geo.setIndex(mix);geo.computeVertexNormals();
+  const mesh=new THREE.Mesh(geo,cm(E,{r:.025,ei:5,m:.99}));
+  mesh.scale.setScalar(.88);mesh.position.y=0.15;mesh.castShadow=true;S.add(mesh);
+  SC.push({R,S,C,fn(t){mesh.rotation.y=t*.2;mesh.rotation.x=Math.sin(t*.35)*.15;}});
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// G — Three Orbits
+{
+  const R=mkR('c7'),S=new THREE.Scene(),C=mkC(44);
+  S.background=new THREE.Color(0x060608);
+  const E=ENV(R);lts(S);addShadowLight(S);addLedge(S,E);
+  const tg=new THREE.TorusGeometry(.96,.042,20,130);
+  const r1=new THREE.Mesh(tg,cm(E,{r:.025,ei:5}));r1.castShadow=true;
+  const r2=new THREE.Mesh(tg,cm(E,{c:0xB0B8C0,r:.025,ei:4.5}));r2.rotation.x=Math.PI/2;r2.castShadow=true;
+  const r3=new THREE.Mesh(tg,cm(E,{c:0xA8BCC0,r:.025,ei:4}));r3.rotation.x=Math.PI/3;r3.rotation.z=Math.PI/5;r3.castShadow=true;
+  const cs=new THREE.Mesh(new THREE.SphereGeometry(.16,64,64),cm(E,{r:.01,ei:6}));cs.castShadow=true;
+  const grp=new THREE.Group();grp.add(r1,r2,r3,cs);grp.position.y=0.22;
+  const nr=new THREE.Mesh(new THREE.TorusGeometry(1.04,.007,8,100),new THREE.MeshBasicMaterial({color:CY}));
+  nr.rotation.x=-Math.PI/2;nr.position.y=-0.87;
+  const nl=new THREE.PointLight(CY,8,5);nl.position.set(0,-0.8,0);
+  S.add(grp,nr,nl);
+  SC.push({R,S,C,fn(t){grp.rotation.y=t*.22;grp.rotation.x=t*.13;}});
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// H — Gyroid
+{
+  const R=mkR('c8'),S=new THREE.Scene(),C=mkC(42);
+  S.background=new THREE.Color(0x050508);
+  const E=ENV(R);lts(S,{wi:16,ci:14,ri:6});addShadowLight(S);addLedge(S,E);
+  const geo=new THREE.IcosahedronGeometry(1,5);
+  const gp=geo.attributes.position;
+  for(let i=0;i<gp.count;i++){
+    const x=gp.getX(i)*Math.PI*2.5,y=gp.getY(i)*Math.PI*2.5,z=gp.getZ(i)*Math.PI*2.5;
+    const gv=Math.sin(x)*Math.cos(y)+Math.sin(y)*Math.cos(z)+Math.sin(z)*Math.cos(x);
+    const dv=1+gv*.18;gp.setXYZ(i,gp.getX(i)*dv,gp.getY(i)*dv,gp.getZ(i)*dv);
+  }
+  geo.computeVertexNormals();
+  const mesh=new THREE.Mesh(geo,cm(E,{r:.025,ei:5,ir:.7,iR:[60,600]}));
+  mesh.position.y=0.2;mesh.castShadow=true;
+  const cube=new THREE.LineSegments(
+    new THREE.EdgesGeometry(new THREE.BoxGeometry(2.15,2.15,2.15)),
+    new THREE.LineBasicMaterial({color:CY,transparent:true,opacity:.2})
+  );
+  S.add(mesh,cube);
+  SC.push({R,S,C,fn(t){mesh.rotation.y=t*.18;mesh.rotation.x=t*.11;cube.rotation.copy(mesh.rotation);}});
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// I — Hyperboloid
+{
+  const R=mkR('c9'),S=new THREE.Scene(),C=mkC(42);
+  S.background=new THREE.Color(0x060608);
+  const E=ENV(R);lts(S);addShadowLight(S);addLedge(S,E);
+  const NR=24,NH=36,ha=.56,hc=.76;
+  const hv=[],hix=[];
+  for(let j=0;j<=NH;j++){
+    const y=-1.4+j/NH*2.8;
+    const hr=ha*Math.sqrt(1+y*y/(hc*hc));
+    for(let i=0;i<=NR;i++){
+      const ang=i/NR*Math.PI*2+(j/NH)*Math.PI*.7;
+      hv.push(hr*Math.cos(ang),y,hr*Math.sin(ang));
+    }
+  }
+  for(let j=0;j<NH;j++)for(let i=0;i<NR;i++){
+    const a=j*(NR+1)+i,b=a+1,c=a+(NR+1),dd=c+1;
+    hix.push(a,c,b,b,c,dd);
+  }
+  const geo=new THREE.BufferGeometry();
+  geo.setAttribute('position',new THREE.BufferAttribute(new Float32Array(hv),3));
+  geo.setIndex(hix);geo.computeVertexNormals();
+  const mesh=new THREE.Mesh(geo,cm(E,{r:.03,ei:4.5}));
+  mesh.position.y=0.2;mesh.castShadow=true;
+  const cap1=new THREE.Mesh(new THREE.CircleGeometry(.63,NR),cm(E,{r:.02}));
+  cap1.rotation.x=-Math.PI/2;cap1.position.y=1.6;cap1.castShadow=true;
+  const cap2=cap1.clone();cap2.rotation.x=Math.PI/2;cap2.position.y=-1.2;
+  const gl=new THREE.PointLight(CY,6,4);gl.position.y=-1.3;
+  S.add(mesh,cap1,cap2,gl);
+  SC.push({R,S,C,fn(t){mesh.rotation.y=t*.28;cap1.rotation.z=t*.28;cap2.rotation.z=-t*.28;}});
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// J — Nautilus
+{
+  const R=mkR('c10'),S=new THREE.Scene(),C=mkC(44);
+  S.background=new THREE.Color(0x060608);
+  const E=ENV(R);lts(S);addShadowLight(S);addLedge(S,E);
+  const npts=[];
+  for(let i=0;i<=480;i++){
+    const t=i/480*Math.PI*7;
+    const nr=.06*Math.exp(.18*t);
+    npts.push(new THREE.Vector3(nr*Math.cos(t),nr*.28*Math.sin(t*1.4+.4)-t*.028,nr*Math.sin(t)));
+  }
+  const grp=new THREE.Group();
+  const tube=new THREE.Mesh(
+    new THREE.TubeGeometry(new THREE.CatmullRomCurve3(npts),700,.05,16,false),
+    cm(E,{r:.03,ei:4.5})
+  );
+  tube.castShadow=true;
+  grp.add(tube);grp.position.set(-.1,.5,0);S.add(grp);
+  SC.push({R,S,C,fn(t){grp.rotation.y=t*.18;grp.rotation.z=Math.sin(t*.28)*.06;}});
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// K — Trumpet Bell
+{
+  const R=mkR('c11'),S=new THREE.Scene(),C=mkC(44);
+  S.background=new THREE.Color(0x060608);
+  const E=ENV(R);lts(S,{wc:0xFFAA40,wi:20,ci:12});addShadowLight(S,{c:0xFFDD88,i:2.5});addLedge(S,E);
+  const kpts=[];
+  for(let i=0;i<=70;i++){
+    const t=i/70;kpts.push(new THREE.Vector2(.1+Math.exp(t*2.9-2.2)*.72,t*2.6-1.2));
+  }
+  const bell=new THREE.Mesh(new THREE.LatheGeometry(kpts,80),
+    new THREE.MeshPhysicalMaterial({color:GOLD,metalness:.98,roughness:.025,
+      envMap:E,envMapIntensity:4.5,clearcoat:1,clearcoatRoughness:0,side:THREE.DoubleSide}));
+  bell.position.y=0.1;bell.castShadow=true;
+  const rim=new THREE.Mesh(new THREE.TorusGeometry(.77,.028,16,80),cm(E,{r:.02}));
+  rim.position.y=1.2;rim.castShadow=true;
+  S.add(bell,rim);
+  SC.push({R,S,C,fn(t){bell.rotation.y=t*.18;rim.rotation.y=t*.18;}});
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// L — Organic Vase
+{
+  const R=mkR('c12'),S=new THREE.Scene(),C=mkC(42);
+  S.background=new THREE.Color(0x060608);
+  const E=ENV(R);lts(S,{wc:AM,wi:20,ci:12});addShadowLight(S,{c:0xFFCC66,i:3});addLedge(S,E);
+  const lpts=[];
+  for(let i=0;i<=60;i++){
+    const t=i/60;
+    const lr=.07+.82*Math.pow(Math.sin(t*Math.PI),1.2)+.2*Math.sin(t*Math.PI*4.5)*.45;
+    lpts.push(new THREE.Vector2(Math.max(.04,lr),t*2.7-1.35));
+  }
+  const mesh=new THREE.Mesh(new THREE.LatheGeometry(lpts,90),cm(E,{c:GOLD,r:.055,ei:3.8}));
+  mesh.position.y=0.2;mesh.castShadow=true;S.add(mesh);
+  SC.push({R,S,C,fn(t){mesh.rotation.y=t*.2;}});
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// M — Star Polyhedron
+{
+  const R=mkR('c13'),S=new THREE.Scene(),C=mkC(42);
+  S.background=new THREE.Color(0x060608);
+  const E=ENV(R);lts(S,{wi:20,ci:14,ri:8});addShadowLight(S);addLedge(S,E);
+  const grp=new THREE.Group();
+  const core=new THREE.Mesh(new THREE.OctahedronGeometry(.52,0),cm(E,{r:.02,ei:5}));
+  core.castShadow=true;grp.add(core);
+  const fc=.52/Math.sqrt(3);
+  [[1,1,1],[-1,1,1],[1,-1,1],[-1,-1,1],[1,1,-1],[-1,1,-1],[1,-1,-1],[-1,-1,-1]].forEach(([x,y,z])=>{
+    const ln=Math.sqrt(3);
+    const spike=new THREE.Mesh(new THREE.ConeGeometry(.19,.85,6,1),cm(E,{c:GOLD,r:.04,ei:4}));
+    spike.position.set(x/ln*fc,y/ln*fc,z/ln*fc);
+    spike.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0),new THREE.Vector3(x/ln,y/ln,z/ln));
+    spike.castShadow=true;grp.add(spike);
+  });
+  grp.position.y=0.2;S.add(grp);
+  SC.push({R,S,C,fn(t){grp.rotation.y=t*.22;grp.rotation.x=t*.11;}});
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// N — Crystal Array
+{
+  const R=mkR('c14'),S=new THREE.Scene(),C=mkC(44);
+  S.background=new THREE.Color(0x060608);
+  const E=ENV(R);lts(S,{wi:16,ci:14,ri:10});addShadowLight(S,{x:0,y:7,z:2,i:3});addLedge(S,E);
+  const grp=new THREE.Group();
+  [{h:2.2,r:.12,x:0,z:0,lean:0},
+   {h:1.6,r:.09,x:.45,z:.3,lean:.06},
+   {h:1.4,r:.08,x:-.42,z:.2,lean:-.05},
+   {h:1.0,r:.07,x:.25,z:-.45,lean:.04},
+   {h:.85,r:.065,x:-.3,z:-.4,lean:-.07},
+   {h:.75,r:.06,x:.6,z:-.1,lean:.05},
+   {h:.65,r:.055,x:-.58,z:0,lean:-.04}
+  ].forEach(({h,r,x,z,lean})=>{
+    const body=new THREE.Mesh(new THREE.CylinderGeometry(r*.4,r,h*.7,6),cm(E,{r:.025,ei:4.5}));
+    const tip=new THREE.Mesh(new THREE.ConeGeometry(r*.4,h*.35,6),cm(E,{c:0xD0D8FF,r:.015,ei:5.5}));
+    body.position.y=h*.35;tip.position.y=h*.7+h*.175;
+    body.castShadow=true;tip.castShadow=true;
+    const cg=new THREE.Group();cg.add(body,tip);
+    cg.position.set(x,-0.87,z);cg.rotation.z=lean;
+    grp.add(cg);
+  });
+  S.add(grp);
+  SC.push({R,S,C,fn(t){grp.rotation.y=t*.18;}});
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// O — Star Knot
+{
+  const R=mkR('c15'),S=new THREE.Scene(),C=mkC(48);
+  S.background=new THREE.Color(0x060608);
+  const E=ENV(R);lts(S,{wi:16,ci:12});addShadowLight(S);addLedge(S,E);
+  const mesh=new THREE.Mesh(new THREE.TorusKnotGeometry(.55,.1,400,28,3,5),
+    cm(E,{c:0xD4B8A0,r:.03,ei:4.5,ir:.3,iR:[80,400]}));
+  mesh.position.y=0.2;mesh.castShadow=true;S.add(mesh);
+  SC.push({R,S,C,fn(t){mesh.rotation.y=t*.2;mesh.rotation.x=Math.sin(t*.28)*.1;}});
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// P — Saddle Surface
+{
+  const R=mkR('c16'),S=new THREE.Scene();
+  const C=new THREE.PerspectiveCamera(50,1,.1,100);
+  C.position.set(0,1.2,4.2);C.lookAt(0,-0.3,0);
+  S.background=new THREE.Color(0x060608);
+  const E=ENV(R);lts(S,{wi:18,ci:14,ri:6});addShadowLight(S,{y:6,i:2});addLedge(S,E);
+  const SN=60,sv=[],six=[];
+  for(let j=0;j<=SN;j++)for(let i=0;i<=SN;i++){
+    const u=(i/SN-.5)*3.2,w=(j/SN-.5)*3.2;
+    sv.push(u,u*u*.62-w*w*.62,w);
+  }
+  for(let j=0;j<SN;j++)for(let i=0;i<SN;i++){
+    const a=j*(SN+1)+i,b=a+1,c=a+(SN+1),dd=c+1;
+    six.push(a,c,b,b,c,dd);
+  }
+  const geo=new THREE.BufferGeometry();
+  geo.setAttribute('position',new THREE.BufferAttribute(new Float32Array(sv),3));
+  geo.setIndex(six);geo.computeVertexNormals();
+  const mesh=new THREE.Mesh(geo,new THREE.MeshPhysicalMaterial({
+    color:0x384050,metalness:.95,roughness:.05,envMap:E,envMapIntensity:4,
+    clearcoat:1,clearcoatRoughness:0,side:THREE.DoubleSide
+  }));
+  mesh.castShadow=true;
+  const edges=new THREE.LineSegments(
+    new THREE.EdgesGeometry(geo),
+    new THREE.LineBasicMaterial({color:CY,transparent:true,opacity:.18})
+  );
+  S.add(mesh,edges);
+  SC.push({R,S,C,fn(t){mesh.rotation.z=t*.15;edges.rotation.z=t*.15;}});
+}
+
+// ── RENDER LOOP ───────────────────────────────────────────────────────────────
+(function loop(){
+  requestAnimationFrame(loop);
+  const t=performance.now()/1000;
+  SC.forEach(({R,S,C,fn})=>{fn(t);R.render(S,C);});
+})();
+</script>
+</body>
+</html>

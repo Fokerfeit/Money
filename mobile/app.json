@@ -6,7 +6,7 @@
     "orientation": "portrait",
     "icon": "./assets/logo.png",
     "userInterfaceStyle": "dark",
-    "newArchEnabled": true,
+    "newArchEnabled": false,
     "splash": {
       "image": "./assets/logo.png",
       "resizeMode": "contain",
@@ -22,11 +22,30 @@
         "backgroundColor": "#0a0a0a"
       },
       "package": "com.fokerfeit.money",
-      "edgeToEdgeEnabled": true
+      "edgeToEdgeEnabled": true,
+      "usesCleartextTraffic": true,
+      "permissions": []
     },
     "web": {
       "favicon": "./assets/logo.png"
     },
-    "plugins": []
+    "plugins": [
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "usesCleartextTraffic": true
+          }
+        }
+      ],
+      "expo-secure-store",
+      "expo-video"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "4bd2cece-f8b0-4776-b503-d0c5b1d59f83"
+      }
+    },
+    "owner": "fokerfeit"
   }
 }

@@ -8,10 +8,7 @@
 // Both your phone AND server must be on the same Wi-Fi network.
 // ─────────────────────────────────────────────────────────────────────────
 
-export const BACKEND_IP   = '192.168.4.34';   // ← change this when your IP changes
-export const BACKEND_PORT = 3000;
-
-export const BACKEND_URL        = `http://${BACKEND_IP}:${BACKEND_PORT}`;
+export const BACKEND_URL        = 'https://api.moneyforeveryone.app';
 export const FAUCET_ADDRESS     = 'FAUCET';
 export const RESERVE_ADDRESS    = 'SWARM_RESERVE';
 export const BASE_PENALTY       = 100;          // MONEY burned per disconnect infraction
