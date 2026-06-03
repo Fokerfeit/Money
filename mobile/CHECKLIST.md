@@ -1,87 +1,78 @@
-# MONEY — Ship & test checklist
+# MONEY — Test & Run Checklist
 
-Goal: test the app end-to-end with a second person against the live backend,
-and watch real transactions land.
-
----
-
-## STEP 1 — Deploy the hardened backend FIRST (critical)
-
-The app was rewritten to rely on the signed key + Google identity — it no longer
-sends face hashes. The current `server.js` matches that; an older deployed server
-that still requires face hashes will **reject every ignition**. So redeploy before testing.
-
-On the server host (api.moneyforeveryone.app):
-- [ ] Get the latest `server.js` onto the host (git pull / scp).
-- [ ] Set the platform-wallet env var so nocopycART payments are accepted:
-  ```
-  MONEY_PLATFORM_ADDRESSES=M_F66DCDBCD2FA68D8FCEE50A503CFBA20
-  TRUST_PROXY=1
-  ```
-  (see `.env.example`; set these however the host loads env — systemd unit, PM2 ecosystem, Docker, etc.)
-- [ ] Restart the server (`node server.js`, or `pm2 restart money`, etc.).
-- [ ] Confirm it's live:
-  ```
-  curl https://api.moneyforeveryone.app/health
-  curl https://api.moneyforeveryone.app/stats
-  ```
-  `/health` should return `{ "status": "ok", ... }`.
+Status: **private test only.** Nothing is public. Do not deploy / go live without
+Luca's explicit approval (see the standing rule in memory).
 
 ---
 
-## STEP 2 — Build the Android APK (~10 min, you just wait)
+## 🔑 Your ignition codes (single-use — one seal each)
+| Code | For |
+|---|---|
+| `LUCA-1` | You |
+| `GUEST-1` | Your friend |
 
-- [ ] Terminal in the MONEY-Test folder:
-  ```
-  npx eas build --profile preview --platform android
-  ```
-- [ ] Wait for the build; you get a link.
-- [ ] Open the link on BOTH phones to install.
+Each code makes exactly **one** wallet. Reused, missing, or fake codes are rejected.
+To issue more codes, restart the server with more in `IGNITION_CODES` (see below).
 
 ---
 
-## STEP 3 — Two-person test (do these in order)
+## ▶️ Get your 1,000,000 (on your phone)
+The server runs on this PC; your phone talks to it over Wi-Fi.
 
-**She sets up the app:**
-- [ ] Completes setup (face scan, voice, thumbprint, PIN).
-- [ ] Lands on the main screen with a balance ✅
-  - (Watch the server log: you should see a `TX: FAUCET → M_... ` line and `/stats` users count go up.)
+1. Make sure **phone + PC are on the same Wi-Fi.**
+2. **Reload the app** — Metro terminal press `r`, or shake → Reload.
+   - If it's stuck at 0.00 on the main screen, clear it first: phone **Settings → Apps → Expo Go → Storage → Clear data**, reopen, re-scan the QR.
+3. Go through onboarding to the **Ignite** screen.
+4. In the **"Founder's ignition code"** box, type **`LUCA-1`**.
+5. Tap **Ignite** → balance becomes **1,000,000** 🎉
 
-**You two send money:**
-- [ ] She sends you some MONEY.
-- [ ] Her phone asks for fingerprint/face before sending ✅
-- [ ] Your balance updates within ~1 minute ✅
-- [ ] `curl https://api.moneyforeveryone.app/ledger` shows the transfer.
+Your friend does the same with **`GUEST-1`**. Then send money between phones to test transfers.
 
-**Try to cheat (these should all FAIL):**
-- [ ] She tries to claim her starting money a second time → blocked ("already been ignited") ✅
-- [ ] She tries to send more than she has → blocked ("Insufficient balance") ✅
-- [ ] Forged faucet claim from a laptop (below) → blocked ✅
+---
 
-**Laptop cheat test** — paste in a terminal:
+## 🖥️ Running the server
+
+It's already running in this session. To run it yourself (so it survives), open a
+terminal in `MONEY-Test` and run **one** line:
+
 ```
-curl -X POST https://api.moneyforeveryone.app/transaction -H "Content-Type: application/json" -d "{\"from\":\"FAUCET\",\"to\":\"M_FAKEADDRESS\",\"amount\":999999}"
+# Windows PowerShell
+$env:MONEY_PLATFORM_ADDRESSES="M_F66DCDBCD2FA68D8FCEE50A503CFBA20"; $env:IGNITION_CODES="LUCA-1,GUEST-1"; node server.js
 ```
-Expected: a **401 rejection** — `"Transaction timestamp expired or invalid"` (no timestamp) or,
-if you add a fresh timestamp, `"Ignition must include signature, publicKey, and timestamp"`.
-The point: a faucet claim with no valid signature is **rejected**, never `success`.
+
+- It listens on `http://192.168.4.41:3000` (your PC, Wi-Fi only — not the internet).
+- `config.js` already points the app here (local testing). The production URL is
+  commented out below it; swap back only when you deploy (with approval).
+- If your phone can't connect: allow port 3000 through Windows Firewall —
+  in an **Admin** PowerShell:
+  `New-NetFirewallRule -DisplayName "MONEY 3000" -Direction Inbound -LocalPort 3000 -Protocol TCP -Action Allow`
 
 ---
 
-## STEP 4 — Sanity-check the backend state
+## ✅ What's protected (verified by tests)
+- `node attack_sim.js` → 14/14 standard attacks blocked
+- `node flow_test.js` → full ignite→send→balance journey (10/10)
+- `node adversary_demo.js` → unlimited-mint blocked (0 minted without a code)
 
-- [ ] `GET /stats` — transactions, registeredUsers, googleSeals, replayFenceSize.
-- [ ] `GET /ledger` — every test transfer is present, amounts correct.
-- [ ] Run the local attack simulation any time: `node attack_sim.js` (should print ALL ... BLOCKED).
+Run any of them anytime. (Use `PORT=3100 node attack_sim.js` if the main server is up.)
 
 ---
 
-## LATER — Nice to have (no rush)
+## 📦 Build a shareable APK (optional — when you want it on phones without Metro)
+Needs your Expo login; takes ~10 min. From `MONEY-Test`:
+```
+npx eas build --profile preview --platform android
+```
+Open the resulting link on each phone to install. (A preview build for a friend is
+fine; publishing to an app store is a "go-live" step → needs approval.)
 
-- [ ] Turn on Google Sign-In in the app to activate the Sybil gate. It's currently
-      commented out (needs a native build), so `google_sub` is undefined and the
-      "one seal per human" gate is dormant — identity falls back to the signed key,
-      which a fresh keypair defeats. This is the main thing standing between "demo"
-      and "real Sybil resistance".
-- [ ] Auth-gate or remove the `/stats` debug endpoint before a public launch.
-- [ ] Add rate limiting to `/google-lookup` and `/ledger`.
+---
+
+## 🚦 Before an OPEN launch (strangers, real value) — NOT yet
+1. **Real identity** instead of codes: verified Google sign-in (server validates the
+   ID token) or phone-number OTP. Codes are great for a closed test, not the public.
+2. **Tamper-proof ledger**: today it's one server + one JSON file. A real launch needs
+   a distributed/append-only ledger so no single machine controls the money.
+3. **Deploy** server + set `TRUST_PROXY=1` behind a real proxy, HTTPS, backups.
+
+All gated on your approval.
