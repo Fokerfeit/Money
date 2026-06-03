@@ -6,11 +6,12 @@ const nacl      = require('tweetnacl');
 const rateLimit = require('express-rate-limit');
 
 const app = express();
-// Behind the HTTPS reverse proxy (api.moneyforeveryone.app) the client IP lives
-// in X-Forwarded-For. Trust one proxy hop so req.ip is the real client — otherwise
-// the rate limiter and ignition throttle key on the proxy's IP (one shared bucket
-// for everyone). Override with TRUST_PROXY for direct/multi-hop deployments.
-app.set('trust proxy', Number(process.env.TRUST_PROXY ?? 1));
+// SECURITY: default to NOT trusting X-Forwarded-For (0). A directly-exposed or
+// LAN server then keys the rate-limiter / ignition throttle on the real socket
+// IP, which a client CANNOT spoof. Set TRUST_PROXY=1 ONLY when behind a trusted
+// proxy that overwrites/appends the real client IP — otherwise a client can forge
+// X-Forwarded-For and bypass the per-IP ignition throttle (unlimited-mint vector).
+app.set('trust proxy', Number(process.env.TRUST_PROXY ?? 0));
 app.use(cors());
 app.use(express.json({ limit: '16kb' }));
 
@@ -21,6 +22,8 @@ const DATA_DIR             = process.env.MONEY_DATA_DIR || __dirname;
 const LEDGER_FILE          = process.env.MONEY_LEDGER_FILE   || path.join(DATA_DIR, 'ledger.json');
 const GOOGLE_ACCOUNTS_FILE = process.env.MONEY_GOOGLE_FILE   || path.join(DATA_DIR, 'google_accounts.json');
 const REPLAY_FENCE_FILE    = process.env.MONEY_FENCE_FILE    || path.join(DATA_DIR, 'replay_fence.json');
+const DEVICES_FILE         = process.env.MONEY_DEVICES_FILE  || path.join(DATA_DIR, 'devices.json');
+const USED_CODES_FILE      = process.env.MONEY_CODES_FILE    || path.join(DATA_DIR, 'ignition_codes_used.json');
 
 // ── Persistence helpers ────────────────────────────────────────────────────
 const loadJSON = (file, fallback) => {
@@ -47,6 +50,22 @@ let googleAccounts = loadJSON(GOOGLE_ACCOUNTS_FILE, {});
 // replay_fence.json stores { signature: timestampMs } — a persistent replay
 // fence so a signature can never be replayed, even across a server restart.
 let seenSigs = loadJSON(REPLAY_FENCE_FILE, {});
+
+// ── Anti-Sybil: server-issued single-use ignition codes ─────────────────────
+// IGNITION_CODES (comma-separated) are codes YOU hand out. The server controls
+// them, so — unlike a client-supplied google_sub or deviceId — they CANNOT be
+// forged. When non-empty, a faucet claim must present a valid, UNUSED code, and
+// each code seals exactly one identity. This is the real interim "one per human"
+// control (replace with verified Google/phone identity for open launch).
+const IGNITION_CODES = new Set(
+  (process.env.IGNITION_CODES || '').split(',').map(s => s.trim()).filter(Boolean)
+);
+let usedCodes = loadJSON(USED_CODES_FILE, {});   // code → address (consumed)
+
+// devices.json maps a per-install deviceId → address. Secondary signal: stops a
+// normal user on the official app from minting many wallets on one phone.
+// (Forgeable by a scripted attacker, so it's defence-in-depth, not the gate.)
+let devices = loadJSON(DEVICES_FILE, {});
 
 // ── Platform recipient allowlist ────────────────────────────────────────────
 // Addresses (comma-separated in MONEY_PLATFORM_ADDRESSES) that may RECEIVE
@@ -152,7 +171,7 @@ app.post('/google-lookup', (req, res) => {
 });
 
 app.post('/transaction', (req, res) => {
-  const { from, to, amount, reason, signature, publicKey, timestamp, google_sub } = req.body;
+  const { from, to, amount, reason, signature, publicKey, timestamp, google_sub, ignitionCode, deviceId } = req.body;
 
   // ── Basic field validation ─────────────────────────────────────────────
   if (!from || !to || amount == null)
@@ -213,6 +232,21 @@ app.post('/transaction', (req, res) => {
   // These checks run only for faucet claims (the ignition transaction).
   // ─────────────────────────────────────────────────────────────────────
   if (from === 'FAUCET') {
+    // Gate 0: Server-issued ignition code (the UNFORGEABLE one-per-human control).
+    // Only enforced when IGNITION_CODES is configured. A scripted attacker can
+    // forge keypairs, IPs and deviceIds — but NOT a code the server never issued.
+    if (IGNITION_CODES.size > 0) {
+      if (!ignitionCode || !IGNITION_CODES.has(ignitionCode))
+        return res.status(403).json({ error: 'A valid ignition code is required to seal. Ask the founder for yours.' });
+      if (usedCodes[ignitionCode])
+        return res.status(403).json({ error: 'This ignition code has already been used — one seal per code.' });
+    }
+
+    // Gate 0b: One seal per device (defence-in-depth — stops casual multi-wallet
+    // farming from the real app; forgeable by scripts, so it is NOT the main gate).
+    if (deviceId && devices[deviceId])
+      return res.status(400).json({ error: 'This device has already sealed an identity.' });
+
     // Gate 1: One faucet claim per wallet address
     if (txs.some(t => t.from === 'FAUCET' && t.to === to))
       return res.status(400).json({ error: 'This address has already been ignited' });
@@ -283,11 +317,22 @@ app.post('/transaction', (req, res) => {
   saveJSON(LEDGER_FILE,        txs);
   saveJSON(REPLAY_FENCE_FILE,  seenSigs); // atomically commits the replay fence
 
-  // Store google_sub → address mapping on first faucet claim
-  if (from === 'FAUCET' && google_sub) {
-    googleAccounts[google_sub] = to;
-    saveJSON(GOOGLE_ACCOUNTS_FILE, googleAccounts);
-    console.log(`Google account linked: ${google_sub.substring(0, 8)}... → ${to}`);
+  // On a successful ignition, consume the one-time code and seal the device.
+  if (from === 'FAUCET') {
+    if (ignitionCode && IGNITION_CODES.size > 0) {
+      usedCodes[ignitionCode] = to;
+      saveJSON(USED_CODES_FILE, usedCodes);
+      console.log(`[ignition-code] consumed code → ${to}`);
+    }
+    if (deviceId) {
+      devices[deviceId] = to;
+      saveJSON(DEVICES_FILE, devices);
+    }
+    if (google_sub) {
+      googleAccounts[google_sub] = to;
+      saveJSON(GOOGLE_ACCOUNTS_FILE, googleAccounts);
+      console.log(`Google account linked: ${google_sub.substring(0, 8)}... → ${to}`);
+    }
   }
 
   console.log(`TX: ${from} → ${to} | ${amt} MONEY${reason ? ` [${reason}]` : ''}`);
@@ -305,8 +350,9 @@ app.get('/stats', (req, res) => {
   });
 });
 
-app.listen(3000, '0.0.0.0', () => {
-  console.log('MONEY server listening on :3000');
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`MONEY server listening on :${PORT}`);
   console.log(`Registered users: ${userCount()} | Google seals: ${Object.keys(googleAccounts).length}`);
   if (PLATFORM_ADDRESSES.size > 0)
     console.log(`Platform recipients: ${[...PLATFORM_ADDRESSES].join(', ')}`);
