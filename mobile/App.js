@@ -291,17 +291,15 @@ const IDENTITY_CARDS = [
 // ── Screen entry animation — every screen fades + scales in from slightly zoomed-out ─
 const ScreenWrapper = ({ children, style }) => {
   const anim = useRef(new Animated.Value(0)).current;
-  const tilt = useTilt();   // gyroscope → parallax (no-op / null on web)
   useEffect(() => {
     Animated.spring(anim, { toValue: 1, tension: 55, friction: 9, useNativeDriver: NATIVE_DRIVER }).start();
   }, []);
   const scaleInterp = anim.interpolate({ inputRange: [0, 1], outputRange: [0.96, 1] });
   return (
-    <Animated.View style={[{ flex: 1, backgroundColor: IS_WEB ? 'transparent' : '#0E0700' }, style, { opacity: anim, transform: [{ scale: scaleInterp }] }]}>
-      {/* Anamorphic 3D box — native only (web uses HoloFX.web.js three.js scene).
-          BACK: perspective starfield parallaxed by gyro · MID: beveled frame. */}
-      {Platform.OS !== 'web' && <HoloBackground tilt={tilt} />}
-      {Platform.OS !== 'web' && <DepthFrame />}
+    <Animated.View style={[{ flex: 1, backgroundColor: 'transparent' }, style, { opacity: anim, transform: [{ scale: scaleInterp }] }]}>
+      {/* The deep-space background + depth frame are rendered ONCE at the app
+          root (see App() at the bottom) so EVERY screen shows them — not just
+          the ones wrapped in ScreenWrapper. */}
       {children}
       {/* Domain bar — floats above all screens on native (web is handled by HoloFX CSS) */}
       {Platform.OS !== 'web' && (
@@ -471,7 +469,7 @@ const pinBoxStyle = StyleSheet.create({
   dot:      { fontSize: 22, color: '#D4AF37', lineHeight: 26 },
 });
 
-export default function App() {
+function AppInner() {
   const [address,   setAddress]   = useState('');
   const [balance,   setBalance]   = useState(0);
   const [userCount, setUserCount] = useState(0);
@@ -1338,10 +1336,19 @@ export default function App() {
     return null; // passed
   };
 
+  const [ignitionCode, setIgnitionCode] = useState('');
   const triggerIgnition = async () => {
     const reward = calcReward(userCount);
     const ts  = Date.now();
     const sig = signTx('FAUCET', addrRef.current, reward, ts, secKeyRef.current);
+
+    // Stable per-install device id — a defence-in-depth Sybil signal so one
+    // phone can't seal many wallets through the official app.
+    let deviceId = await SecureStore.getItemAsync('device_id_v1').catch(() => null);
+    if (!deviceId) {
+      deviceId = [...ExpoCrypto.getRandomBytes(16)].map(b => b.toString(16).padStart(2, '0')).join('');
+      await SecureStore.setItemAsync('device_id_v1', deviceId).catch(() => {});
+    }
 
     // Sybil firewall stays server-side. The signed public key below is the real,
     // stable per-identity signal the server keys off — image hashes were dropped
@@ -1370,6 +1377,8 @@ export default function App() {
           from: 'FAUCET', to: addrRef.current, amount: reward,
           signature: sig, publicKey: pubKeyRef.current, timestamp: ts,
           google_sub: (await SecureStore.getItemAsync('google_sub_v1').catch(() => null)) || undefined,
+          deviceId,
+          ignitionCode: ignitionCode ? ignitionCode.trim().toUpperCase() : undefined,
         }),
       });
       clearTimeout(timeoutId);
@@ -1462,7 +1471,7 @@ export default function App() {
       cancelLabel: 'Cancel', disableDeviceFallback: false, fallbackLabel: 'Use PIN',
     });
     if (r.success) setOnboardingStep(32);
-    else Alert.alert('Try again', 'Authentication failed — try again.');
+    else Alert.alert('Seal not confirmed', `Couldn't verify (reason: ${r.error || 'unknown'}). Tap "Use PIN" on the prompt to seal with your device PIN instead.`);
   };
 
   const testRightThumb = async () => {
@@ -1472,7 +1481,7 @@ export default function App() {
       cancelLabel: 'Cancel', disableDeviceFallback: false, fallbackLabel: 'Use PIN',
     });
     if (r.success) { setPinSetup1(''); setPinSetup2(''); setPinSetupStep(1); setPinSetupError(''); setOnboardingStep(36); }
-    else Alert.alert('Try again', 'Authentication failed — try again.');
+    else Alert.alert('Second seal not confirmed', `Couldn't verify (reason: ${r.error || 'unknown'}). Tap "Use PIN" on the prompt and enter your device PIN, or use any enrolled fingerprint.`);
   };
 
   const testPin = async () => {
@@ -2417,6 +2426,28 @@ export default function App() {
             )}
           </View>
 
+          {/* Founder's one-time ignition code (server enforces it when configured) */}
+          {gatePassed && (
+            <View style={{ width: '100%', marginBottom: 14, paddingHorizontal: 4 }}>
+              <Text style={{ color: '#9A7B4A', fontSize: 11, letterSpacing: 3, textAlign: 'center', marginBottom: 8 }}>
+                ✦ FOUNDER'S IGNITION CODE
+              </Text>
+              <TextInput
+                value={ignitionCode}
+                onChangeText={setIgnitionCode}
+                placeholder="enter your one-time seal code"
+                placeholderTextColor="#5A3D1A"
+                autoCapitalize="characters"
+                autoCorrect={false}
+                style={{
+                  backgroundColor: 'rgba(28,17,4,0.6)', borderWidth: 1, borderColor: 'rgba(212,175,55,0.35)',
+                  borderRadius: 12, paddingVertical: 12, paddingHorizontal: 16, color: '#F1E2C0',
+                  fontSize: 15, letterSpacing: 2, textAlign: 'center',
+                }}
+              />
+            </View>
+          )}
+
           {/* Ignite button */}
           {gatePassed && (
             <AnimatedPress style={[s.btnIgnite, glassButton]} onPress={triggerIgnition}>
@@ -2855,6 +2886,19 @@ export default function App() {
       </ScrollView>
     </SafeAreaView>
     </ScreenWrapper>
+  );
+}
+
+// ── Root shell — renders the deep-space background + depth frame ONCE, behind
+//    EVERY screen (wrapped or not). Gyro tilt is read once here. ─────────────
+export default function App() {
+  const tilt = useTilt();
+  return (
+    <View style={{ flex: 1, backgroundColor: IS_WEB ? 'transparent' : '#0E0700' }}>
+      {Platform.OS !== 'web' && <HoloBackground tilt={tilt} />}
+      {Platform.OS !== 'web' && <DepthFrame />}
+      <AppInner />
+    </View>
   );
 }
 

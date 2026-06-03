@@ -37,11 +37,12 @@ const fakeHash = () => crypto.randomBytes(32).toString('hex');
 // A platform recipient address that never ignites via the faucet — it is
 // allowed to receive only because it is whitelisted in MONEY_PLATFORM_ADDRESSES.
 const PLATFORM_ADDR = 'M_DEADBEEFDEADBEEFDEADBEEFDEADBEEF';
+const PORT = process.env.PORT || 3000;  // override to avoid clashing with a running server
 
 const post = (body) => new Promise((resolve, reject) => {
   const data = JSON.stringify(body);
   const req  = http.request({
-    hostname: 'localhost', port: 3000, path: '/transaction',
+    hostname: 'localhost', port: PORT, path: '/transaction',
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) },
   }, (res) => {
@@ -86,6 +87,7 @@ const spawnServer = () => new Promise((resolve, reject) => {
       NODE_ENV: 'test',                          // 1000 ignition attempts/hr in test
       MONEY_DATA_DIR: tmpDir,
       MONEY_PLATFORM_ADDRESSES: PLATFORM_ADDR,   // whitelisted recipient under test
+      PORT: String(PORT),                        // isolate from any running server
     },
     stdio: 'pipe',
   });
