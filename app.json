@@ -4,7 +4,7 @@
     "slug": "money-proof-of-swarm",
     "version": "1.0.0",
     "orientation": "portrait",
-    "icon": "./assets/logo.png",
+    "icon": "./assets/icon-square.png",
     "userInterfaceStyle": "dark",
     "newArchEnabled": false,
     "splash": {
@@ -18,12 +18,11 @@
     },
     "android": {
       "adaptiveIcon": {
-        "foregroundImage": "./assets/logo.png",
+        "foregroundImage": "./assets/icon-square.png",
         "backgroundColor": "#0a0a0a"
       },
       "package": "com.fokerfeit.money",
       "edgeToEdgeEnabled": true,
-      "usesCleartextTraffic": true,
       "permissions": []
     },
     "web": {
@@ -39,7 +38,8 @@
         }
       ],
       "expo-secure-store",
-      "expo-video"
+      "expo-video",
+      "expo-web-browser"
     ],
     "extra": {
       "eas": {
