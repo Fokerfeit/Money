@@ -38,6 +38,8 @@ const fakeHash = () => crypto.randomBytes(32).toString('hex');
 // allowed to receive only because it is whitelisted in MONEY_PLATFORM_ADDRESSES.
 const PLATFORM_ADDR = 'M_DEADBEEFDEADBEEFDEADBEEFDEADBEEF';
 const PORT = process.env.PORT || 3000;  // override to avoid clashing with a running server
+// Produce the malleable S+L variant of a valid signature (must be rejected by canonical-S).
+const malleate = sigHex => { const L = 7237005577332262213973186563042994240857116359379907606001950938285454250989n; const sb = Buffer.from(sigHex, 'hex'); let Sp = (() => { let n = 0n; for (let i = 31; i >= 0; i--) n = (n << 8n) | BigInt(sb[32 + i]); return n; })() + L; const o = Buffer.alloc(32); for (let j = 0; j < 32; j++) { o[j] = Number(Sp & 0xffn); Sp >>= 8n; } return Buffer.concat([sb.slice(0, 32), o]).toString('hex'); };
 
 const post = (body) => new Promise((resolve, reject) => {
   const data = JSON.stringify(body);
@@ -87,6 +89,7 @@ const spawnServer = () => new Promise((resolve, reject) => {
       NODE_ENV: 'test',                          // 1000 ignition attempts/hr in test
       MONEY_DATA_DIR: tmpDir,
       MONEY_PLATFORM_ADDRESSES: PLATFORM_ADDR,   // whitelisted recipient under test
+      IGNITION_CODES: '',                        // no codes in this suite — it exercises the OTHER gates
       PORT: String(PORT),                        // isolate from any running server
     },
     stdio: 'pipe',
@@ -130,19 +133,19 @@ const spawnServer = () => new Promise((resolve, reject) => {
   // ── Block 2: Replay attacks ────────────────────────────────────────────
   console.log(Y('\n[ 2 ] Replay attacks'));
 
-  // To hit the replay gate we need a tx that passes timestamp but fails later.
-  // We craft one with a valid timestamp but wrong signature — it'll pass timestamp,
-  // get added to seenSigs, then fail on sig verify. Second attempt with same sig = replay catch.
-  const ts2 = Date.now();
-  const fakeSig = fakeHash(); // not a valid sig — will fail verifyTx, but that comes after seenSig insert
-  r = await post({ from: 'FAUCET', to: kp.address, amount: 1_000_000,
-    signature: fakeSig, publicKey: kp.publicKey, timestamp: ts2 });
-  // This will fail on sig verify, but the important thing is the sig is now in seenSigs
-
-  // Second attempt with the SAME signature (replay)
-  r = await post({ from: 'FAUCET', to: kp.address, amount: 1_000_000,
-    signature: fakeSig, publicKey: kp.publicKey, timestamp: ts2 });
-  expect('Exact replay of same signature is rejected', r, 401, 'duplicate transaction');
+  // Ignite two honest wallets, send a VALID transfer, then replay it verbatim.
+  // The message-keyed fence (checked AFTER signature verification) must reject it.
+  const rpA = makeKeypair(), rpB = makeKeypair();
+  const ta = Date.now();
+  await post({ from: 'FAUCET', to: rpA.address, amount: 1_000_000, signature: signTx('FAUCET', rpA.address, 1_000_000, ta, rpA.secretKey), publicKey: rpA.publicKey, timestamp: ta });
+  const tb = Date.now();
+  await post({ from: 'FAUCET', to: rpB.address, amount: 1_000_000, signature: signTx('FAUCET', rpB.address, 1_000_000, tb, rpB.secretKey), publicKey: rpB.publicKey, timestamp: tb });
+  const ttr = Date.now();
+  const transferBody = { from: rpA.address, to: rpB.address, amount: 100, signature: signTx(rpA.address, rpB.address, 100, ttr, rpA.secretKey), publicKey: rpA.publicKey, timestamp: ttr };
+  r = await post(transferBody);
+  expect('Valid transfer accepted (setup)', r, 200);
+  r = await post(transferBody); // replay verbatim
+  expect('Exact replay of the same transfer is rejected', r, 401, 'duplicate transaction');
 
   // ── Block 3: Signature forgery ─────────────────────────────────────────
   console.log(Y('\n[ 3 ] Signature forgery'));
@@ -163,25 +166,20 @@ const spawnServer = () => new Promise((resolve, reject) => {
     signature: tamperedSig, publicKey: victim.publicKey, timestamp: forgedTs });
   expect('Tampered signature is rejected', r, 401, 'invalid');
 
-  // ── Block 4: Google-identity Sybil gate ───────────────────────────────
-  console.log(Y('\n[ 4 ] Google-identity Sybil gate'));
+  // ── Block 4: Signature malleability (canonical-S) ─────────────────────
+  console.log(Y('\n[ 4 ] Signature malleability'));
 
-  // A google_sub may seal exactly one address. First claim succeeds.
-  const gsub      = 'google-sub-' + fakeHash().slice(0, 16);
-  const gSeal     = makeKeypair();
-  const tsg       = Date.now();
-  const sigg      = signTx('FAUCET', gSeal.address, 1_000_000, tsg, gSeal.secretKey);
-  r = await post({ from: 'FAUCET', to: gSeal.address, amount: 1_000_000,
-    signature: sigg, publicKey: gSeal.publicKey, timestamp: tsg, google_sub: gsub });
-  expect('First ignition linked to a Google identity is accepted', r, 200);
-
-  // Second address claiming the SAME google_sub is rejected (Sybil firewall).
-  const gSybil    = makeKeypair();
-  const tsg2      = Date.now();
-  const sigg2     = signTx('FAUCET', gSybil.address, 1_000_000, tsg2, gSybil.secretKey);
-  r = await post({ from: 'FAUCET', to: gSybil.address, amount: 1_000_000,
-    signature: sigg2, publicKey: gSybil.publicKey, timestamp: tsg2, google_sub: gsub });
-  expect('Second address reusing same Google identity is rejected', r, 400, 'already linked');
+  // A valid signature, re-encoded as the malleable S+L variant, must be rejected
+  // by the canonical-S check — so a captured transfer can't be re-applied.
+  const mA = makeKeypair(), mB = makeKeypair();
+  const tma = Date.now();
+  await post({ from: 'FAUCET', to: mA.address, amount: 1_000_000, signature: signTx('FAUCET', mA.address, 1_000_000, tma, mA.secretKey), publicKey: mA.publicKey, timestamp: tma });
+  const tmb = Date.now();
+  await post({ from: 'FAUCET', to: mB.address, amount: 1_000_000, signature: signTx('FAUCET', mB.address, 1_000_000, tmb, mB.secretKey), publicKey: mB.publicKey, timestamp: tmb });
+  const tmt = Date.now();
+  const goodSig = signTx(mA.address, mB.address, 100, tmt, mA.secretKey);
+  r = await post({ from: mA.address, to: mB.address, amount: 100, signature: malleate(goodSig), publicKey: mA.publicKey, timestamp: tmt });
+  expect('Malleated (S+L) signature is rejected', r, 401, 'invalid');
 
   // ── Block 5: Successful ignition (no Google identity — dormant gate) ───
   console.log(Y('\n[ 5 ] Legitimate ignition'));

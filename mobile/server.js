@@ -20,9 +20,7 @@ app.use(express.json({ limit: '16kb' }));
 // isolated data directory instead of clobbering the production ledger.
 const DATA_DIR             = process.env.MONEY_DATA_DIR || __dirname;
 const LEDGER_FILE          = process.env.MONEY_LEDGER_FILE   || path.join(DATA_DIR, 'ledger.json');
-const GOOGLE_ACCOUNTS_FILE = process.env.MONEY_GOOGLE_FILE   || path.join(DATA_DIR, 'google_accounts.json');
 const REPLAY_FENCE_FILE    = process.env.MONEY_FENCE_FILE    || path.join(DATA_DIR, 'replay_fence.json');
-const DEVICES_FILE         = process.env.MONEY_DEVICES_FILE  || path.join(DATA_DIR, 'devices.json');
 const USED_CODES_FILE      = process.env.MONEY_CODES_FILE    || path.join(DATA_DIR, 'ignition_codes_used.json');
 
 // ── Persistence helpers ────────────────────────────────────────────────────
@@ -38,16 +36,27 @@ const saveJSON = (file, data) => {
 // ── Load state ──────────────────────────────────────────────────────────────
 let txs = loadJSON(LEDGER_FILE, []);
 
-// google_accounts.json maps google_sub → MONEY address (one seal per human).
-// This is the anti-Sybil signal: the app sends google_sub on ignition, and a
-// Google identity may only ever ignite one address.
-//
-// NOTE: Google Sign-In is currently commented out in the app (it needs a native
-// build), so google_sub arrives undefined for now and this gate stays dormant.
-// When undefined, ignition falls back to "one claim per wallet address" only.
-let googleAccounts = loadJSON(GOOGLE_ACCOUNTS_FILE, {});
+// ── In-memory indexes for O(1) targeted lookups ──────────────────────────────
+// The scalability fix: instead of every client re-downloading the ENTIRE ledger
+// to find one payment (cost grows with total history), they query GET /tx with
+// a from/to/since filter served from these indexes (cost bounded by recent/
+// relevant activity). Rebuilt from txs on startup, kept in sync on each commit.
+// Arrays stay newest-first, matching the txs array.
+const idxFrom = new Map(); // address -> tx[]
+const idxTo   = new Map(); // address -> tx[]
+function indexTx(tx, prepend) {
+  for (const [map, key] of [[idxFrom, tx.from], [idxTo, tx.to]]) {
+    if (!key) continue;
+    let arr = map.get(key);
+    if (!arr) { arr = []; map.set(key, arr); }
+    if (prepend) arr.unshift(tx); else arr.push(tx);
+  }
+}
+// txs is newest-first; iterate oldest→newest with prepend so index arrays also
+// end up newest-first.
+for (let i = txs.length - 1; i >= 0; i--) indexTx(txs[i], true);
 
-// replay_fence.json stores { signature: timestampMs } — a persistent replay
+// replay_fence.json stores { messageKey: timestampMs } — a persistent replay
 // fence so a signature can never be replayed, even across a server restart.
 let seenSigs = loadJSON(REPLAY_FENCE_FILE, {});
 
@@ -61,11 +70,6 @@ const IGNITION_CODES = new Set(
   (process.env.IGNITION_CODES || '').split(',').map(s => s.trim()).filter(Boolean)
 );
 let usedCodes = loadJSON(USED_CODES_FILE, {});   // code → address (consumed)
-
-// devices.json maps a per-install deviceId → address. Secondary signal: stops a
-// normal user on the official app from minting many wallets on one phone.
-// (Forgeable by a scripted attacker, so it's defence-in-depth, not the gate.)
-let devices = loadJSON(DEVICES_FILE, {});
 
 // ── Platform recipient allowlist ────────────────────────────────────────────
 // Addresses (comma-separated in MONEY_PLATFORM_ADDRESSES) that may RECEIVE
@@ -96,7 +100,7 @@ saveJSON(REPLAY_FENCE_FILE, seenSigs);
 // Prune automatically every 5 minutes so the file stays bounded
 setInterval(() => { pruneSeenSigs(); saveJSON(REPLAY_FENCE_FILE, seenSigs); }, 5 * 60 * 1000);
 
-console.log(`MONEY server — ${txs.length} txs | ${Object.keys(googleAccounts).length} Google seals`);
+console.log(`MONEY server — ${txs.length} txs loaded`);
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 const fromHex    = (hex) => new Uint8Array(hex.match(/.{2}/g).map(b => parseInt(b, 16)));
@@ -116,8 +120,18 @@ const calcReward = (count) => {
 const getBalance = (addr) =>
   txs.reduce((b, t) => t.to === addr ? b + t.amount : t.from === addr ? b - t.amount : b, 0);
 
+// ── Canonical-S (anti-malleability) ─────────────────────────────────────────
+// ed25519 signatures are malleable: both S and S+L verify. tweetnacl does NOT
+// enforce S < L, so a re-encoded variant of a captured signature would pass.
+// We reject any non-canonical signature so a captured transfer cannot be
+// malleated into a "new" signature and double-applied.
+const ED25519_L = 7237005577332262213973186563042994240857116359379907606001950938285454250989n;
+const leToBig = (bytes) => { let n = 0n; for (let i = bytes.length - 1; i >= 0; i--) n = (n << 8n) | BigInt(bytes[i]); return n; };
+const isCanonicalSig = (sigHex) => { try { const b = fromHex(sigHex); return b.length === 64 && leToBig(b.slice(32)) < ED25519_L; } catch { return false; } };
+
 const verifyTx = (from, to, amount, timestamp, signature, publicKey) => {
   try {
+    if (!isCanonicalSig(signature)) return false;   // reject malleable / non-canonical signatures
     const msg = Buffer.from(`${from}:${to}:${amount}:${timestamp}`);
     return nacl.sign.detached.verify(msg, fromHex(signature), fromHex(publicKey));
   } catch { return false; }
@@ -143,43 +157,79 @@ const checkIgnitionThrottle = (ip) => {
   return true;
 };
 
-// ── Rate limiting — 20 req/min per IP ────────────────────────────────────
+// ── Failed ignition-code throttle (anti-brute-force) ─────────────────────────
+// Wrong/used code guesses are capped per IP per hour. Without this, an attacker
+// could brute-force the ignition codes at the general 20/min rate. With it,
+// guessing is throttled to a crawl even if a code has low entropy.
+const codeFails = new Map(); // ip -> { count, resetAt }
+const MAX_CODE_FAILS = process.env.NODE_ENV === 'test' ? 100000 : 10;
+const tooManyCodeFails = (ip) => {
+  const now = Date.now();
+  const slot = codeFails.get(ip) || { count: 0, resetAt: now + 60 * 60 * 1000 };
+  if (now > slot.resetAt) { slot.count = 0; slot.resetAt = now + 60 * 60 * 1000; }
+  codeFails.set(ip, slot);
+  return slot.count >= MAX_CODE_FAILS;
+};
+const noteCodeFail = (ip) => { const s = codeFails.get(ip); if (s) s.count++; };
+
+// ── Rate limiting ──────────────────────────────────────────────────────────
 app.use('/transaction', rateLimit({
   windowMs: 60 * 1000, max: 20,
   message: { error: 'Too many requests — slow down.' },
 }));
+// Real DoS protection: the public READ endpoints were unthrottled, so a flood of
+// /ledger or /balance could pin the single Node process. Cap them too.
+app.use(['/ledger', '/tx', '/balance', '/usercount'], rateLimit({
+  windowMs: 60 * 1000, max: 120,
+  message: { error: 'Too many requests — slow down.' },
+}));
 
 // ── Routes ────────────────────────────────────────────────────────────────
-app.get('/health',    (req, res) => res.json({ status: 'ok', transactions: txs.length, seals: Object.keys(googleAccounts).length }));
+app.get('/health',    (req, res) => res.json({ status: 'ok', transactions: txs.length, seals: userCount() }));
 app.get('/usercount', (req, res) => res.json({ count: userCount() }));
 app.get('/ledger',    (req, res) => res.json(txs));
+
+// ── Targeted lookup ──────────────────────────────────────────────────────────
+// GET /tx?from=&to=&since=&reason=&limit=  → only the matching txs, newest-first.
+// This is what payment-verifying clients (e.g. nocopycART) should use instead of
+// GET /ledger: served from the in-memory indexes so the cost is bounded by
+// recent/relevant activity, NOT by the total size of the ledger.
+app.get('/tx', (req, res) => {
+  const { from, to, since, reason } = req.query;
+  const sinceTs = since ? Number(since) : 0;
+  const cap = Math.min(Math.max(parseInt(req.query.limit || '200', 10) || 200, 1), 1000);
+  // Pick the most selective index to scan from (from is the common case).
+  let base;
+  if (from) base = idxFrom.get(from) || [];
+  else if (to) base = idxTo.get(to) || [];
+  else base = txs; // no from/to → full scan (discouraged; still capped)
+  const out = [];
+  for (const t of base) {
+    if (from && t.from !== from) continue;
+    if (to && t.to !== to) continue;
+    if (sinceTs && !(t.timestamp >= sinceTs)) continue;
+    if (reason && !String(t.reason || '').includes(reason)) continue;
+    out.push(t);
+    if (out.length >= cap) break;
+  }
+  res.json(out);
+});
 
 app.get('/balance/:addr', (req, res) => {
   const bal = getBalance(req.params.addr);
   res.json({ address: req.params.addr, balance: Math.max(0, parseFloat(bal.toFixed(2))) });
 });
 
-// ── Google account lookup — called by the app before registration ───────────
-// Returns { exists: true, address } if this Google account already has a seal,
-// or { exists: false } if it is a new user. Lets the app restore an existing
-// wallet instead of trying to ignite a duplicate.
-app.post('/google-lookup', (req, res) => {
-  const { google_sub } = req.body;
-  if (!google_sub) return res.status(400).json({ error: 'Missing google_sub' });
-  const address = googleAccounts[google_sub];
-  return address ? res.json({ exists: true, address }) : res.json({ exists: false });
-});
-
 app.post('/transaction', (req, res) => {
-  const { from, to, amount, reason, signature, publicKey, timestamp, google_sub, ignitionCode, deviceId } = req.body;
+  const { from, to, amount, reason, signature, publicKey, timestamp, ignitionCode } = req.body;
 
   // ── Basic field validation ─────────────────────────────────────────────
   if (!from || !to || amount == null)
     return res.status(400).json({ error: 'Missing required fields' });
 
   const amt = parseFloat(amount);
-  if (isNaN(amt) || !isFinite(amt) || amt <= 0)
-    return res.status(400).json({ error: 'Invalid amount' });
+  if (isNaN(amt) || !isFinite(amt) || amt <= 0 || !Number.isInteger(amt))
+    return res.status(400).json({ error: 'Invalid amount (whole numbers only)' });
 
   // ── Timestamp freshness ────────────────────────────────────────────────
   // Reject anything older than 2 minutes or from the future (±30s tolerance).
@@ -190,17 +240,6 @@ app.post('/transaction', (req, res) => {
     const age = Date.now() - Number(timestamp);
     if (!timestamp || isNaN(age) || age > 2 * 60 * 1000 || age < -30_000)
       return res.status(401).json({ error: 'Transaction timestamp expired or invalid' });
-  }
-
-  // ── Replay fence (persistent) ──────────────────────────────────────────
-  // Signatures that passed the timestamp check land here.
-  // Stored in replay_fence.json so the fence survives server restarts.
-  // Without persistence: attacker restarts server, replays a 90-second-old tx.
-  if (signature) {
-    if (seenSigs[signature])
-      return res.status(401).json({ error: 'Duplicate transaction — already processed' });
-    seenSigs[signature] = Date.now();
-    // (saveJSON happens at commit time to keep writes atomic)
   }
 
   // ── Signature verification ─────────────────────────────────────────────
@@ -227,62 +266,46 @@ app.post('/transaction', (req, res) => {
       return res.status(401).json({ error: 'Invalid signature — transaction rejected' });
   }
 
+  // ── Replay fence — keyed on the SIGNED MESSAGE, checked AFTER verification ──
+  // (1) Keying on the message (from:to:amount:timestamp) instead of the signature
+  //     string makes malleability useless: a re-encoded signature of the same
+  //     payment maps to the same key and is rejected.
+  // (2) Checking AFTER verification means a forged/unverified request can no
+  //     longer poison the fence to block a victim's legitimate transaction.
+  const fenceKey = `${from}:${to}:${amt}:${timestamp}`;
+  if (seenSigs[fenceKey])
+    return res.status(401).json({ error: 'Duplicate transaction — already processed' });
+  seenSigs[fenceKey] = Date.now();
+
   // ─────────────────────────────────────────────────────────────────────
   // ── IGNITION-ONLY GATES ───────────────────────────────────────────────
   // These checks run only for faucet claims (the ignition transaction).
   // ─────────────────────────────────────────────────────────────────────
   if (from === 'FAUCET') {
-    // Gate 0: Server-issued ignition code (the UNFORGEABLE one-per-human control).
-    // Only enforced when IGNITION_CODES is configured. A scripted attacker can
-    // forge keypairs, IPs and deviceIds — but NOT a code the server never issued.
-    if (IGNITION_CODES.size > 0) {
-      if (!ignitionCode || !IGNITION_CODES.has(ignitionCode))
-        return res.status(403).json({ error: 'A valid ignition code is required to seal. Ask the founder for yours.' });
-      if (usedCodes[ignitionCode])
-        return res.status(403).json({ error: 'This ignition code has already been used — one seal per code.' });
-    }
+    const ip = req.ip || 'unknown';
 
-    // Gate 0b: One seal per device (defence-in-depth — stops casual multi-wallet
-    // farming from the real app; forgeable by scripts, so it is NOT the main gate).
-    if (deviceId && devices[deviceId])
-      return res.status(400).json({ error: 'This device has already sealed an identity.' });
+    // Gate 0: Server-issued single-use ignition code — the REAL one-per-human gate.
+    // Wrong/used guesses are throttled per IP so the codes cannot be brute-forced.
+    if (IGNITION_CODES.size > 0) {
+      if (tooManyCodeFails(ip))
+        return res.status(429).json({ error: 'Too many invalid codes from this network — locked for 1 hour.' });
+      if (!ignitionCode || !IGNITION_CODES.has(ignitionCode)) { noteCodeFail(ip); return res.status(403).json({ error: 'A valid ignition code is required to seal. Ask the founder for yours.' }); }
+      if (usedCodes[ignitionCode]) { noteCodeFail(ip); return res.status(403).json({ error: 'This ignition code has already been used — one seal per code.' }); }
+    }
 
     // Gate 1: One faucet claim per wallet address
     if (txs.some(t => t.from === 'FAUCET' && t.to === to))
       return res.status(400).json({ error: 'This address has already been ignited' });
 
-    // Gate 2: Reward cap — the server computes the authoritative reward itself
-    // and rejects any claim above it. Without this, a modified client could sign
-    // a FAUCET→self transaction for any amount and mint it (the signature only
-    // proves key-ownership, not that the amount is legitimate).
+    // Gate 2: Reward cap — the server computes the authoritative reward and rejects
+    // any claim above it (a modified client cannot sign itself a bigger faucet).
     const maxReward = calcReward(userCount());
     if (amt > maxReward)
       return res.status(400).json({ error: `Faucet reward exceeds the current allowance (max ${maxReward})` });
 
-    // Gate 3: Per-IP ignition throttle
-    // Placed AFTER signature verification — only cryptographically valid attempts
-    // (i.e. real key-owners) burn the budget. Random bots can't forge sigs to
-    // exhaust the throttle for legitimate users. req.ip honours trust-proxy.
-    const ip = req.ip || 'unknown';
+    // Gate 3: Per-IP ignition throttle (only valid-signature attempts burn it).
     if (!checkIgnitionThrottle(ip))
       return res.status(429).json({ error: 'Too many ignition attempts from this network — try again in 1 hour' });
-
-    // Gate 4: Anti-Sybil — one MONEY account per Google identity.
-    // ── How this works ────────────────────────────────────────────────────
-    // The signed public key proves key-ownership, but a fresh keypair is free,
-    // so the public key alone is NOT a per-human signal. google_sub (the stable
-    // subject ID from a verified Google account) is. A Google identity may only
-    // ever seal one address.
-    //
-    // DORMANT FOR NOW: Google Sign-In is commented out in the app, so google_sub
-    // arrives undefined and this gate is a no-op until OAuth is wired up. When it
-    // is, this becomes the real Sybil firewall. (Replaced the old face-hash gate,
-    // which was dropped because SHA-256 of a photo can never match two captures
-    // of the same face — illusion of dedup without the substance.)
-    if (google_sub && googleAccounts[google_sub])
-      return res.status(400).json({
-        error: 'A MONEY account is already linked to this Google account. One seal per human.',
-      });
   }
 
   // ── Recipient must be a registered Swarm node (or a known platform) ──────
@@ -314,25 +337,15 @@ app.post('/transaction', (req, res) => {
   };
 
   txs.unshift(tx);
+  indexTx(tx, true);            // keep the targeted-lookup indexes in sync
   saveJSON(LEDGER_FILE,        txs);
   saveJSON(REPLAY_FENCE_FILE,  seenSigs); // atomically commits the replay fence
 
-  // On a successful ignition, consume the one-time code and seal the device.
-  if (from === 'FAUCET') {
-    if (ignitionCode && IGNITION_CODES.size > 0) {
-      usedCodes[ignitionCode] = to;
-      saveJSON(USED_CODES_FILE, usedCodes);
-      console.log(`[ignition-code] consumed code → ${to}`);
-    }
-    if (deviceId) {
-      devices[deviceId] = to;
-      saveJSON(DEVICES_FILE, devices);
-    }
-    if (google_sub) {
-      googleAccounts[google_sub] = to;
-      saveJSON(GOOGLE_ACCOUNTS_FILE, googleAccounts);
-      console.log(`Google account linked: ${google_sub.substring(0, 8)}... → ${to}`);
-    }
+  // On a successful ignition, consume the one-time code.
+  if (from === 'FAUCET' && ignitionCode && IGNITION_CODES.size > 0) {
+    usedCodes[ignitionCode] = to;
+    saveJSON(USED_CODES_FILE, usedCodes);
+    console.log(`[ignition-code] consumed code → ${to}`);
   }
 
   console.log(`TX: ${from} → ${to} | ${amt} MONEY${reason ? ` [${reason}]` : ''}`);
@@ -340,12 +353,12 @@ app.post('/transaction', (req, res) => {
 });
 
 // ── Debug endpoint (dev-only — remove or auth-gate before public launch) ──
-// Returns counts only — never the google_sub values or addresses themselves.
+// Returns counts only — never addresses or codes themselves.
 app.get('/stats', (req, res) => {
   res.json({
-    transactions:   txs.length,
+    transactions:    txs.length,
     registeredUsers: userCount(),
-    googleSeals:    Object.keys(googleAccounts).length,
+    usedCodes:       Object.keys(usedCodes).length,
     replayFenceSize: Object.keys(seenSigs).length,
   });
 });
@@ -353,7 +366,7 @@ app.get('/stats', (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`MONEY server listening on :${PORT}`);
-  console.log(`Registered users: ${userCount()} | Google seals: ${Object.keys(googleAccounts).length}`);
+  console.log(`Registered users: ${userCount()} | Codes used: ${Object.keys(usedCodes).length}`);
   if (PLATFORM_ADDRESSES.size > 0)
     console.log(`Platform recipients: ${[...PLATFORM_ADDRESSES].join(', ')}`);
 });
