@@ -691,7 +691,9 @@ function AppInner() {
 
         if (biokey === '1') {
           isIgnitedRef.current = ignited === '1';
-          destinationAfterAuth.current = ignited === '1' ? 0 : 5;
+          // Not-yet-ignited returning user → the clean invite-code + IGNITE screen
+          // (step 4), NOT the old suns/KYC formation screen (step 5).
+          destinationAfterAuth.current = ignited === '1' ? 0 : 4;
           setReAuthPhase('biometric');
           setReAuthError(null);
           setOnboardingStep(99);
@@ -795,7 +797,8 @@ function AppInner() {
         // fingerprint + PIN dance every time the app comes back to the foreground.
         if (away > REAUTH_AWAY_MS && bioKeyActive) {
           clearReAuthTimer();
-          destinationAfterAuth.current = isIgnitedRef.current ? 0 : 5;
+          // Not-yet-ignited user → clean invite + IGNITE screen (4), not suns/KYC (5).
+          destinationAfterAuth.current = isIgnitedRef.current ? 0 : 4;
           setReAuthPhase('biometric');
           setReAuthError(null);
           setOnboardingStep(99);
