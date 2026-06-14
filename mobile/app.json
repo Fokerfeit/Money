@@ -22,6 +22,7 @@
         "backgroundColor": "#0a0a0a"
       },
       "package": "com.fokerfeit.money",
+      "versionCode": 9,
       "edgeToEdgeEnabled": true,
       "permissions": []
     },
@@ -38,8 +39,7 @@
         }
       ],
       "expo-secure-store",
-      "expo-video",
-      "expo-web-browser"
+      "expo-video"
     ],
     "extra": {
       "eas": {

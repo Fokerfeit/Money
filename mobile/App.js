@@ -11,11 +11,11 @@ import * as ExpoCrypto from 'expo-crypto';
 import * as LocalAuthentication from 'expo-local-authentication';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { Audio, Video as ExpoVideo, ResizeMode } from 'expo-av';
-// Google Sign-In (expo-auth-session) requires a native build — not available in Expo Go.
-// Imports are stubbed here; re-enable after EAS build.
-// import * as Google from 'expo-auth-session/providers/google';
-// import * as WebBrowser from 'expo-web-browser';
-// import * as AuthSession from 'expo-auth-session';
+// Sovereignty model: identity is the user's on-device ed25519 keypair.
+// No third-party identity provider (no Google, no Firebase phone auth) — those
+// are centralized choke points that can be banned or pressured, which would
+// contradict the mission. Sybil resistance is handled separately (invite codes
+// → social vouching → validator-eligibility → faucet decay), NOT by the login.
 // ── Pure-JS TOTP — no native modules, RFC 6238 compliant ──────────────────
 // SHA-1 (RFC 3174)
 const _sha1 = (m) => {
@@ -479,15 +479,15 @@ function AppInner() {
   const [amount,    setAmount]    = useState('');
 
   // ── Onboarding / screen state ─────────────────────────────────────────
-  // null=loading | 1=welcome | 2=face | 3=leftThumb | 32=rightThumb
-  // 35=PIN | 4=sealComplete | 5=formation | 6=ignition
+  // null=loading | 12=oath | 3=leftThumb | 32=rightThumb
+  // 35=PIN | 4=sealComplete (invite code + ignite) | 5=formation | 6=ignition
   // 99=reAuth | 0=mainApp
   const [onboardingStep,  setOnboardingStep]  = useState(null);
   const [showAboutScreen, setShowAboutScreen] = useState(false);
   // ── Intro video ───────────────────────────────────────────────────────
-  const [showIntroVideo,  setShowIntroVideo]  = useState(true);  // always play on launch
+  const [showIntroVideo,  setShowIntroVideo]  = useState(true);   // plays on first launch only
   const [introFirstTime,  setIntroFirstTime]  = useState(true);  // false if seen before
-  const [showSkipBtn,     setShowSkipBtn]     = useState(false); // appears after 3s (non-first)
+  const [showSkipBtn,     setShowSkipBtn]     = useState(true);  // always visible
   const [bioKeyActive,   setBioKeyActive]   = useState(false);
   const [hasFingerprint, setHasFingerprint] = useState(false); // true only if fingerprint sensor AND enrolled
   // 'fingerprint' | 'face' | 'credential' — what actually unlocks this device right now
@@ -631,24 +631,11 @@ function AppInner() {
       const seen = await AsyncStorage.getItem('intro_seen_v1').catch(() => null);
       if (seen) {
         setIntroFirstTime(false);
-        const t = setTimeout(() => setShowSkipBtn(true), 3000);
-        return () => clearTimeout(t);
       }
     })();
     // Set audio mode so video plays even on silent switch (iOS)
     Audio.setAudioModeAsync({ playsInSilentModeIOS: true, allowsRecordingIOS: false }).catch(() => {});
   }, []);
-
-  // ── Google Sign-In — stubbed for Expo Go (needs EAS build) ──────────
-  // expo-auth-session uses SubtleCrypto which requires ExpoCryptoAES native module.
-  // Will be re-enabled after first EAS build.
-  const googleRequest = null;
-  const promptGoogleAsync = () =>
-    Alert.alert(
-      'Coming soon',
-      'Google Sign-In will be available in the next app build.\n\nContinuing in testing mode.',
-      [{ text: 'OK', onPress: () => setOnboardingStep(11) }]
-    );
 
   // ── Generate TOTP secret when step 36 is entered ─────────────────────
   useEffect(() => {
@@ -709,11 +696,14 @@ function AppInner() {
           setReAuthError(null);
           setOnboardingStep(99);
         } else {
-          setOnboardingStep(1);
+          // Identity is the on-device keypair (already generated above). No
+          // third-party login — a new user goes straight to the Oath, then the
+          // body seal, then the invite-code + faucet ignition.
+          setOnboardingStep(12);
         }
       } catch {
         // Any unexpected failure → go to welcome screen so the app always starts
-        setOnboardingStep(1);
+        setOnboardingStep(10);
       }
     })();
   }, []);
@@ -1376,9 +1366,9 @@ function AppInner() {
         body: JSON.stringify({
           from: 'FAUCET', to: addrRef.current, amount: reward,
           signature: sig, publicKey: pubKeyRef.current, timestamp: ts,
-          google_sub: (await SecureStore.getItemAsync('google_sub_v1').catch(() => null)) || undefined,
-          deviceId,
+          // Invite (ignition) code — the server's one-per-human faucet gate.
           ignitionCode: ignitionCode ? ignitionCode.trim().toUpperCase() : undefined,
+          deviceId,
         }),
       });
       clearTimeout(timeoutId);
@@ -1465,42 +1455,46 @@ function AppInner() {
 
   // ── Fingerprint onboarding ────────────────────────────────────────────
   const testLeftThumb = async () => {
-    if (IS_WEB) { setOnboardingStep(32); return; }
+    if (IS_WEB) { setOnboardingStep(4); return; }
     const r = await LocalAuthentication.authenticateAsync({
       promptMessage: 'First seal — use your fingerprint or device PIN',
       cancelLabel: 'Cancel', disableDeviceFallback: false, fallbackLabel: 'Use PIN',
     });
-    if (r.success) setOnboardingStep(32);
+    // Body seal confirmed → invite-code + ignite screen (2FA step removed).
+    if (r.success) { setPinSetup1(''); setPinSetup2(''); setPinSetupStep(1); setPinSetupError(''); setOnboardingStep(4); }
     else Alert.alert('Seal not confirmed', `Couldn't verify (reason: ${r.error || 'unknown'}). Tap "Use PIN" on the prompt to seal with your device PIN instead.`);
   };
 
   const testRightThumb = async () => {
-    if (IS_WEB) { setOnboardingStep(36); return; }
+    if (IS_WEB) { setOnboardingStep(4); return; }
     const r = await LocalAuthentication.authenticateAsync({
       promptMessage: 'Second seal — confirm again to lock it in',
       cancelLabel: 'Cancel', disableDeviceFallback: false, fallbackLabel: 'Use PIN',
     });
-    if (r.success) { setPinSetup1(''); setPinSetup2(''); setPinSetupStep(1); setPinSetupError(''); setOnboardingStep(36); }
+    if (r.success) { setPinSetup1(''); setPinSetup2(''); setPinSetupStep(1); setPinSetupError(''); setOnboardingStep(4); }
     else Alert.alert('Second seal not confirmed', `Couldn't verify (reason: ${r.error || 'unknown'}). Tap "Use PIN" on the prompt and enter your device PIN, or use any enrolled fingerprint.`);
   };
 
   const testPin = async () => {
-    if (IS_WEB) { setOnboardingStep(36); return; }
+    if (IS_WEB) { setOnboardingStep(4); return; }
     const r = await LocalAuthentication.authenticateAsync({
       promptMessage: 'Enter your device PIN to seal your identity',
       cancelLabel: 'Cancel', disableDeviceFallback: false, fallbackLabel: 'Use PIN',
     });
-    if (r.success) { setPinSetup1(''); setPinSetup2(''); setPinSetupStep(1); setPinSetupError(''); setOnboardingStep(36); }
+    if (r.success) { setPinSetup1(''); setPinSetup2(''); setPinSetupStep(1); setPinSetupError(''); setOnboardingStep(4); }
     else Alert.alert('Try again', 'PIN confirmation failed.');
   };
 
-  // ── Complete Seal Setup → immediate ignition ──────────────────────────
+  // ── Complete Seal Setup → faucet ignition ─────────────────────────────
   const completeBioKeySetup = async () => {
+    // The body seal (fingerprint/PIN) is real the moment biometric is confirmed,
+    // so lock it in now. But DO NOT mark the wallet "ignited" here — ignition is
+    // only earned when the server accepts the invite code. triggerIgnition sets
+    // formation_ignited / isIgnitedRef inside igniteLocally on success (or a
+    // genuine network failure), and on an explicit rejection (bad/used code) it
+    // leaves the user on this screen to fix the code instead of falsely igniting.
     await SecureStore.setItemAsync('biokey_v1', '1').catch(() => {});
-    await SecureStore.setItemAsync('formation_ignited', '1').catch(() => {});
     setBioKeyActive(true);
-    isIgnitedRef.current = true;
-    destinationAfterAuth.current = 0;
     await triggerIgnition();
   };
 
@@ -1600,6 +1594,8 @@ function AppInner() {
         body: JSON.stringify({
           from: 'FAUCET', to: address, amount: reward,
           signature: sig, publicKey: pubKeyRef.current, timestamp: ts,
+          // Invite (ignition) code — the server's one-per-human faucet gate.
+          ignitionCode: ignitionCode ? ignitionCode.trim().toUpperCase() : undefined,
         }),
       });
       const data = await res.json();
@@ -1775,8 +1771,13 @@ function AppInner() {
               <ClayWhoMadeThis size={130} />
               <Text style={[s.onboardCardTitle, { marginTop: 12, fontSize: 15 }]}>Who made this?</Text>
               <Text style={[s.onboardBody, { textAlign: 'center', marginTop: 6, lineHeight: 20 }]}>
-                {'One person built the first version — Luca Urbani. An average dude wearing a hoodie and joggings. He was tired of the scams, the ads and the lies.\n\nHe got 1,000,000 MONEY — the same as you. No secret stash. No hidden advantage. Being first was the only reward.'}
+                {'One person built the first version — Luca Urbani. An average dude wearing a hoodie and joggings. He was tired of the scams, the ads and the lies.'}
               </Text>
+              <View style={{ flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', marginTop: 8 }}>
+                <Text style={[s.onboardBody, { textAlign: 'center', lineHeight: 20 }]}>{'He got 1,000,000 '}</Text>
+                <MoneySymbol size={14} color="#D4AF37" style={{ marginTop: 3 }} />
+                <Text style={[s.onboardBody, { textAlign: 'center', lineHeight: 20 }]}>{' — the same as you. No secret stash. No hidden advantage. Being first was the only reward.'}</Text>
+              </View>
               <TouchableOpacity style={{ marginTop: 10 }} onPress={() => openLink('https://m.facebook.com/Luca.Urbani007/')}>
                 <Text style={{ color: '#D4AF37', fontSize: 13, letterSpacing: 0.5 }}>Meet Luca →</Text>
               </TouchableOpacity>
@@ -1788,9 +1789,11 @@ function AppInner() {
             <View style={[s.onboardCard, glassOnboardCard, { alignItems: 'center', marginTop: 18 }]}>
               <ClayIsItSafe size={130} />
               <Text style={[s.onboardCardTitle, { marginTop: 12, fontSize: 15 }]}>Is it safe?</Text>
-              <Text style={[s.onboardBody, { textAlign: 'center', marginTop: 6, lineHeight: 20 }]}>
-                {'Right now your MONEY lives on one computer in Germany — the initial node. That\'s the honest truth. The dream is for it to live on your phone, so no single person, company, or government can touch it. You can run the node yourself — the code is open source.'}
-              </Text>
+              <View style={{ flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', marginTop: 6 }}>
+                <Text style={[s.onboardBody, { textAlign: 'center', lineHeight: 20 }]}>{'Right now your '}</Text>
+                <MoneySymbol size={14} color="#D4AF37" style={{ marginTop: 3 }} />
+                <Text style={[s.onboardBody, { textAlign: 'center', lineHeight: 20 }]}>{' lives on one computer in Germany — the initial node. That\'s the honest truth. The dream is for it to live on your phone, so no single person, company, or government can touch it. You can run the node yourself — the code is open source.'}</Text>
+              </View>
               <TouchableOpacity style={{ marginTop: 10 }} onPress={() => openLink('https://github.com/Fokerfeit/Money')}>
                 <Text style={{ color: '#D4AF37', fontSize: 13, letterSpacing: 0.5 }}>See the code →</Text>
               </TouchableOpacity>
@@ -1914,67 +1917,8 @@ function AppInner() {
     );
   }
 
-  // ── Step 1: Welcome — Google Sign-In only ────────────────────────────
-  if (onboardingStep === 1) {
-    return (
-      <ScreenWrapper>
-      <SafeAreaView style={s.root}>
-        <ScrollView contentContainerStyle={s.onboardScroll}>
-          <View style={s.onboardCenter}>
-
-            {/* Hero — SVG logo so pulse rings show through */}
-            <View style={{ marginBottom: 20, alignItems: 'center', justifyContent: 'center', width: 100, height: 100 }}>
-              <PulseRing size={100} color="#D4AF37" delay={0} />
-              <PulseRing size={100} color="#D4AF37" delay={900} />
-              <View style={{ position: 'absolute', width: 72, height: 72, borderRadius: 36, backgroundColor: 'rgba(18,8,0,0.92)', borderWidth: 1.5, borderColor: 'rgba(212,175,55,0.4)', alignItems: 'center', justifyContent: 'center' }}>
-                <MoneySymbol size={46} color="#D4AF37" />
-              </View>
-            </View>
-
-            <Text style={s.onboardTitle}>Earth's Money</Text>
-            <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'center', marginBottom: 4 }}>
-              <Text style={s.onboardSub}>One million </Text>
-              <MoneySymbol size={14} color="#B8956A" style={{ marginHorizontal: 3 }} />
-              <Text style={s.onboardSub}> MONEY per verified human.</Text>
-            </View>
-            <Text style={[s.onboardSub, { marginBottom: 32 }]}>No mining. No ads. No tricks.</Text>
-
-            <GoldDivider width={width - 80} opacity={0.4} />
-
-            {/* Google Sign-In — primary action */}
-            <AnimatedPress
-              style={[s.btnGold, glassButton, { marginTop: 36, marginBottom: 8, flexDirection: 'row', alignItems: 'center', gap: 12, paddingHorizontal: 28, paddingVertical: 16 }]}
-              onPress={() => promptGoogleAsync()}
-            >
-              <Text style={[s.btnText, { fontSize: 18, fontWeight: 'bold' }]}>G</Text>
-              <Text style={[s.btnText, { fontSize: 15 }]}>CONTINUE WITH GOOGLE</Text>
-            </AnimatedPress>
-
-            <Text style={{ color: '#5A3D1A', fontSize: 11, textAlign: 'center', marginTop: 8, letterSpacing: 0.3 }}>
-              Sign in to link your identity. One account per human.
-            </Text>
-
-            <GoldDivider width={width - 80} opacity={0.25} style={{ marginTop: 36 }} />
-
-            {/* Testing bypass — only visible in dev, will be removed in production */}
-            <TouchableOpacity
-              style={{ marginTop: 20, paddingVertical: 10 }}
-              onPress={() => setOnboardingStep(11)}
-            >
-              <Text style={{ color: '#4A2E0A', fontSize: 12, textAlign: 'center', letterSpacing: 0.5 }}>
-                Continue without Google (testing only) →
-              </Text>
-            </TouchableOpacity>
-
-          </View>
-        </ScrollView>
-      </SafeAreaView>
-      </ScreenWrapper>
-    );
-  }
-
-  // ── Step 11: The Oath — only reached after Google or testing bypass ──
-  if (onboardingStep === 11) {
+  // ── Step 12: The Oath — first screen after the on-device keypair exists ──
+  if (onboardingStep === 12) {
     const TERMS = [
       'Allow face capture for identity sealing (hash only — image deleted immediately)',
       'Allow device check (no personal data stored on any server)',
@@ -1993,18 +1937,16 @@ function AppInner() {
               <SealMedallion size={80} />
             </View>
             <Text style={s.onboardTitle}>Forge Your Seal</Text>
-            <Text style={s.onboardSub}>Your face is your seal.</Text>
-            <Text style={s.onboardSub}>Your body, the key.</Text>
+            <Text style={s.onboardSub}>Your body is your key.</Text>
 
             <View style={[s.onboardCard, glassOnboardCard]}>
               <Text style={s.onboardCardTitle}>THE FORGING RITUAL</Text>
-              <Text style={s.onboardBody}>① Front camera face inscription — 3 positions</Text>
               {hasFingerprint
-                ? <Text style={s.onboardBody}>② Fingerprint seal (×2)</Text>
-                : <Text style={s.onboardBody}>② {authLabel} confirmation</Text>}
-              <Text style={s.onboardBody}>③ Link your authenticator app (2FA)</Text>
+                ? <Text style={s.onboardBody}>① Fingerprint seal</Text>
+                : <Text style={s.onboardBody}>① {authLabel} confirmation</Text>}
+              <Text style={s.onboardBody}>② Enter your invite code</Text>
               <View style={{ flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', marginBottom: 4 }}>
-                <Text style={s.onboardBody}>④ IGNITION — </Text>
+                <Text style={s.onboardBody}>③ IGNITION — </Text>
                 <MoneySymbol size={14} color="#B8956A" style={{ marginHorizontal: 3 }} />
                 <Text style={s.onboardBody}>1,000,000 released 🔥</Text>
               </View>
@@ -2046,11 +1988,7 @@ function AppInner() {
             <AnimatedPress
               style={[s.btnGold, glassButton, { marginTop: 8 }, !allChecked && s.btnDisabled]}
               disabled={!allChecked}
-              onPress={async () => {
-                const { granted } = await requestCameraPermission();
-                if (granted) setOnboardingStep(2);
-                else Alert.alert('Camera required', 'Please allow camera for face sealing.');
-              }}
+              onPress={() => setOnboardingStep(hasFingerprint ? 3 : 35)}
             >
               <Text style={s.btnText}>{allChecked ? 'BEGIN THE FORGING →' : 'SWEAR ALL OATHS TO CONTINUE'}</Text>
             </AnimatedPress>
@@ -2062,50 +2000,7 @@ function AppInner() {
     );
   }
 
-  // ── Step 2: Face Inscription ──────────────────────────────────────────
-  if (onboardingStep === 2) {
-    const step = FACE_STEPS[faceStepIdx];
-    return (
-      <SafeAreaView style={s.root}>
-        <View style={s.cameraContainer}>
-          <View style={s.progressBar}><View style={[s.progressFill, { width: `${(faceStepIdx / FACE_STEPS.length) * 100}%` }]} /></View>
-          <Text style={s.faceCounter}>{faceStepIdx + 1} / {FACE_STEPS.length}</Text>
-          <Text style={s.faceTitle}>FACE INSCRIPTION</Text>
-          {cameraPermission?.granted
-            ? <View style={s.camera}>
-                <CameraView ref={cameraRef} style={StyleSheet.absoluteFill} facing="front" />
-                <View style={s.faceOvalContainer}><View style={s.faceOval} /></View>
-                {photoRejectedMsg && (
-                  <View style={s.photoRejectOverlay}>
-                    <Text style={s.photoRejectText}>{photoRejectedMsg}</Text>
-                  </View>
-                )}
-              </View>
-            : <View style={[s.camera, s.cameraPlaceholder]}><CameraIrisIcon size={60} /></View>
-          }
-          <View style={s.faceInstructionBox}>
-            <View style={{ marginBottom: 8 }}>
-              {step.icon === 'front'
-                ? <FaceFront size={40} color="#D4AF37" />
-                : <FaceSide  size={40} color="#D4AF37" direction={step.icon} />}
-            </View>
-            <Text style={s.faceInstruction}>{step.instruction}</Text>
-          </View>
-          {step.requiresTap
-            ? <TouchableOpacity style={s.tapConfirmBtn} onPress={captureFaceStepAuto}>
-                <Text style={s.tapConfirmText}>✓  I'M IN POSITION</Text>
-              </TouchableOpacity>
-            : <View style={s.autoCountdownRow}>
-                <View style={[s.countdownRingSmall, s.countdownRingActive]}>
-                  <Text style={[s.countdownNumberSmall, s.countdownNumberActive]}>{faceCountdown}</Text>
-                </View>
-                <Text style={s.autoCapLabel}>Auto-inscribing in {faceCountdown}s…</Text>
-              </View>
-          }
-        </View>
-      </SafeAreaView>
-    );
-  }
+  // ── Step 2 (Face Inscription) removed — face scan eliminated from onboarding
 
   // ── Step 25 (Liveness) removed — voice liveness deleted. Face pose ritual
   //    + body seal now cover liveness. Kept the step number reserved so any
@@ -2118,10 +2013,10 @@ function AppInner() {
         <ScrollView contentContainerStyle={s.onboardScroll}>
           <View style={s.onboardCenter}>
             <View style={{ marginBottom: 16 }}><CheckSeal size={80} /></View>
-            <Text style={s.onboardTitle}>Face Inscribed</Text>
-            <Text style={s.onboardSub}>Now seal your identity with your {authLabel.toLowerCase()}.</Text>
+            <Text style={s.onboardTitle}>Forge Your Seal</Text>
+            <Text style={s.onboardSub}>Seal your identity with your {authLabel.toLowerCase()}.</Text>
             <View style={[s.onboardCard, glassOnboardCard]}>
-              <Text style={s.onboardCardTitle}>BODY SEAL — 1 OF 2</Text>
+              <Text style={s.onboardCardTitle}>BODY SEAL</Text>
               <Text style={s.onboardBody}>Confirm with your {authLabel.toLowerCase()} to bind your seal.</Text>
             </View>
             <View style={{ marginVertical: 20 }}><AuthIcon size={52} color="#D4AF37" /></View>
@@ -2137,31 +2032,7 @@ function AppInner() {
     );
   }
 
-  // ── Step 3.2: Right Thumb ─────────────────────────────────────────────
-  if (onboardingStep === 32) {
-    return (
-      <SafeAreaView style={s.root}>
-        <ScrollView contentContainerStyle={s.onboardScroll}>
-          <View style={s.onboardCenter}>
-            <View style={{ marginBottom: 16 }}><CheckSeal size={80} /></View>
-            <Text style={s.onboardTitle}>First Seal Confirmed</Text>
-            <Text style={s.onboardSub}>Confirm once more to lock it in.</Text>
-            <View style={[s.onboardCard, glassOnboardCard]}>
-              <Text style={s.onboardCardTitle}>BODY SEAL — 2 OF 2</Text>
-              <Text style={s.onboardBody}>One more confirmation — this is your final seal.</Text>
-            </View>
-            <View style={{ marginVertical: 20 }}><AuthIcon size={52} color="#D4AF37" /></View>
-            <TouchableOpacity style={[s.btnGold, glassButton]} onPress={testRightThumb}>
-              <View style={{ flexDirection:'row', alignItems:'center', gap: 8 }}>
-                <AuthIcon size={18} color="#160B00" />
-                <Text style={s.btnText}>CONFIRM FINAL SEAL</Text>
-              </View>
-            </TouchableOpacity>
-          </View>
-        </ScrollView>
-      </SafeAreaView>
-    );
-  }
+  // ── Step 3.2 (Second fingerprint) removed
 
   // ── Step 3.5: PIN ─────────────────────────────────────────────────────
   if (onboardingStep === 35) {
@@ -2290,8 +2161,29 @@ function AppInner() {
               <MoneySymbol size={13} color="#B8956A" style={{ marginRight:4, marginTop:2 }} />
               <Text style={[s.onboardBody, { flex:1 }]}>1,000,000 is waiting in the Common Treasury.</Text>
             </View>
-            <Text style={s.onboardBody}>{'\n'}Press IGNITE to claim your founding share now.</Text>
+            <Text style={s.onboardBody}>{'\n'}Enter your invite code, then press IGNITE to claim your founding share.</Text>
           </View>
+
+          {/* Invite (ignition) code — the server's one-per-human faucet gate */}
+          <View style={{ width: '100%', marginBottom: 14, paddingHorizontal: 24 }}>
+            <Text style={{ color: '#9A7B4A', fontSize: 11, letterSpacing: 3, textAlign: 'center', marginBottom: 8 }}>
+              ✦ INVITE CODE
+            </Text>
+            <TextInput
+              value={ignitionCode}
+              onChangeText={setIgnitionCode}
+              placeholder="enter your invite code"
+              placeholderTextColor="#5A3D1A"
+              autoCapitalize="characters"
+              autoCorrect={false}
+              style={{
+                backgroundColor: 'rgba(28,17,4,0.6)', borderWidth: 1, borderColor: 'rgba(212,175,55,0.35)',
+                borderRadius: 12, paddingVertical: 12, paddingHorizontal: 16, color: '#F1E2C0',
+                fontSize: 15, letterSpacing: 2, textAlign: 'center',
+              }}
+            />
+          </View>
+
           <AnimatedPress style={[s.btnGold, glassButton]} onPress={completeBioKeySetup}>
             <View style={{ flexDirection:'row', alignItems:'center', justifyContent:'center', gap: 6 }}>
               <FlameIcon size={18} color="#1A0A00" />
@@ -2480,8 +2372,12 @@ function AppInner() {
             {/* KYC explanation */}
             <View style={s.kycBox}>
               <Text style={s.kycHeading}>🛡️  This is not surveillance.</Text>
+              <View style={{ flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', marginBottom: 4 }}>
+                <MoneySymbol size={13} color="#D4AF37" style={{ marginRight: 4 }} />
+                <Text style={s.kycBody}>{'is built for real humans — not bots, not scripts, not fake accounts.'}</Text>
+              </View>
               <Text style={s.kycBody}>
-                MONEY is built for real humans — not bots, not scripts, not fake accounts.{'\n\n'}
+                {'\n'}
                 Each piece of information you share is a signal that you are a unique person. It stays on your device. It is never sold, never sent to a server without your action, never used for anything other than proving you are real.{'\n\n'}
                 The more you prove it, the faster the forge heats — and the sooner your founding share ignites.
               </Text>

@@ -60,12 +60,14 @@ for (let i = txs.length - 1; i >= 0; i--) indexTx(txs[i], true);
 // fence so a signature can never be replayed, even across a server restart.
 let seenSigs = loadJSON(REPLAY_FENCE_FILE, {});
 
-// ── Anti-Sybil: server-issued single-use ignition codes ─────────────────────
+// ── Anti-Sybil: server-issued single-use invite (ignition) codes ────────────
 // IGNITION_CODES (comma-separated) are codes YOU hand out. The server controls
-// them, so — unlike a client-supplied google_sub or deviceId — they CANNOT be
-// forged. When non-empty, a faucet claim must present a valid, UNUSED code, and
-// each code seals exactly one identity. This is the real interim "one per human"
-// control (replace with verified Google/phone identity for open launch).
+// them, so — unlike a client-supplied id or token — they CANNOT be forged. When
+// non-empty, a faucet claim must present a valid, UNUSED code, and each code
+// seals exactly one identity. This is the one-per-human gate for the sovereignty
+// model: identity itself is the user's on-device keypair (no third-party login);
+// Sybil resistance is layered on top via invite codes → vouching → validator
+// eligibility → faucet decay.
 const IGNITION_CODES = new Set(
   (process.env.IGNITION_CODES || '').split(',').map(s => s.trim()).filter(Boolean)
 );
@@ -284,13 +286,18 @@ app.post('/transaction', (req, res) => {
   if (from === 'FAUCET') {
     const ip = req.ip || 'unknown';
 
-    // Gate 0: Server-issued single-use ignition code — the REAL one-per-human gate.
-    // Wrong/used guesses are throttled per IP so the codes cannot be brute-forced.
+    // Gate 0: server-issued single-use invite (ignition) code — the one-per-human
+    // gate. Wrong/used guesses are throttled per IP so codes can't be brute-forced.
     if (IGNITION_CODES.size > 0) {
       if (tooManyCodeFails(ip))
         return res.status(429).json({ error: 'Too many invalid codes from this network — locked for 1 hour.' });
-      if (!ignitionCode || !IGNITION_CODES.has(ignitionCode)) { noteCodeFail(ip); return res.status(403).json({ error: 'A valid ignition code is required to seal. Ask the founder for yours.' }); }
-      if (usedCodes[ignitionCode]) { noteCodeFail(ip); return res.status(403).json({ error: 'This ignition code has already been used — one seal per code.' }); }
+      if (!ignitionCode || !IGNITION_CODES.has(ignitionCode)) { noteCodeFail(ip); return res.status(403).json({ error: 'A valid invite code is required to seal.' }); }
+      if (usedCodes[ignitionCode]) { noteCodeFail(ip); return res.status(403).json({ error: 'This invite code has already been used — one seal per code.' }); }
+    } else {
+      // No codes configured. Refusing is the safe default: an open faucet with no
+      // gate lets anyone mint money in a loop. Set IGNITION_CODES to open it.
+      console.error('[FAUCET] BLOCKED: no IGNITION_CODES set — refusing claim.');
+      return res.status(503).json({ error: 'The faucet is not open yet.' });
     }
 
     // Gate 1: One faucet claim per wallet address
@@ -341,11 +348,11 @@ app.post('/transaction', (req, res) => {
   saveJSON(LEDGER_FILE,        txs);
   saveJSON(REPLAY_FENCE_FILE,  seenSigs); // atomically commits the replay fence
 
-  // On a successful ignition, consume the one-time code.
+  // On a successful ignition, consume the one-time invite code.
   if (from === 'FAUCET' && ignitionCode && IGNITION_CODES.size > 0) {
     usedCodes[ignitionCode] = to;
     saveJSON(USED_CODES_FILE, usedCodes);
-    console.log(`[ignition-code] consumed code → ${to}`);
+    console.log(`[invite-code] consumed code → ${to}`);
   }
 
   console.log(`TX: ${from} → ${to} | ${amt} MONEY${reason ? ` [${reason}]` : ''}`);
@@ -356,16 +363,20 @@ app.post('/transaction', (req, res) => {
 // Returns counts only — never addresses or codes themselves.
 app.get('/stats', (req, res) => {
   res.json({
-    transactions:    txs.length,
-    registeredUsers: userCount(),
-    usedCodes:       Object.keys(usedCodes).length,
-    replayFenceSize: Object.keys(seenSigs).length,
+    transactions:     txs.length,
+    registeredUsers:  userCount(),
+    faucetGate:       IGNITION_CODES.size > 0 ? 'ignition-code' : 'CLOSED',
+    usedCodes:        Object.keys(usedCodes).length,
+    replayFenceSize:  Object.keys(seenSigs).length,
   });
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`MONEY server listening on :${PORT}`);
+  const gate = IGNITION_CODES.size > 0 ? `invite codes (${IGNITION_CODES.size})`
+             : 'NONE — faucet CLOSED (set IGNITION_CODES to open)';
+  console.log(`Faucet gate: ${gate}`);
   console.log(`Registered users: ${userCount()} | Codes used: ${Object.keys(usedCodes).length}`);
   if (PLATFORM_ADDRESSES.size > 0)
     console.log(`Platform recipients: ${[...PLATFORM_ADDRESSES].join(', ')}`);
