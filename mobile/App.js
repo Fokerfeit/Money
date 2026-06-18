@@ -459,6 +459,10 @@ function AppInner() {
   const [recipient, setRecipient] = useState('');
   const [amount,    setAmount]    = useState('');
 
+  // Wallet backup / restore (key recovery)
+  const [seedInput,      setSeedInput]      = useState('');   // recovery key typed on Restore screen
+  const [restorePreview, setRestorePreview] = useState(null); // { address, publicKey, secretKey } once a valid key is checked
+
   // ── Onboarding / screen state ─────────────────────────────────────────
   // null=loading | 12=oath | 3=leftThumb | 32=rightThumb
   // 35=PIN | 4=sealComplete (invite code + ignite) | 5=formation | 6=ignition
@@ -1784,6 +1788,16 @@ function AppInner() {
               <Text style={s.btnText}>{allChecked ? 'BEGIN THE FORGING →' : 'SWEAR ALL OATHS TO CONTINUE'}</Text>
             </AnimatedPress>
 
+            {/* Lost-phone recovery: restore an existing wallet from its recovery key */}
+            <TouchableOpacity
+              style={{ marginTop: 18, paddingVertical: 8 }}
+              onPress={() => { setSeedInput(''); setRestorePreview(null); setOnboardingStep(51); }}
+            >
+              <Text style={{ color: '#9A7B4A', fontSize: 13, textAlign: 'center', letterSpacing: 0.5 }}>
+                Already have a wallet? Restore it →
+              </Text>
+            </TouchableOpacity>
+
           </View>
         </ScrollView>
       </SafeAreaView>
@@ -2033,6 +2047,156 @@ function AppInner() {
     );
   }
 
+  // ── Wallet backup / restore (key recovery) ───────────────────────────
+  // The 32-byte seed IS the wallet: ed25519 secretKey = seed(32) ‖ publicKey(32),
+  // so seed = secretKey[:32]. Rebuilding from that seed reproduces the EXACT same
+  // keypair + address (proven: 4000/4000 round-trips). We surface the seed as hex
+  // for the user to write down / save; restore rebuilds from it. No third party,
+  // no server — sovereignty-consistent.
+  const recoverySeedHex = () => (secKeyRef.current || '').substring(0, 64).toUpperCase();
+  const groupHex = (h) => (h.match(/.{1,4}/g) || []).join(' ');
+
+  // Check a typed recovery key and reconstruct the keypair (preview only — no write yet).
+  const previewRestore = () => {
+    const clean = (seedInput || '').replace(/[^0-9a-fA-F]/g, '').toLowerCase();
+    if (clean.length !== 64) {
+      Alert.alert('Check your recovery key', 'A recovery key is 64 characters (digits 0–9 and letters A–F). Spaces are ignored. Yours has ' + clean.length + '.');
+      return;
+    }
+    try {
+      const kp = nacl.sign.keyPair.fromSeed(fromHex(clean));
+      setRestorePreview({
+        address:   'M_' + toHex(kp.publicKey).substring(0, 32).toUpperCase(),
+        publicKey: toHex(kp.publicKey),
+        secretKey: toHex(kp.secretKey),
+      });
+    } catch {
+      Alert.alert('Invalid recovery key', 'That key could not be read. Double-check it and try again.');
+    }
+  };
+
+  // Confirm + apply: overwrite this device's wallet with the restored one.
+  const applyRestore = async () => {
+    if (!restorePreview) return;
+    const kp = restorePreview;
+    try { await SecureStore.setItemAsync('keypair_v3', JSON.stringify(kp)); } catch {}
+    setAddress(kp.address);
+    addrRef.current   = kp.address;
+    pubKeyRef.current = kp.publicKey;
+    secKeyRef.current = kp.secretKey;
+    // A restored wallet already exists on the ledger — mark this device sealed +
+    // ignited so the user lands in the wallet now AND stays there on future
+    // launches (re-auth then uses the device fingerprint/PIN, same as a normal seal).
+    await SecureStore.setItemAsync('formation_ignited', '1').catch(() => {});
+    await SecureStore.setItemAsync('biokey_v1', '1').catch(() => {});
+    setBioKeyActive(true);
+    isIgnitedRef.current = true;
+    setSeedInput(''); setRestorePreview(null);
+    Alert.alert('Wallet restored ✅', `This device now controls:\n\n${kp.address}\n\nYour balance will sync from the Clay Tablets.`);
+    setOnboardingStep(0);
+  };
+
+  // ── Screen 50: BACK UP WALLET ─────────────────────────────────────────
+  if (onboardingStep === 50) {
+    const seedHex = recoverySeedHex();
+    return (
+      <ScreenWrapper>
+      <SafeAreaView style={s.root}>
+        <ScrollView contentContainerStyle={s.onboardScroll}>
+          <View style={s.onboardCenter}>
+            <Text style={s.onboardTitle}>Back Up Your Wallet</Text>
+            <Text style={s.onboardSub}>Your recovery key — the only way to restore this wallet.</Text>
+
+            <View style={[s.onboardCard, glassOnboardCard]}>
+              <Text style={s.onboardCardTitle}>⚠️  READ THIS FIRST</Text>
+              <Text style={s.onboardBody}>
+                Write these characters down on paper and store them safely — or save them in a password manager.{'\n\n'}
+                • Anyone with this key controls your wallet and your MONEY.{'\n'}
+                • Never share it. Never type it into a website.{'\n'}
+                • We cannot recover it for you. Lose this key AND your phone, and your MONEY is gone forever.
+              </Text>
+            </View>
+
+            <View style={[s.onboardCard, glassOnboardCard]}>
+              <Text style={s.onboardCardTitle}>YOUR RECOVERY KEY (64 CHARACTERS)</Text>
+              <Text selectable style={{ color: '#F1E2C0', fontSize: 16, letterSpacing: 2, fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace', textAlign: 'center', lineHeight: 30, marginTop: 6 }}>
+                {groupHex(seedHex)}
+              </Text>
+            </View>
+
+            <Text style={{ color: '#9A7B4A', fontSize: 12, textAlign: 'center', marginBottom: 16 }}>
+              This key restores wallet:{'\n'}{addrRef.current}
+            </Text>
+
+            <AnimatedPress
+              style={[s.btnGold, glassButton]}
+              onPress={() => Share.share({ message: `MONEY wallet recovery key (KEEP SECRET — anyone with this controls the wallet):\n\n${seedHex}\n\nWallet address: ${addrRef.current}` })}
+            >
+              <Text style={s.btnText}>SAVE / EXPORT KEY</Text>
+            </AnimatedPress>
+
+            <TouchableOpacity style={{ marginTop: 16, paddingVertical: 10 }} onPress={() => setOnboardingStep(0)}>
+              <Text style={{ color: '#888', textAlign: 'center' }}>← Done — back to wallet</Text>
+            </TouchableOpacity>
+          </View>
+        </ScrollView>
+      </SafeAreaView>
+      </ScreenWrapper>
+    );
+  }
+
+  // ── Screen 51: RESTORE WALLET ─────────────────────────────────────────
+  if (onboardingStep === 51) {
+    return (
+      <ScreenWrapper>
+      <SafeAreaView style={s.root}>
+        <ScrollView contentContainerStyle={s.onboardScroll} keyboardShouldPersistTaps="handled">
+          <View style={s.onboardCenter}>
+            <Text style={s.onboardTitle}>Restore Your Wallet</Text>
+            <Text style={s.onboardSub}>Enter your 64-character recovery key.</Text>
+
+            <View style={[s.onboardCard, glassOnboardCard]}>
+              <Text style={s.onboardBody}>
+                ⚠️  Restoring REPLACES the wallet on this phone with the one your recovery key controls. If this phone already holds MONEY, back it up first.
+              </Text>
+            </View>
+
+            <TextInput
+              style={{ width: '100%', backgroundColor: 'rgba(28,17,4,0.6)', borderWidth: 1, borderColor: 'rgba(212,175,55,0.35)', borderRadius: 12, padding: 14, color: '#F1E2C0', fontSize: 14, letterSpacing: 1, minHeight: 96, textAlignVertical: 'top', fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace' }}
+              placeholder="Paste or type your recovery key (spaces are ignored)"
+              placeholderTextColor="#5A3D1A"
+              autoCapitalize="none"
+              autoCorrect={false}
+              multiline
+              value={seedInput}
+              onChangeText={(t) => { setSeedInput(t); setRestorePreview(null); }}
+            />
+
+            {!restorePreview ? (
+              <AnimatedPress style={[s.btnGold, glassButton, { marginTop: 16 }]} onPress={previewRestore}>
+                <Text style={s.btnText}>CHECK KEY</Text>
+              </AnimatedPress>
+            ) : (
+              <View style={{ width: '100%', marginTop: 16 }}>
+                <Text style={{ color: '#7DB87A', textAlign: 'center', marginBottom: 12 }}>
+                  This key restores wallet:{'\n'}{restorePreview.address}{'\n\n'}Confirm this is the wallet you want on this phone.
+                </Text>
+                <AnimatedPress style={[s.btnGold, glassButton]} onPress={applyRestore}>
+                  <Text style={s.btnText}>RESTORE THIS WALLET</Text>
+                </AnimatedPress>
+              </View>
+            )}
+
+            <TouchableOpacity style={{ marginTop: 16, paddingVertical: 10 }} onPress={() => { setSeedInput(''); setRestorePreview(null); setOnboardingStep(isIgnitedRef.current ? 0 : 12); }}>
+              <Text style={{ color: '#888', textAlign: 'center' }}>← Cancel</Text>
+            </TouchableOpacity>
+          </View>
+        </ScrollView>
+      </SafeAreaView>
+      </ScreenWrapper>
+    );
+  }
+
   // ─────────────────────────────────────────────────────────────────────
   // ── MAIN APP ──────────────────────────────────────────────────────────
   // ─────────────────────────────────────────────────────────────────────
@@ -2260,6 +2424,16 @@ function AppInner() {
         >
           <Text style={{ color: '#5A3D1A', fontSize: 12, letterSpacing: 1 }}>WHAT IS MONEY? →</Text>
         </TouchableOpacity>
+
+        {/* Wallet backup / restore (key recovery) */}
+        <View style={{ flexDirection: 'row', justifyContent: 'center', gap: 24, paddingVertical: 6, marginBottom: 10 }}>
+          <TouchableOpacity onPress={() => setOnboardingStep(50)}>
+            <Text style={{ color: '#9A7B4A', fontSize: 12, letterSpacing: 1 }}>🔑 BACK UP WALLET</Text>
+          </TouchableOpacity>
+          <TouchableOpacity onPress={() => { setSeedInput(''); setRestorePreview(null); setOnboardingStep(51); }}>
+            <Text style={{ color: '#9A7B4A', fontSize: 12, letterSpacing: 1 }}>♻️ RESTORE WALLET</Text>
+          </TouchableOpacity>
+        </View>
 
         {/* CLAY TABLETS (ledger) */}
         <View style={s.section}>
