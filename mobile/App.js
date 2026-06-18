@@ -259,13 +259,7 @@ const FACE_STEPS = [
   { instruction: 'Return to center and hold',     icon: 'front', requiresTap: false },
 ];
 
-// ── Daily missions ──────────────────────────────────────────────────────────
-const MISSIONS = [
-  { day: 1, icon: '📜', task: 'Share your seal mark with one person today — send it in a message or show it in person.' },
-  { day: 2, icon: '🪨', task: 'Read the Clay Tablets — scroll through real trades and understand what is moving.' },
-  { day: 3, icon: '🌟', task: 'Invite one person to the Swarm — they join, you both grow.' },
-  { day: 4, icon: '🔥', task: 'IGNITION DAY — Your star is ready. Claim your founding share.' },
-];
+// (Daily missions removed with the suns mechanic.)
 
 const RE_AUTH_COUNTDOWN = 3;
 
@@ -273,20 +267,7 @@ const RE_AUTH_COUNTDOWN = 3;
 // re-auth (biometric + MONEY PIN). Short app-switches stay unlocked.
 const REAUTH_AWAY_MS = 5 * 60 * 1000; // 5 minutes
 
-// ── Identity contribution cards ────────────────────────────────────────────
-// Each filled card melts `worth` calendar days off the 4-day requirement.
-// Total possible: 4.5 → daysRequired floors to max(1, 4 - floor(score)).
-// Fill everything → ignite on Day 1 after a single check-in.
-// icon: SVG component reference (rendered as <card.icon size={20} color={...} />)
-const IDENTITY_CARDS = [
-  { id: 'name',       icon: IconPerson,     label: 'Full Name',          worth: 0.5, minLen: 3,  placeholder: 'Your real name',                 keyboardType: 'default'      },
-  { id: 'dob',        icon: IconCalendar,   label: 'Date of Birth',      worth: 0.5, minLen: 8,  placeholder: 'DD / MM / YYYY',                 keyboardType: 'numeric'      },
-  { id: 'country',    icon: IconGlobe,      label: 'Country',            worth: 0.5, minLen: 2,  placeholder: 'Your country',                   keyboardType: 'default'      },
-  { id: 'email',      icon: IconAt,         label: 'Email Address',      worth: 0.5, minLen: 5,  placeholder: 'you@example.com',                keyboardType: 'email-address'},
-  { id: 'profession', icon: IconProfession, label: 'What You Do',        worth: 0.5, minLen: 3,  placeholder: 'e.g. nurse, engineer, student…', keyboardType: 'default'      },
-  { id: 'phone',      icon: IconPhone,      label: 'Phone Number',       worth: 1.0, minLen: 7,  placeholder: '+1 234 567 8900',                keyboardType: 'phone-pad'    },
-  { id: 'social',     icon: IconLink,       label: 'LinkedIn / Social',  worth: 1.0, minLen: 10, placeholder: 'linkedin.com/in/you or @handle', keyboardType: 'url'          },
-];
+// (Identity/KYC contribution cards removed with the suns mechanic.)
 
 // ── Screen entry animation — every screen fades + scales in from slightly zoomed-out ─
 const ScreenWrapper = ({ children, style }) => {
@@ -506,14 +487,7 @@ function AppInner() {
   const [faceRetry,        setFaceRetry]        = useState(0);
   const [reAuthRetry,      setReAuthRetry]      = useState(0);
 
-  // Formation (step 5)
-  const [formationDay,    setFormationDay]    = useState(1);
-  const [formationTotal,  setFormationTotal]  = useState(0);
-  const [formationStreak, setFormationStreak] = useState(0);
-  const [todayCheckedIn,  setTodayCheckedIn]  = useState(false);
-  const [missionDone,     setMissionDone]     = useState(false);
-  const [identityData,    setIdentityData]    = useState({});   // { name:'', dob:'', ... }
-  const [expandedCard,    setExpandedCard]    = useState(null); // id of open card
+  // (Formation/suns state removed.)
 
   // Liveness check (step 25)
   const [livenessNums,           setLivenessNums]           = useState([]);
@@ -830,117 +804,11 @@ function AppInner() {
     } catch {}
   };
 
-  // ── 4D Inspector (web-only design tool) ──────────────────────────────
-  // Invisible in the APK — only injected when IS_WEB is true.
-  // Lets you teleport to any screen and simulate state without touching security.
+  // (4D web-only debug inspector removed — it referenced deleted formation state.)
+
+  // ── Star pulse animation (ignition screen) ───────────────────────────
   useEffect(() => {
-    if (!IS_WEB) return;
-
-    const SCREENS = [
-      { label: '① Oath / Welcome',        step: 1  },
-      { label: '② Face Inscription',       step: 2  },
-      { label: '② Liveness Check',         step: 25 },
-      { label: '③ Left Thumb',             step: 3  },
-      { label: '③ Right Thumb',            step: 32 },
-      { label: '③ PIN Seal',               step: 35 },
-      { label: '④ Seal Forged',            step: 4  },
-      { label: '⑤ Formation / Forge',      step: 5  },
-      { label: '⑥ Ignition',              step: 6  },
-      { label: '⓪ Main App',              step: 0  },
-      { label: '↺  Re-auth Screen',        step: 99 },
-    ];
-
-    let open = false;
-    const el = document.createElement('div');
-    el.id = '__4d_inspector__';
-    document.body.appendChild(el);
-
-    const render = () => {
-      el.innerHTML = open ? `
-        <div style="
-          position:fixed; bottom:20px; right:20px; z-index:99999;
-          background:#1A0E00; border:1px solid #D4AF37; border-radius:12px;
-          padding:14px 16px; width:230px; font-family:monospace;
-          box-shadow:0 0 24px rgba(212,175,55,0.35);
-        ">
-          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
-            <span style="color:#D4AF37; font-weight:bold; font-size:13px; letter-spacing:2px;">4D INSPECTOR</span>
-            <button onclick="window.__4d_toggle()" style="
-              background:none; border:none; color:#D4AF37; cursor:pointer; font-size:16px; padding:0;
-            ">✕</button>
-          </div>
-          <div style="margin-bottom:10px;">
-            ${SCREENS.map(s => `
-              <button onclick="window.__4d_nav(${s.step})" style="
-                display:block; width:100%; text-align:left; background:transparent;
-                border:none; border-bottom:1px solid #2E1F00; color:#F5E6C8;
-                padding:7px 4px; cursor:pointer; font-size:12px; font-family:monospace;
-              " onmouseover="this.style.color='#D4AF37'" onmouseout="this.style.color='#F5E6C8'">
-                ${s.label}
-              </button>
-            `).join('')}
-          </div>
-          <div style="border-top:1px solid #2E1F00; padding-top:10px;">
-            <div style="color:#D4AF37; font-size:11px; margin-bottom:6px; letter-spacing:1px;">FORMATION DAY</div>
-            <div style="display:flex; gap:6px; flex-wrap:wrap;">
-              ${[0,1,2,3,4].map(d => `
-                <button onclick="window.__4d_day(${d})" style="
-                  background:#2E1F00; border:1px solid #D4AF37; border-radius:4px;
-                  color:#D4AF37; padding:4px 8px; cursor:pointer; font-size:12px; font-family:monospace;
-                ">D${d}</button>
-              `).join('')}
-            </div>
-          </div>
-          <div style="margin-top:10px; border-top:1px solid #2E1F00; padding-top:8px;">
-            <div style="color:#D4AF37; font-size:11px; margin-bottom:6px; letter-spacing:1px;">MELT SCORE (0–4.5)</div>
-            <input id="__4d_melt__" type="range" min="0" max="4.5" step="0.5" value="0"
-              oninput="window.__4d_melt(parseFloat(this.value));document.getElementById('__4d_meltval__').innerText=this.value"
-              style="width:100%; accent-color:#D4AF37;"
-            />
-            <span id="__4d_meltval__" style="color:#F5E6C8; font-size:11px;">0</span>
-          </div>
-        </div>
-      ` : `
-        <button onclick="window.__4d_toggle()" style="
-          position:fixed; bottom:20px; right:20px; z-index:99999;
-          background:#1A0E00; border:2px solid #D4AF37; border-radius:50%;
-          width:42px; height:42px; color:#D4AF37; font-weight:bold; font-size:13px;
-          cursor:pointer; font-family:monospace; letter-spacing:1px;
-          box-shadow:0 0 12px rgba(212,175,55,0.4);
-        ">4D</button>
-      `;
-    };
-
-    window.__4d_toggle = () => { open = !open; render(); };
-    window.__4d_nav    = (step) => { setOnboardingStep(step); };
-    window.__4d_day    = (day)  => { setFormationDay(day); setOnboardingStep(5); };
-    window.__4d_melt   = (score) => {
-      // Inject artificial identity data to match the melt score
-      // We approximate by filling identity cards worth 0.5 each
-      const filled = {};
-      const cards = ['name','dob','phone','email','city','country','bio'];
-      const worths = [0.5, 0.5, 0.5, 0.5, 1.0, 1.0, 0.5];
-      let remaining = score;
-      cards.forEach((id, i) => {
-        if (remaining >= worths[i]) {
-          filled[id] = 'sim_placeholder_value_long_enough';
-          remaining -= worths[i];
-        }
-      });
-      setIdentityData(filled);
-    };
-
-    render();
-
-    return () => {
-      ['__4d_toggle','__4d_nav','__4d_day','__4d_melt'].forEach(k => delete window[k]);
-      if (document.body.contains(el)) document.body.removeChild(el);
-    };
-  }, []);  // mount/unmount only — setters are stable
-
-  // ── Star pulse animation (formation) ─────────────────────────────────
-  useEffect(() => {
-    if (onboardingStep === 5 || onboardingStep === 6) {
+    if (onboardingStep === 6) {
       const loop = Animated.loop(
         Animated.parallel([
           Animated.sequence([
@@ -1100,7 +968,6 @@ function AppInner() {
     if (IS_WEB) {
       setReAuthPhase('done');
       const dest = destinationAfterAuth.current ?? 0;
-      if (dest === 5) { await loadFormationData(); await doFormationCheckIn(); }
       setOnboardingStep(dest);
       return;
     }
@@ -1132,7 +999,6 @@ function AppInner() {
           // No PIN set up yet (old install or PIN cleared) — proceed directly
           setReAuthPhase('done');
           const dest = destinationAfterAuth.current;
-          if (dest === 5) { await loadFormationData(); await doFormationCheckIn(); }
           setOnboardingStep(dest);
         }
       } else if (result.error === 'lockout' || result.error === 'lockoutPermanent') {
@@ -1152,58 +1018,7 @@ function AppInner() {
     }
   };
 
-  // ── Formation data ────────────────────────────────────────────────────
-  const loadFormationData = async () => {
-    const startStr = await AsyncStorage.getItem('formation_start').catch(() => null);
-    if (!startStr) return;
-
-    const startDate = new Date(startStr);
-    const daysSince = Math.floor((Date.now() - startDate.getTime()) / 86_400_000);
-    const day = Math.min(daysSince + 1, 4);
-    setFormationDay(day);
-
-    const dates = JSON.parse(await AsyncStorage.getItem('streak_dates').catch(() => '[]') || '[]');
-    setFormationTotal(dates.length);
-    setTodayCheckedIn(dates.includes(todayStr()));
-
-    let streak = 0;
-    const sorted = [...dates].sort().reverse();
-    let checkDate = new Date();
-    for (const d of sorted) {
-      const expected = checkDate.toISOString().split('T')[0];
-      if (d === expected) { streak++; checkDate.setDate(checkDate.getDate() - 1); }
-      else break;
-    }
-    setFormationStreak(streak);
-
-    const doneMissions = JSON.parse(await AsyncStorage.getItem('missions_done').catch(() => '[]') || '[]');
-    setMissionDone(doneMissions.includes(day));
-
-    // Identity data migrates from AsyncStorage (plaintext) → SecureStore (hardware-backed)
-    let idRaw = await SecureStore.getItemAsync('identity_data').catch(() => null);
-    if (!idRaw) {
-      const legacy = await AsyncStorage.getItem('identity_data').catch(() => null);
-      if (legacy) {
-        await SecureStore.setItemAsync('identity_data', legacy).catch(() => {});
-        await AsyncStorage.removeItem('identity_data').catch(() => {});
-        idRaw = legacy;
-      }
-    }
-    if (idRaw) setIdentityData(JSON.parse(idRaw));
-  };
-
-  const doFormationCheckIn = async () => {
-    const today = todayStr();
-    const dates = JSON.parse(await AsyncStorage.getItem('streak_dates').catch(() => '[]') || '[]');
-    if (!dates.includes(today)) {
-      dates.push(today);
-      await AsyncStorage.setItem('streak_dates', JSON.stringify(dates));
-      setTodayCheckedIn(true);
-      setFormationTotal(dates.length);
-      setFormationStreak(prev => prev + 1);
-      setHammerHits(h => h + 1); // each day present strikes the forge
-    }
-  };
+  // (Formation data load + daily check-in removed with the suns mechanic.)
 
   // ── 2FA — MONEY PIN ──────────────────────────────────────────────────
   // The PIN is never stored raw — only its SHA-256 hash survives in SecureStore.
@@ -1228,7 +1043,6 @@ function AppInner() {
     const returnTo = pinSetupReturnTo.current;
     if (returnTo !== null) {
       pinSetupReturnTo.current = null;
-      if (returnTo === 5) { await loadFormationData(); await doFormationCheckIn(); }
       Alert.alert('Authenticator linked 🔐', 'Your 2FA has been updated successfully.');
       setOnboardingStep(returnTo);
     } else {
@@ -1267,7 +1081,6 @@ function AppInner() {
       setTotpEntryCode(''); setTotpEntryError('');
       setReAuthPhase('done');
       const dest = destinationAfterAuth.current;
-      if (dest === 5) { await loadFormationData(); await doFormationCheckIn(); }
       setOnboardingStep(dest);
     } else {
       setTotpEntryCode('');
@@ -1279,32 +1092,7 @@ function AppInner() {
   const submitPin2FA = submitTotp2FA;
   const hasPinSetup  = hasTotpSetup;
 
-  const completeMission = async () => {
-    const doneMissions = JSON.parse(await AsyncStorage.getItem('missions_done').catch(() => '[]') || '[]');
-    if (!doneMissions.includes(formationDay)) {
-      doneMissions.push(formationDay);
-      await AsyncStorage.setItem('missions_done', JSON.stringify(doneMissions));
-      setMissionDone(true);
-      Alert.alert('Tablet Inscribed ✅', 'Come back tomorrow for your next task.');
-    }
-  };
-
-  const saveIdentityField = async (id, value) => {
-    const prev = identityData[id] || '';
-    const card = IDENTITY_CARDS.find(c => c.id === id);
-    const wasFilledBefore = prev.trim().length  >= (card?.minLen || 0);
-    const isFilledNow     = value.trim().length >= (card?.minLen || 0);
-    const next = { ...identityData, [id]: value };
-    setIdentityData(next);
-    await SecureStore.setItemAsync('identity_data', JSON.stringify(next)).catch(() => {});
-    // Strike the hammer once when a card becomes newly completed
-    if (!wasFilledBefore && isFilledNow) setHammerHits(h => h + 1);
-  };
-
-  // Derived melt score — recalculated from identityData on every render
-  const meltScore    = IDENTITY_CARDS.reduce((sum, c) =>
-    sum + ((identityData[c.id] || '').trim().length >= c.minLen ? c.worth : 0), 0);
-  const daysRequired = Math.max(1, 4 - Math.floor(meltScore));
+  // (Mission + identity-field helpers and melt-score derivation removed with the suns mechanic.)
 
   // ── Photo quality gate ────────────────────────────────────────────────
   // Returns a rejection message string, or null if the photo passes.
@@ -2201,287 +1989,7 @@ function AppInner() {
     );
   }
 
-  // ── Step 5: Star Formation (4-sun journey) ────────────────────────────
-  if (onboardingStep === 5) {
-    const mission      = MISSIONS[Math.min(formationDay - 1, 3)];
-    const melted       = Math.min(Math.floor(meltScore), 4);
-
-    // 4-day calendar wait removed — once the seal is forged the founding share
-    // ignites immediately. The forge is shown already complete so the screen
-    // reads as "ready" rather than "come back in N days". Sybil resistance now
-    // lives server-side (signed public key) rather than in a time penalty that
-    // mostly punished genuine users.
-    const forgeProgress = 1;
-    const gatePassed    = true;
-
-    const progressPct  = 100;
-    const daysLeft     = 0;
-
-    const gates = [
-      { label: 'Oath sealed',         ok: true },
-      { label: 'Seal forged',         ok: true },
-      { label: 'Face inscribed',      ok: true },
-      { label: 'Body keys enrolled',  ok: true },
-      { label: 'MONEY PIN set (2FA)', ok: true },
-      { label: 'Tablet registered',   ok: true },
-      { label: 'Ready to ignite',     ok: true },
-    ];
-
-    return (
-      <SafeAreaView style={s.root}>
-        <ScrollView contentContainerStyle={s.scroll}>
-
-          {/* Forge Scene */}
-          <View style={s.forgeScene}>
-            <Text style={s.galaxyLabel}>🌌 YOUR SEAL IS BEING FORGED 🌌</Text>
-
-            {/* Hammer + Anvil visual */}
-            <View style={s.forgeContainer}>
-
-              {/* Hammer — swings down on each strike */}
-              <Animated.View style={[s.hammerWrap, {
-                transform: [
-                  { translateX: hammerX },
-                  { translateY: hammerY },
-                  { rotate: hammerRot.interpolate({ inputRange: [0, 1], outputRange: ['-30deg', '5deg'] }) },
-                ],
-              }]}>
-                <ForgeHammerSVG size={72} />
-              </Animated.View>
-
-              {/* Sparks — flash at contact point */}
-              <Animated.View style={[s.forgeSparks, { opacity: sparkOp }]}>
-                <ForgeSparks size={60} />
-              </Animated.View>
-
-              {/* Anvil + emerging M logo */}
-              <View style={s.forgeAnvilSect}>
-                {/* M logo: 1/4 revealed per forge unit (day + identity card).
-                    Ghost shows the full outline so the user knows what is coming.
-                    When forgeProgress hits 1.0 the full logo appears and ignition unlocks. */}
-                <Animated.View style={[s.forgeLogoWrap, { transform: [{ scale: forgeLogoScl }] }]}>
-                  <MoneySymbol size={72} color="#D4AF37" progress={forgeProgress} />
-                </Animated.View>
-                {/* Anvil shape */}
-                <AnvilSVG width={180} />
-              </View>
-            </View>
-
-            <View style={{ flexDirection:'row', gap: 10, marginTop: 8, marginBottom: 4 }}>
-              {Array.from({ length: 4 }, (_, i) =>
-                i < melted
-                  ? <IgnitedCoin key={i} size={28} />
-                  : <GoldCoin    key={i} size={28} active={i < formationDay} />
-              )}
-            </View>
-            <Text style={s.starDayLabel}>SUN {formationDay} — {daysRequired} REQUIRED</Text>
-
-            <View style={s.formProgressBar}>
-              <View style={[s.formProgressFill, { width: `${Math.min(progressPct, 100)}%` }]}>
-                {/* Shimmer sweep overlay */}
-                <Animated.View style={{
-                  position: 'absolute', top: 0, bottom: 0, width: 40, borderRadius: 2,
-                  backgroundColor: 'rgba(255,255,255,0.35)',
-                  transform: [{ translateX: shimmerAnim.interpolate({
-                    inputRange: [0, 1], outputRange: [-40, width * 0.72 + 40],
-                  }) }],
-                }} />
-              </View>
-            </View>
-
-            <View style={{ flexDirection:'row', alignItems:'center', marginTop: 12, gap: 4 }}>
-              {formationStreak > 0
-                ? Array.from({ length: Math.min(formationStreak, 4) }, (_, i) => <FlameIcon key={i} size={14} color="#E05020" />)
-                : <PendingCircle size={16} color="#3A2810" />}
-              <Text style={[s.streakText, { marginLeft: 4 }]}>
-                {formationStreak > 0 ? `${formationStreak}-sun streak` : 'No streak yet — open daily!'}
-              </Text>
-            </View>
-          </View>
-
-          {/* Locked balance */}
-          <View style={[s.lockedCard, glassCard]}>
-            <Text style={s.lockedLabel}>YOUR FOUNDING SHARE</Text>
-            <Animated.Text style={[s.lockedAmount, {
-              opacity: breathAnim.interpolate({ inputRange: [0, 1], outputRange: [0.8, 1] }),
-              textShadowColor: '#D4AF37',
-              textShadowOffset: { width: 0, height: 0 },
-              textShadowRadius: 10,
-            }]}>1,000,000.00 MONEY</Animated.Text>
-            <View style={{ flexDirection:'row', alignItems:'center', gap: 6 }}>
-              {daysLeft > 0 ? <LockIcon size={16} color="#C4956A" /> : <FlameIcon size={16} color="#E05020" />}
-              <Text style={s.lockedLock}>
-                {daysLeft > 0
-                  ? `Ignites in ${daysLeft} sun${daysLeft !== 1 ? 's' : ''} — or share more below`
-                  : 'READY TO IGNITE'}
-              </Text>
-            </View>
-            {melted > 0 && (
-              <Text style={s.meltBadge}>🌡️ {melted} sun{melted !== 1 ? 's' : ''} melted by your identity</Text>
-            )}
-          </View>
-
-          {/* Founder's one-time ignition code (server enforces it when configured) */}
-          {gatePassed && (
-            <View style={{ width: '100%', marginBottom: 14, paddingHorizontal: 4 }}>
-              <Text style={{ color: '#9A7B4A', fontSize: 11, letterSpacing: 3, textAlign: 'center', marginBottom: 8 }}>
-                ✦ FOUNDER'S IGNITION CODE
-              </Text>
-              <TextInput
-                value={ignitionCode}
-                onChangeText={setIgnitionCode}
-                placeholder="enter your one-time seal code"
-                placeholderTextColor="#5A3D1A"
-                autoCapitalize="characters"
-                autoCorrect={false}
-                style={{
-                  backgroundColor: 'rgba(28,17,4,0.6)', borderWidth: 1, borderColor: 'rgba(212,175,55,0.35)',
-                  borderRadius: 12, paddingVertical: 12, paddingHorizontal: 16, color: '#F1E2C0',
-                  fontSize: 15, letterSpacing: 2, textAlign: 'center',
-                }}
-              />
-            </View>
-          )}
-
-          {/* Ignite button */}
-          {gatePassed && (
-            <AnimatedPress style={[s.btnIgnite, glassButton]} onPress={triggerIgnition}>
-              <View style={{ flexDirection:'row', alignItems:'center', justifyContent:'center', gap: 6 }}>
-                <FlameIcon size={18} color="#1A0A00" />
-                <Text style={s.btnIgniteText}>IGNITE YOUR STAR — CLAIM </Text>
-                <MoneySymbol size={14} color="#1A0A00" />
-                <Text style={s.btnIgniteText}> 1,000,000</Text>
-              </View>
-            </AnimatedPress>
-          )}
-
-          {/* Daily check-in */}
-          {!gatePassed && (
-            <TouchableOpacity
-              style={[s.btnCheckIn, todayCheckedIn && s.btnCheckedIn]}
-              onPress={todayCheckedIn ? undefined : doFormationCheckIn}
-              disabled={todayCheckedIn}
-            >
-              <Text style={s.btnText}>
-                {todayCheckedIn ? '✅ Present today' : '📍 MARK PRESENCE TODAY'}
-              </Text>
-            </TouchableOpacity>
-          )}
-
-          {/* ── MELT THE SUNS — identity contribution cards ─────────────── */}
-          <View style={s.meltSection}>
-            <Text style={s.meltTitle}>🌡️  MELT THE SUNS</Text>
-
-            {/* KYC explanation */}
-            <View style={s.kycBox}>
-              <Text style={s.kycHeading}>🛡️  This is not surveillance.</Text>
-              <View style={{ flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', marginBottom: 4 }}>
-                <MoneySymbol size={13} color="#D4AF37" style={{ marginRight: 4 }} />
-                <Text style={s.kycBody}>{'is built for real humans — not bots, not scripts, not fake accounts.'}</Text>
-              </View>
-              <Text style={s.kycBody}>
-                {'\n'}
-                Each piece of information you share is a signal that you are a unique person. It stays on your device. It is never sold, never sent to a server without your action, never used for anything other than proving you are real.{'\n\n'}
-                The more you prove it, the faster the forge heats — and the sooner your founding share ignites.
-              </Text>
-            </View>
-
-            <Text style={s.meltSub}>
-              Each card you fill strikes the hammer once and melts a sun off your wait.
-            </Text>
-
-            {IDENTITY_CARDS.map((card) => {
-              const val     = (identityData[card.id] || '');
-              const filled  = val.trim().length >= card.minLen;
-              const isOpen  = expandedCard === card.id;
-
-              return (
-                <View key={card.id} style={[s.idCard, filled && s.idCardFilled, glassTermBox]}>
-                  {/* Card header — tap to expand/collapse */}
-                  <TouchableOpacity
-                    style={s.idCardHeader}
-                    onPress={() => setExpandedCard(isOpen ? null : card.id)}
-                    activeOpacity={0.75}
-                  >
-                    <View style={{ marginRight: 10, width: 22, alignItems: 'center' }}>
-                      <card.icon size={20} color={filled ? '#D4AF37' : '#6B4423'} />
-                    </View>
-                    <View style={{ flex: 1 }}>
-                      <Text style={[s.idCardLabel, filled && s.idCardLabelFilled]}>
-                        {card.label}
-                      </Text>
-                      {filled && (
-                        <Text style={s.idCardPreview} numberOfLines={1}>{val}</Text>
-                      )}
-                    </View>
-                    {filled
-                      ? <CheckSeal size={18} />
-                      : <Text style={s.idCardWorth}>{`−${card.worth % 1 === 0 ? card.worth : card.worth} day`}</Text>
-                    }
-                    <Text style={s.idCardChevron}>{isOpen ? '▲' : '▼'}</Text>
-                  </TouchableOpacity>
-
-                  {/* Expanded input */}
-                  {isOpen && (
-                    <TextInput
-                      style={s.idCardInput}
-                      placeholder={card.placeholder}
-                      placeholderTextColor="#4A2E10"
-                      keyboardType={card.keyboardType}
-                      autoCapitalize="none"
-                      value={val}
-                      onChangeText={(t) => saveIdentityField(card.id, t)}
-                      autoFocus
-                    />
-                  )}
-                </View>
-              );
-            })}
-
-            <Text style={s.meltFooter}>
-              {meltScore === 0
-                ? 'Your data stays on your device. Nothing is shared without your consent.'
-                : `Score: ${meltScore.toFixed(1)} / 4.5 — ${melted} sun${melted !== 1 ? 's' : ''} melted 🔥`}
-            </Text>
-          </View>
-
-          {/* Today's task */}
-          <View style={[s.missionCard, glassCard]}>
-            <Text style={s.missionTitle}>TODAY'S TASK — SUN {formationDay}</Text>
-            <Text style={s.missionIcon}>{mission.icon}</Text>
-            <Text style={s.missionTask}>{mission.task}</Text>
-            {formationDay < 4 && (
-              <TouchableOpacity
-                style={[s.btnMission, missionDone && s.btnMissionDone]}
-                onPress={missionDone ? undefined : completeMission}
-                disabled={missionDone}
-              >
-                <Text style={s.btnText}>{missionDone ? '✅ TABLET INSCRIBED' : 'INSCRIBE AS DONE'}</Text>
-              </TouchableOpacity>
-            )}
-          </View>
-
-          {/* Gates */}
-          <View style={[s.gatesCard, glassOnboardCard]}>
-            <Text style={s.onboardCardTitle}>THE NINE GATES</Text>
-            {gates.map((g, i) => (
-              <View key={i} style={s.gateRow}>
-                <View style={[{ width: 24, marginRight: 10, alignItems: 'center' }, g.ok === null && { opacity: 0.35 }]}>
-                  {g.ok === true
-                    ? <CheckSeal size={18} />
-                    : g.ok === false
-                      ? <HourglassIcon size={18} />
-                      : <PendingCircle size={18} color="#3A2810" />}
-                </View>
-                <Text style={[s.gateLabel, g.ok === null && s.gateLabelFaded]}>{g.label}</Text>
-              </View>
-            ))}
-          </View>
-
-        </ScrollView>
-      </SafeAreaView>
-    );
-  }
+  // Step 5 (formation / 4-suns / KYC screen) removed — sovereignty ignites on step 4.
 
   // ── Step 6: IGNITION ──────────────────────────────────────────────────
   if (onboardingStep === 6) {
