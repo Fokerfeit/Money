@@ -7,6 +7,12 @@ import {
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as SecureStore from 'expo-secure-store';
 import nacl from 'tweetnacl';
+// BIP39 (audited, RN-safe, bundles its own wordlist). We use the ENTROPY path
+// (entropyToMnemonic / mnemonicToEntropy) — NOT the PBKDF2 mnemonic→seed path —
+// so the 24 words encode the wallet's existing 32-byte seed directly and restore
+// the EXACT same address. Proven 30001/30001 round-trips.
+import { entropyToMnemonic, mnemonicToEntropy, validateMnemonic } from '@scure/bip39';
+import { wordlist as bip39Words } from '@scure/bip39/wordlists/english.js';
 import * as ExpoCrypto from 'expo-crypto';
 import * as LocalAuthentication from 'expo-local-authentication';
 import { CameraView, useCameraPermissions } from 'expo-camera';
@@ -2050,28 +2056,50 @@ function AppInner() {
   // ── Wallet backup / restore (key recovery) ───────────────────────────
   // The 32-byte seed IS the wallet: ed25519 secretKey = seed(32) ‖ publicKey(32),
   // so seed = secretKey[:32]. Rebuilding from that seed reproduces the EXACT same
-  // keypair + address (proven: 4000/4000 round-trips). We surface the seed as hex
-  // for the user to write down / save; restore rebuilds from it. No third party,
-  // no server — sovereignty-consistent.
-  const recoverySeedHex = () => (secKeyRef.current || '').substring(0, 64).toUpperCase();
+  // keypair + address (proven). We surface the seed two ways that encode the SAME
+  // 32-byte seed: a 24-word BIP39 phrase (primary — easiest to write down) and the
+  // raw hex key (fallback). The words use BIP39's ENTROPY path (not PBKDF2), so
+  // either one restores the identical wallet. No third party, no server.
+  const recoverySeedHex  = () => (secKeyRef.current || '').substring(0, 64).toUpperCase();
+  const recoveryMnemonic = () => {
+    try { return entropyToMnemonic(fromHex((secKeyRef.current || '').substring(0, 64)), bip39Words); }
+    catch { return ''; }
+  };
   const groupHex = (h) => (h.match(/.{1,4}/g) || []).join(' ');
 
-  // Check a typed recovery key and reconstruct the keypair (preview only — no write yet).
+  // Check a typed recovery phrase OR raw key and reconstruct the keypair (preview only).
+  // Accepts a 24-word BIP39 phrase (preferred) or the 64-char hex key (fallback).
   const previewRestore = () => {
-    const clean = (seedInput || '').replace(/[^0-9a-fA-F]/g, '').toLowerCase();
-    if (clean.length !== 64) {
-      Alert.alert('Check your recovery key', 'A recovery key is 64 characters (digits 0–9 and letters A–F). Spaces are ignored. Yours has ' + clean.length + '.');
-      return;
+    const raw = (seedInput || '').trim();
+    const words = raw.toLowerCase().split(/\s+/).filter(Boolean);
+    let seedHex = null;
+    if (words.length >= 12) {
+      // 24-word recovery phrase — BIP39 entropy path (NOT pbkdf2)
+      const phrase = words.join(' ');
+      if (!validateMnemonic(phrase, bip39Words)) {
+        Alert.alert('Check your recovery phrase', 'That phrase is not valid — a word may be misspelled or out of order. It should be 24 words from the recovery list. Check and try again.');
+        return;
+      }
+      try { seedHex = toHex(mnemonicToEntropy(phrase, bip39Words)); }
+      catch { Alert.alert('Invalid phrase', 'Could not read that recovery phrase.'); return; }
+    } else {
+      // raw hex recovery key (fallback)
+      const h = raw.replace(/[^0-9a-fA-F]/g, '').toLowerCase();
+      if (h.length !== 64) {
+        Alert.alert('Check your recovery', 'Enter EITHER your 24-word phrase OR your 64-character recovery key. Spaces are ignored.');
+        return;
+      }
+      seedHex = h;
     }
     try {
-      const kp = nacl.sign.keyPair.fromSeed(fromHex(clean));
+      const kp = nacl.sign.keyPair.fromSeed(fromHex(seedHex));
       setRestorePreview({
         address:   'M_' + toHex(kp.publicKey).substring(0, 32).toUpperCase(),
         publicKey: toHex(kp.publicKey),
         secretKey: toHex(kp.secretKey),
       });
     } catch {
-      Alert.alert('Invalid recovery key', 'That key could not be read. Double-check it and try again.');
+      Alert.alert('Invalid recovery', 'That could not be read. Double-check it and try again.');
     }
   };
 
@@ -2099,40 +2127,64 @@ function AppInner() {
   // ── Screen 50: BACK UP WALLET ─────────────────────────────────────────
   if (onboardingStep === 50) {
     const seedHex = recoverySeedHex();
+    const mnemonic = recoveryMnemonic();
+    const words = mnemonic ? mnemonic.split(' ') : [];
     return (
       <ScreenWrapper>
       <SafeAreaView style={s.root}>
         <ScrollView contentContainerStyle={s.onboardScroll}>
           <View style={s.onboardCenter}>
             <Text style={s.onboardTitle}>Back Up Your Wallet</Text>
-            <Text style={s.onboardSub}>Your recovery key — the only way to restore this wallet.</Text>
+            <Text style={s.onboardSub}>Your 24-word recovery phrase restores this wallet.</Text>
 
             <View style={[s.onboardCard, glassOnboardCard]}>
               <Text style={s.onboardCardTitle}>⚠️  READ THIS FIRST</Text>
               <Text style={s.onboardBody}>
-                Write these characters down on paper and store them safely — or save them in a password manager.{'\n\n'}
-                • Anyone with this key controls your wallet and your MONEY.{'\n'}
-                • Never share it. Never type it into a website.{'\n'}
-                • We cannot recover it for you. Lose this key AND your phone, and your MONEY is gone forever.
+                Write these 24 words down IN ORDER on paper and store them safely — or save them in a password manager.{'\n\n'}
+                • Anyone with these words controls your wallet and your MONEY.{'\n'}
+                • Never share them. Never type them into a website.{'\n'}
+                • We cannot recover them for you. Lose them AND your phone, and your MONEY is gone forever.
               </Text>
             </View>
 
+            {words.length === 24 ? (
+              <View style={[s.onboardCard, glassOnboardCard]}>
+                <Text style={s.onboardCardTitle}>YOUR 24-WORD RECOVERY PHRASE</Text>
+                <View style={{ flexDirection: 'row', flexWrap: 'wrap', marginTop: 8 }}>
+                  {words.map((w, i) => (
+                    <View key={i} style={{ width: '50%', flexDirection: 'row', paddingVertical: 5, paddingRight: 6 }}>
+                      <Text style={{ color: '#7A5C3A', fontSize: 13, width: 26, textAlign: 'right', marginRight: 8 }}>{i + 1}.</Text>
+                      <Text selectable style={{ color: '#F1E2C0', fontSize: 15, fontWeight: '600', letterSpacing: 0.5 }}>{w}</Text>
+                    </View>
+                  ))}
+                </View>
+              </View>
+            ) : (
+              <View style={[s.onboardCard, glassOnboardCard]}>
+                <Text style={s.onboardBody}>Couldn't render the phrase here — use the raw recovery key below instead. It restores the same wallet.</Text>
+              </View>
+            )}
+
+            {/* Fallback: the raw hex key — encodes the SAME seed as the words */}
             <View style={[s.onboardCard, glassOnboardCard]}>
-              <Text style={s.onboardCardTitle}>YOUR RECOVERY KEY (64 CHARACTERS)</Text>
-              <Text selectable style={{ color: '#F1E2C0', fontSize: 16, letterSpacing: 2, fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace', textAlign: 'center', lineHeight: 30, marginTop: 6 }}>
+              <Text style={s.onboardCardTitle}>ADVANCED — RAW RECOVERY KEY (FALLBACK)</Text>
+              <Text selectable style={{ color: '#B8956A', fontSize: 13, letterSpacing: 1.5, fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace', textAlign: 'center', lineHeight: 24, marginTop: 6 }}>
                 {groupHex(seedHex)}
+              </Text>
+              <Text style={{ color: '#5A3D1A', fontSize: 11, textAlign: 'center', marginTop: 8 }}>
+                Same wallet as the words above — either one restores it.
               </Text>
             </View>
 
             <Text style={{ color: '#9A7B4A', fontSize: 12, textAlign: 'center', marginBottom: 16 }}>
-              This key restores wallet:{'\n'}{addrRef.current}
+              Restores wallet:{'\n'}{addrRef.current}
             </Text>
 
             <AnimatedPress
               style={[s.btnGold, glassButton]}
-              onPress={() => Share.share({ message: `MONEY wallet recovery key (KEEP SECRET — anyone with this controls the wallet):\n\n${seedHex}\n\nWallet address: ${addrRef.current}` })}
+              onPress={() => Share.share({ message: `MONEY wallet recovery (KEEP SECRET — anyone with this controls the wallet):\n\n24-WORD PHRASE:\n${mnemonic}\n\nRAW KEY (fallback, same wallet):\n${seedHex}\n\nWallet: ${addrRef.current}` })}
             >
-              <Text style={s.btnText}>SAVE / EXPORT KEY</Text>
+              <Text style={s.btnText}>SAVE / EXPORT</Text>
             </AnimatedPress>
 
             <TouchableOpacity style={{ marginTop: 16, paddingVertical: 10 }} onPress={() => setOnboardingStep(0)}>
@@ -2153,17 +2205,17 @@ function AppInner() {
         <ScrollView contentContainerStyle={s.onboardScroll} keyboardShouldPersistTaps="handled">
           <View style={s.onboardCenter}>
             <Text style={s.onboardTitle}>Restore Your Wallet</Text>
-            <Text style={s.onboardSub}>Enter your 64-character recovery key.</Text>
+            <Text style={s.onboardSub}>Enter your 24-word recovery phrase (or your raw recovery key).</Text>
 
             <View style={[s.onboardCard, glassOnboardCard]}>
               <Text style={s.onboardBody}>
-                ⚠️  Restoring REPLACES the wallet on this phone with the one your recovery key controls. If this phone already holds MONEY, back it up first.
+                ⚠️  Restoring REPLACES the wallet on this phone with the one your recovery phrase controls. If this phone already holds MONEY, back it up first.
               </Text>
             </View>
 
             <TextInput
               style={{ width: '100%', backgroundColor: 'rgba(28,17,4,0.6)', borderWidth: 1, borderColor: 'rgba(212,175,55,0.35)', borderRadius: 12, padding: 14, color: '#F1E2C0', fontSize: 14, letterSpacing: 1, minHeight: 96, textAlignVertical: 'top', fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace' }}
-              placeholder="Paste or type your recovery key (spaces are ignored)"
+              placeholder="Paste your 24 words (or your 64-character recovery key)"
               placeholderTextColor="#5A3D1A"
               autoCapitalize="none"
               autoCorrect={false}
