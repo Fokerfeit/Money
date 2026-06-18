@@ -26,8 +26,9 @@ npm-debug.*
 yarn-debug.*
 yarn-error.*
 
-# macOS
+# macOS / Windows OS junk
 .DS_Store
+desktop.ini
 *.pem
 
 # local env files
