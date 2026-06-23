@@ -192,27 +192,40 @@ function createCentralLedger() {
   };
 }
 
-// ── Phase-1 COMMITTEE backend (READ-ONLY SHADOW) ─────────────────────────────
+// ── COMMITTEE backend (READ-ONLY SHADOW, DURABLE in Phase 2) ─────────────────
 // A second LedgerBackend modelled on prototypes/fastpay_net (per-account state).
-// In Phase 1 it runs as a read-only SHADOW: it ingests the SAME committed txs as
-// central and computes each account's balance & standing INDEPENDENTLY from
-// per-account state — it NEVER serves a user response. Standing uses the IDENTICAL
-// rule as central (ported standingOf): IGNITED_BASELINE once ignited, +1 per
-// DISTINCT counterparty (excluding FAUCET and self); movable = min(balance,
-// standing × MOVE_PER_STANDING). No static standing.
+// It ingests the SAME committed txs as central and computes each account's
+// balance & standing INDEPENDENTLY — it NEVER serves a user response. Standing
+// uses the IDENTICAL rule as central (ported standingOf: IGNITED_BASELINE once
+// ignited, +1 per DISTINCT counterparty excluding FAUCET and self; movable =
+// min(balance, standing × MOVE_PER_STANDING) — no static standing).
+// Phase 2 — DURABLE: persists per-account state to its OWN file (never
+// ledger.json), reloads it on boot, catches up via resync(), is IDEMPOTENT
+// (a tx already applied is a no-op), and enforces INTEGER money end-to-end.
 function createCommitteeLedger() {
-  const accounts = new Map(); // addr -> { balance, ignited, counterparties:Set, nextSeq }
+  const STATE_FILE    = process.env.MONEY_COMMITTEE_FILE || path.join(DATA_DIR, 'committee_state.json');
+  const STATE_VERSION = 2;
+  const accounts   = new Map(); // addr -> { balance, ignited, counterparties:Set, nextSeq }
+  const appliedIds = new Set(); // idempotency: stable per-tx keys already applied
   let appliedCount = 0;
+
   const acct = (addr) => {
     let a = accounts.get(addr);
     if (!a) { a = { balance: 0, ignited: false, counterparties: new Set(), nextSeq: 0 }; accounts.set(addr, a); }
     return a;
   };
-  // Apply a finalized transfer (fastpay-authority style), deriving standing from
-  // history rather than storing it. Mirrors central's getBalance + distinct-
-  // counterparty rule EXACTLY so the two can be reconciled byte-for-byte.
+  // Stable durable identity for a committed tx: server timestamp + signature-
+  // derived sigPrefix + from/to/amount — two distinct payments never collide.
+  const txKey = (tx) => `${tx.from}:${tx.to}:${tx.amount}:${tx.timestamp}:${tx.sigPrefix}`;
+
+  // Apply one finalized transfer. IDEMPOTENT (already-applied → no-op) and
+  // INTEGER-ONLY (a non-integer amount is rejected; money stays whole end-to-end).
   const applyTx = (tx) => {
     const { from, to, amount } = tx;
+    if (!Number.isInteger(amount)) throw new Error(`committee rejects non-integer amount: ${amount}`);
+    const id = txKey(tx);
+    if (appliedIds.has(id)) return false;   // idempotent no-op (replay / catch-up safe)
+    appliedIds.add(id);
     const f = acct(from), t = acct(to);
     t.balance += amount;
     f.balance -= amount;
@@ -221,67 +234,109 @@ function createCommitteeLedger() {
     if (to   !== 'FAUCET' && to   !== from) f.counterparties.add(to);   // sender gains recipient
     if (from !== 'FAUCET' && from !== to)   t.counterparties.add(from); // recipient gains sender
     appliedCount += 1;
+    return true;
   };
+
+  // ── durable persistence to the committee's OWN store (NEVER ledger.json) ──
+  const persist = () => saveJSON(STATE_FILE, {
+    version: STATE_VERSION, appliedCount, appliedIds: [...appliedIds],
+    accounts: Object.fromEntries([...accounts].map(([addr, a]) =>
+      [addr, { balance: a.balance, ignited: a.ignited, counterparties: [...a.counterparties], nextSeq: a.nextSeq }])),
+  });
+  const load = () => {
+    const d = loadJSON(STATE_FILE, null);
+    if (!d || d.version !== STATE_VERSION) return;
+    appliedCount = d.appliedCount || 0;
+    for (const id of (d.appliedIds || [])) appliedIds.add(id);
+    for (const [addr, a] of Object.entries(d.accounts || {}))
+      accounts.set(addr, { balance: a.balance, ignited: !!a.ignited, counterparties: new Set(a.counterparties || []), nextSeq: a.nextSeq || 0 });
+  };
+  load();   // boot: restore persisted state before catch-up
+
   const balance    = (addr) => (accounts.get(addr)?.balance ?? 0);
   const isIgnited  = (addr) => (accounts.get(addr)?.ignited ?? false);
-  const standingOf = (addr) =>
-    (isIgnited(addr) ? IGNITED_BASELINE : 0) + (accounts.get(addr)?.counterparties.size ?? 0);
+  const standingOf = (addr) => (isIgnited(addr) ? IGNITED_BASELINE : 0) + (accounts.get(addr)?.counterparties.size ?? 0);
   const movableNow = (addr) => Math.min(balance(addr), standingOf(addr) * MOVE_PER_STANDING);
   const userCount  = () => { let n = 0; for (const a of accounts.values()) if (a.ignited) n++; return n; };
+
   return {
-    // Same interface as createCentralLedger(). In Phase 1 the shadow wrapper
-    // routes EVERY response to central; the two response-serving reads are guarded
-    // to fail loudly if anything ever tries to serve a user from the committee.
+    // Same interface as createCentralLedger(); the two response-serving reads are
+    // guarded to fail loudly if anything ever tries to serve a user from here.
     all:   () => { throw new Error('committee.all() must never serve a response in shadow mode'); },
     query: () => { throw new Error('committee.query() must never serve a response in shadow mode'); },
     size:  () => appliedCount,
+    appliedCount: () => appliedCount,
     balance, standingOf, movableNow, userCount, isIgnited,
-    commit: applyTx,
-    // Read-only snapshot for the reconciliation inspector (never money).
+    // live write path: apply + durably persist (idempotent, integer-only)
+    commit: (tx) => { const applied = applyTx(tx); if (applied) persist(); return applied; },
+    // boot catch-up / resync: replay central's ledger oldest→newest. Idempotent,
+    // so it applies every MISSING tx and double-applies NONE.
+    resync: (centralTxsNewestFirst) => {
+      let applied = 0;
+      for (let i = centralTxsNewestFirst.length - 1; i >= 0; i--) if (applyTx(centralTxsNewestFirst[i])) applied++;
+      persist();
+      return applied;
+    },
     debugSnapshot: () => {
       const out = {};
       for (const [addr, a] of accounts) {
         if (addr === 'FAUCET' || addr === 'SWARM_RESERVE') continue;
-        out[addr] = {
-          balance: a.balance, standing: standingOf(addr), movable: movableNow(addr),
-          ignited: a.ignited, counterparties: [...a.counterparties].sort(), nextSeq: a.nextSeq,
-        };
+        out[addr] = { balance: a.balance, standing: standingOf(addr), movable: movableNow(addr),
+                      ignited: a.ignited, counterparties: [...a.counterparties].sort(), nextSeq: a.nextSeq };
       }
       return out;
     },
   };
 }
 
-// ── Phase-1 RECONCILER ───────────────────────────────────────────────────────
-// After every shadowed commit, assert the committee agrees with central EXACTLY
-// on {balance, standing, size} for each account the tx touched. Observe-only: it
-// records drift and NEVER throws into the commit path (central has already
-// committed; the user response must stay unaffected). The test fails on any drift.
+// ── RECONCILER ───────────────────────────────────────────────────────────────
+// Two layers: a fast per-commit check on touched accounts, AND an ACTIVE full
+// reconciliation (report/fullReconcile) that recomputes committee-vs-central
+// across ALL accounts — valid even after a restart with no new commits. Both are
+// observe-only: they record drift and NEVER throw into the commit path (central
+// has already committed; the user response must stay unaffected). Test fails on drift.
 function createReconciler(central, committee) {
-  const drifts = [], errors = [];
+  const liveDrifts = [], errors = [];
   const SYSTEM = new Set(['FAUCET', 'SWARM_RESERVE']);
   const check = (tx) => {
     for (const addr of [tx.from, tx.to].filter((a) => a && !SYSTEM.has(a))) {
       const cb = central.balance(addr),    kb = committee.balance(addr);
+      if (cb !== kb) liveDrifts.push({ when: 'live', field: 'balance',  addr, central: cb, committee: kb });
+      const cs = central.standingOf(addr), ks = committee.standingOf(addr);
+      if (cs !== ks) liveDrifts.push({ when: 'live', field: 'standing', addr, central: cs, committee: ks });
+    }
+    const csz = central.size(), ksz = committee.size();
+    if (csz !== ksz) liveDrifts.push({ when: 'live', field: 'size', central: csz, committee: ksz });
+  };
+  const noteError = (e, tx) => errors.push({ error: String((e && e.message) || e), from: tx.from, to: tx.to, amount: tx.amount });
+  // ACTIVE reconciliation across every account in central's ledger ∪ committee.
+  const fullReconcile = () => {
+    const addrs = new Set();
+    for (const t of central.all()) for (const a of [t.from, t.to]) if (a && !SYSTEM.has(a)) addrs.add(a);
+    for (const a of Object.keys(committee.debugSnapshot())) addrs.add(a);
+    const drifts = [];
+    for (const addr of addrs) {
+      const cb = central.balance(addr), kb = committee.balance(addr);
       if (cb !== kb) drifts.push({ field: 'balance',  addr, central: cb, committee: kb });
       const cs = central.standingOf(addr), ks = committee.standingOf(addr);
       if (cs !== ks) drifts.push({ field: 'standing', addr, central: cs, committee: ks });
     }
-    const csz = central.size(), ksz = committee.size();
-    if (csz !== ksz) drifts.push({ field: 'size', central: csz, committee: ksz });
+    if (central.size() !== committee.size()) drifts.push({ field: 'size', central: central.size(), committee: committee.size() });
+    return drifts;
   };
-  const noteError = (e, tx) => errors.push({ error: String((e && e.message) || e), from: tx.from, to: tx.to, amount: tx.amount });
-  const report = () => ({
-    backend: 'committee-shadow',
-    reconciled: drifts.length === 0 && errors.length === 0,
-    driftCount: drifts.length,
-    errorCount: errors.length,
-    drifts: drifts.slice(0, 20),
-    errors: errors.slice(0, 5),
-    size: { central: central.size(), committee: committee.size() },
-    accounts: committee.debugSnapshot(),
-  });
-  return { check, noteError, report };
+  const report = () => {
+    const drifts = fullReconcile();
+    return {
+      backend: 'committee-shadow',
+      reconciled: drifts.length === 0 && liveDrifts.length === 0 && errors.length === 0,
+      driftCount: drifts.length, liveDriftCount: liveDrifts.length, errorCount: errors.length,
+      drifts: drifts.slice(0, 20), liveDrifts: liveDrifts.slice(0, 20), errors: errors.slice(0, 5),
+      size: { central: central.size(), committee: committee.size() },
+      appliedCount: committee.appliedCount(),
+      accounts: committee.debugSnapshot(),
+    };
+  };
+  return { check, noteError, report, fullReconcile };
 }
 
 // ── Phase-1 SHADOWED ledger ──────────────────────────────────────────────────
@@ -306,14 +361,23 @@ function createShadowedLedger(central, committee, reconciler) {
 
 const LEDGER_BACKEND = process.env.LEDGER_BACKEND || 'central';
 let shadowReconciler = null; // set in committee-shadow mode; exposed read-only via /debug/shadow
+let shadowResync = null;     // handle to re-run committee catch-up on demand (idempotent)
 const ledger = (() => {
   if (LEDGER_BACKEND === 'central') return createCentralLedger();
   if (LEDGER_BACKEND === 'committee-shadow') {
-    // Central authoritative; committee runs as a read-only shadow that reconciles.
+    // Central authoritative; committee runs as a DURABLE read-only shadow.
     const central = createCentralLedger();
-    const committee = createCommitteeLedger();
-    shadowReconciler = createReconciler(central, committee);
-    return createShadowedLedger(central, committee, shadowReconciler);
+    try {
+      const committee = createCommitteeLedger();   // loads its OWN persisted state
+      committee.resync(central.all());             // boot catch-up: replay any txs it is behind on
+      shadowReconciler = createReconciler(central, committee);
+      shadowResync = () => committee.resync(central.all());
+      return createShadowedLedger(central, committee, shadowReconciler);
+    } catch (e) {
+      // A committee/persistence fault must NEVER stop the authoritative server.
+      console.error('[committee-shadow] boot failed — central-only, live unaffected:', e.message);
+      return central;
+    }
   }
   throw new Error(`Unknown LEDGER_BACKEND "${LEDGER_BACKEND}" (expected "central" or "committee-shadow")`);
 })();
@@ -561,11 +625,17 @@ app.get('/stats', (req, res) => {
   });
 });
 
-// ── Phase-1 shadow reconciliation inspector (committee-shadow mode ONLY) ──────
-// Read-only window into whether the committee reconciles with central. Never
-// serves money; only registered when the shadow backend is active.
+// ── Shadow reconciliation inspector (committee-shadow mode ONLY) ──────────────
+// Read-only window into whether the durable committee reconciles with central.
+// Never serves money; only registered when the shadow backend is active.
 if (LEDGER_BACKEND === 'committee-shadow' && shadowReconciler) {
   app.get('/debug/shadow', (req, res) => res.json(shadowReconciler.report()));
+  // Re-run catch-up against central's ledger on demand. Idempotent: already-
+  // applied txs are skipped, so repeated calls never double-apply (replay test).
+  app.post('/debug/shadow/resync', (req, res) => {
+    const applied = shadowResync ? shadowResync() : 0;
+    res.json({ applied, ...shadowReconciler.report() });
+  });
 }
 
 const PORT = process.env.PORT || 3000;

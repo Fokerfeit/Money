@@ -58,10 +58,12 @@ devices.json
 ignition_codes_used.json
 google_accounts.json
 
-# phase-0/1 ledger-seam test artifacts (regenerated; not source)
+# phase-0/1/2 ledger-seam test artifacts (regenerated; not source)
 .phase0_tmp/
 .phase1_tmp/
+.phase2_tmp/
 phase0_golden.json
+committee_state.json
 
 # typescript
 *.tsbuildinfo
