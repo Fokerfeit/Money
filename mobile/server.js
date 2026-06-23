@@ -192,10 +192,131 @@ function createCentralLedger() {
   };
 }
 
+// ── Phase-1 COMMITTEE backend (READ-ONLY SHADOW) ─────────────────────────────
+// A second LedgerBackend modelled on prototypes/fastpay_net (per-account state).
+// In Phase 1 it runs as a read-only SHADOW: it ingests the SAME committed txs as
+// central and computes each account's balance & standing INDEPENDENTLY from
+// per-account state — it NEVER serves a user response. Standing uses the IDENTICAL
+// rule as central (ported standingOf): IGNITED_BASELINE once ignited, +1 per
+// DISTINCT counterparty (excluding FAUCET and self); movable = min(balance,
+// standing × MOVE_PER_STANDING). No static standing.
+function createCommitteeLedger() {
+  const accounts = new Map(); // addr -> { balance, ignited, counterparties:Set, nextSeq }
+  let appliedCount = 0;
+  const acct = (addr) => {
+    let a = accounts.get(addr);
+    if (!a) { a = { balance: 0, ignited: false, counterparties: new Set(), nextSeq: 0 }; accounts.set(addr, a); }
+    return a;
+  };
+  // Apply a finalized transfer (fastpay-authority style), deriving standing from
+  // history rather than storing it. Mirrors central's getBalance + distinct-
+  // counterparty rule EXACTLY so the two can be reconciled byte-for-byte.
+  const applyTx = (tx) => {
+    const { from, to, amount } = tx;
+    const f = acct(from), t = acct(to);
+    t.balance += amount;
+    f.balance -= amount;
+    f.nextSeq += 1;
+    if (from === 'FAUCET') t.ignited = true;
+    if (to   !== 'FAUCET' && to   !== from) f.counterparties.add(to);   // sender gains recipient
+    if (from !== 'FAUCET' && from !== to)   t.counterparties.add(from); // recipient gains sender
+    appliedCount += 1;
+  };
+  const balance    = (addr) => (accounts.get(addr)?.balance ?? 0);
+  const isIgnited  = (addr) => (accounts.get(addr)?.ignited ?? false);
+  const standingOf = (addr) =>
+    (isIgnited(addr) ? IGNITED_BASELINE : 0) + (accounts.get(addr)?.counterparties.size ?? 0);
+  const movableNow = (addr) => Math.min(balance(addr), standingOf(addr) * MOVE_PER_STANDING);
+  const userCount  = () => { let n = 0; for (const a of accounts.values()) if (a.ignited) n++; return n; };
+  return {
+    // Same interface as createCentralLedger(). In Phase 1 the shadow wrapper
+    // routes EVERY response to central; the two response-serving reads are guarded
+    // to fail loudly if anything ever tries to serve a user from the committee.
+    all:   () => { throw new Error('committee.all() must never serve a response in shadow mode'); },
+    query: () => { throw new Error('committee.query() must never serve a response in shadow mode'); },
+    size:  () => appliedCount,
+    balance, standingOf, movableNow, userCount, isIgnited,
+    commit: applyTx,
+    // Read-only snapshot for the reconciliation inspector (never money).
+    debugSnapshot: () => {
+      const out = {};
+      for (const [addr, a] of accounts) {
+        if (addr === 'FAUCET' || addr === 'SWARM_RESERVE') continue;
+        out[addr] = {
+          balance: a.balance, standing: standingOf(addr), movable: movableNow(addr),
+          ignited: a.ignited, counterparties: [...a.counterparties].sort(), nextSeq: a.nextSeq,
+        };
+      }
+      return out;
+    },
+  };
+}
+
+// ── Phase-1 RECONCILER ───────────────────────────────────────────────────────
+// After every shadowed commit, assert the committee agrees with central EXACTLY
+// on {balance, standing, size} for each account the tx touched. Observe-only: it
+// records drift and NEVER throws into the commit path (central has already
+// committed; the user response must stay unaffected). The test fails on any drift.
+function createReconciler(central, committee) {
+  const drifts = [], errors = [];
+  const SYSTEM = new Set(['FAUCET', 'SWARM_RESERVE']);
+  const check = (tx) => {
+    for (const addr of [tx.from, tx.to].filter((a) => a && !SYSTEM.has(a))) {
+      const cb = central.balance(addr),    kb = committee.balance(addr);
+      if (cb !== kb) drifts.push({ field: 'balance',  addr, central: cb, committee: kb });
+      const cs = central.standingOf(addr), ks = committee.standingOf(addr);
+      if (cs !== ks) drifts.push({ field: 'standing', addr, central: cs, committee: ks });
+    }
+    const csz = central.size(), ksz = committee.size();
+    if (csz !== ksz) drifts.push({ field: 'size', central: csz, committee: ksz });
+  };
+  const noteError = (e, tx) => errors.push({ error: String((e && e.message) || e), from: tx.from, to: tx.to, amount: tx.amount });
+  const report = () => ({
+    backend: 'committee-shadow',
+    reconciled: drifts.length === 0 && errors.length === 0,
+    driftCount: drifts.length,
+    errorCount: errors.length,
+    drifts: drifts.slice(0, 20),
+    errors: errors.slice(0, 5),
+    size: { central: central.size(), committee: committee.size() },
+    accounts: committee.debugSnapshot(),
+  });
+  return { check, noteError, report };
+}
+
+// ── Phase-1 SHADOWED ledger ──────────────────────────────────────────────────
+// Central stays authoritative for EVERY response (all reads delegate to it,
+// byte-identical). The only added behaviour is on commit: after central commits
+// exactly as today, the committee ingests the same tx and the reconciler checks
+// it — both wrapped so a committee fault can NEVER affect the user response.
+function createShadowedLedger(central, committee, reconciler) {
+  return {
+    ...central, // every read/response comes from central — unchanged
+    commit: (tx) => {
+      central.commit(tx); // authoritative — exactly as today
+      try {
+        committee.commit(tx);   // shadow ingests the same tx
+        reconciler.check(tx);   // observe-only equivalence check
+      } catch (e) {
+        reconciler.noteError(e, tx); // swallow — the shadow must never affect the response
+      }
+    },
+  };
+}
+
 const LEDGER_BACKEND = process.env.LEDGER_BACKEND || 'central';
-const ledger = LEDGER_BACKEND === 'central'
-  ? createCentralLedger()
-  : (() => { throw new Error(`Unknown LEDGER_BACKEND "${LEDGER_BACKEND}" (only "central" exists in Phase 0)`); })();
+let shadowReconciler = null; // set in committee-shadow mode; exposed read-only via /debug/shadow
+const ledger = (() => {
+  if (LEDGER_BACKEND === 'central') return createCentralLedger();
+  if (LEDGER_BACKEND === 'committee-shadow') {
+    // Central authoritative; committee runs as a read-only shadow that reconciles.
+    const central = createCentralLedger();
+    const committee = createCommitteeLedger();
+    shadowReconciler = createReconciler(central, committee);
+    return createShadowedLedger(central, committee, shadowReconciler);
+  }
+  throw new Error(`Unknown LEDGER_BACKEND "${LEDGER_BACKEND}" (expected "central" or "committee-shadow")`);
+})();
 console.log(`Ledger backend: ${LEDGER_BACKEND}`);
 
 // ── Canonical-S (anti-malleability) ─────────────────────────────────────────
@@ -439,6 +560,13 @@ app.get('/stats', (req, res) => {
     replayFenceSize:  Object.keys(seenSigs).length,
   });
 });
+
+// ── Phase-1 shadow reconciliation inspector (committee-shadow mode ONLY) ──────
+// Read-only window into whether the committee reconciles with central. Never
+// serves money; only registered when the shadow backend is active.
+if (LEDGER_BACKEND === 'committee-shadow' && shadowReconciler) {
+  app.get('/debug/shadow', (req, res) => res.json(shadowReconciler.report()));
+}
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
