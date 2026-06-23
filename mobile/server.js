@@ -69,7 +69,7 @@ let seenSigs = loadJSON(REPLAY_FENCE_FILE, {});
 // Sybil resistance is layered on top via invite codes → vouching → validator
 // eligibility → faucet decay.
 const IGNITION_CODES = new Set(
-  (process.env.IGNITION_CODES || '').split(',').map(s => s.trim()).filter(Boolean)
+  (process.env.IGNITION_CODES || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean)
 );
 let usedCodes = loadJSON(USED_CODES_FILE, {});   // code → address (consumed)
 
@@ -81,7 +81,7 @@ let usedCodes = loadJSON(USED_CODES_FILE, {});   // code → address (consumed)
 // balance accrued from payments received).
 const PLATFORM_ADDRESSES = new Set(
   (process.env.MONEY_PLATFORM_ADDRESSES || '')
-    .split(',').map(s => s.trim()).filter(Boolean)
+    .split(',').map(s => s.trim().toUpperCase()).filter(Boolean)
 );
 
 // ── Prune expired replay-fence entries on startup ───────────────────────────
@@ -121,6 +121,31 @@ const calcReward = (count) => {
 
 const getBalance = (addr) =>
   txs.reduce((b, t) => t.to === addr ? b + t.amount : t.from === addr ? b - t.amount : b, 0);
+// -- Standing & movement cap ---------------------------------------------
+// Standing = trust EARNED, not money. Your whole million is always yours;
+// standing decides how much you can MOVE at once. Computed live from the ledger:
+//   � ignited (passed the invite-code gate) ? a baseline you can move
+//   � + 1 for each DISTINCT address you've dealt with (diversity, not volume �
+//     two accounts ping-ponging can never pump it)
+const MOVE_PER_STANDING = 10000;  // each standing point unlocks 10k of movement
+const IGNITED_BASELINE  = 5;      // a freshly-ignited human can move 50k to start
+
+const isIgnited = (addr) => txs.some(t => t.from === 'FAUCET' && t.to === addr);
+
+const distinctCounterparties = (addr) => {
+  const seen = new Set();
+  for (const t of txs) {
+    if (t.from === addr && t.to !== 'FAUCET' && t.to !== addr) seen.add(t.to);
+    if (t.to === addr && t.from !== 'FAUCET' && t.from !== addr) seen.add(t.from);
+  }
+  return seen.size;
+};
+
+const standingOf = (addr) =>
+  (isIgnited(addr) ? IGNITED_BASELINE : 0) + distinctCounterparties(addr);
+
+const movableNow = (addr) =>
+  Math.min(getBalance(addr), standingOf(addr) * MOVE_PER_STANDING);
 
 // ── Canonical-S (anti-malleability) ─────────────────────────────────────────
 // ed25519 signatures are malleable: both S and S+L verify. tweetnacl does NOT
@@ -223,7 +248,8 @@ app.get('/balance/:addr', (req, res) => {
 });
 
 app.post('/transaction', (req, res) => {
-  const { from, to, amount, reason, signature, publicKey, timestamp, ignitionCode } = req.body;
+  let { from, to, amount, reason, signature, publicKey, timestamp, ignitionCode } = req.body;
+ignitionCode = (ignitionCode || '').trim().toUpperCase();
 
   // ── Basic field validation ─────────────────────────────────────────────
   if (!from || !to || amount == null)
@@ -330,8 +356,19 @@ app.post('/transaction', (req, res) => {
     const bal = getBalance(from);
     if (bal < amt)
       return res.status(400).json({ error: `Insufficient balance (have ${bal.toFixed(2)}, need ${amt})` });
-  }
 
+    // -- Movement cap (standing-governed) ----------------------------------
+    // You hold your whole million, but you can only MOVE what your standing
+    // allows. A fake's million is frozen; a real user unlocks theirs by
+    // building distinct, honest relationships. This is what lets the grant
+    // stay a flat million safely.
+    const movable = movableNow(from);
+    if (amt > movable)
+      return res.status(403).json({
+        error: `Standing limit: you can move up to ${movable} right now. Transact honestly to unlock more.`,
+        movable, standing: standingOf(from),
+      });
+  }
   // ── Commit ─────────────────────────────────────────────────────────────
   const tx = {
     from, to, amount: amt,
