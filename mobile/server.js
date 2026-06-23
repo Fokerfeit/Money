@@ -124,8 +124,8 @@ const getBalance = (addr) =>
 // -- Standing & movement cap ---------------------------------------------
 // Standing = trust EARNED, not money. Your whole million is always yours;
 // standing decides how much you can MOVE at once. Computed live from the ledger:
-//   � ignited (passed the invite-code gate) ? a baseline you can move
-//   � + 1 for each DISTINCT address you've dealt with (diversity, not volume �
+//   • ignited (passed the invite-code gate) → a baseline you can move
+//   • + 1 for each DISTINCT address you've dealt with (diversity, not volume —
 //     two accounts ping-ponging can never pump it)
 const MOVE_PER_STANDING = 10000;  // each standing point unlocks 10k of movement
 const IGNITED_BASELINE  = 5;      // a freshly-ignited human can move 50k to start
@@ -146,6 +146,57 @@ const standingOf = (addr) =>
 
 const movableNow = (addr) =>
   Math.min(getBalance(addr), standingOf(addr) * MOVE_PER_STANDING);
+
+// ── Phase-0 LEDGER SEAM ──────────────────────────────────────────────────────
+// All ledger access — reads, derivations, and the single commit path — is routed
+// through ONE LedgerBackend object. Today there is exactly one implementation:
+// `central` (the in-process append-only ledger above), selected by
+// LEDGER_BACKEND=central (the default). This is PURE PLUMBING — every method
+// delegates to the existing functions verbatim; no logic changes. The seam is the
+// hook a future committee backend plugs into without the routes ever changing.
+function createCentralLedger() {
+  return {
+    all:        () => txs,
+    size:       () => txs.length,
+    balance:    getBalance,
+    standingOf,
+    movableNow,
+    userCount,
+    isIgnited,
+    // GET /tx scan — moved here verbatim from the route (index-served, capped).
+    query: ({ from, to, since, reason, limit }) => {
+      const sinceTs = since ? Number(since) : 0;
+      const cap = Math.min(Math.max(parseInt(limit || '200', 10) || 200, 1), 1000);
+      // Pick the most selective index to scan from (from is the common case).
+      let base;
+      if (from) base = idxFrom.get(from) || [];
+      else if (to) base = idxTo.get(to) || [];
+      else base = txs; // no from/to → full scan (discouraged; still capped)
+      const out = [];
+      for (const t of base) {
+        if (from && t.from !== from) continue;
+        if (to && t.to !== to) continue;
+        if (sinceTs && !(t.timestamp >= sinceTs)) continue;
+        if (reason && !String(t.reason || '').includes(reason)) continue;
+        out.push(t);
+        if (out.length >= cap) break;
+      }
+      return out;
+    },
+    // The SINGLE write path: append + index + persist the ledger file.
+    commit: (tx) => {
+      txs.unshift(tx);
+      indexTx(tx, true);
+      saveJSON(LEDGER_FILE, txs);
+    },
+  };
+}
+
+const LEDGER_BACKEND = process.env.LEDGER_BACKEND || 'central';
+const ledger = LEDGER_BACKEND === 'central'
+  ? createCentralLedger()
+  : (() => { throw new Error(`Unknown LEDGER_BACKEND "${LEDGER_BACKEND}" (only "central" exists in Phase 0)`); })();
+console.log(`Ledger backend: ${LEDGER_BACKEND}`);
 
 // ── Canonical-S (anti-malleability) ─────────────────────────────────────────
 // ed25519 signatures are malleable: both S and S+L verify. tweetnacl does NOT
@@ -212,9 +263,9 @@ app.use(['/ledger', '/tx', '/balance', '/usercount'], rateLimit({
 }));
 
 // ── Routes ────────────────────────────────────────────────────────────────
-app.get('/health',    (req, res) => res.json({ status: 'ok', transactions: txs.length, seals: userCount() }));
-app.get('/usercount', (req, res) => res.json({ count: userCount() }));
-app.get('/ledger',    (req, res) => res.json(txs));
+app.get('/health',    (req, res) => res.json({ status: 'ok', transactions: ledger.size(), seals: ledger.userCount() }));
+app.get('/usercount', (req, res) => res.json({ count: ledger.userCount() }));
+app.get('/ledger',    (req, res) => res.json(ledger.all()));
 
 // ── Targeted lookup ──────────────────────────────────────────────────────────
 // GET /tx?from=&to=&since=&reason=&limit=  → only the matching txs, newest-first.
@@ -222,28 +273,11 @@ app.get('/ledger',    (req, res) => res.json(txs));
 // GET /ledger: served from the in-memory indexes so the cost is bounded by
 // recent/relevant activity, NOT by the total size of the ledger.
 app.get('/tx', (req, res) => {
-  const { from, to, since, reason } = req.query;
-  const sinceTs = since ? Number(since) : 0;
-  const cap = Math.min(Math.max(parseInt(req.query.limit || '200', 10) || 200, 1), 1000);
-  // Pick the most selective index to scan from (from is the common case).
-  let base;
-  if (from) base = idxFrom.get(from) || [];
-  else if (to) base = idxTo.get(to) || [];
-  else base = txs; // no from/to → full scan (discouraged; still capped)
-  const out = [];
-  for (const t of base) {
-    if (from && t.from !== from) continue;
-    if (to && t.to !== to) continue;
-    if (sinceTs && !(t.timestamp >= sinceTs)) continue;
-    if (reason && !String(t.reason || '').includes(reason)) continue;
-    out.push(t);
-    if (out.length >= cap) break;
-  }
-  res.json(out);
+  res.json(ledger.query(req.query));
 });
 
 app.get('/balance/:addr', (req, res) => {
-  const bal = getBalance(req.params.addr);
+  const bal = ledger.balance(req.params.addr);
   res.json({ address: req.params.addr, balance: Math.max(0, parseFloat(bal.toFixed(2))) });
 });
 
@@ -327,12 +361,12 @@ ignitionCode = (ignitionCode || '').trim().toUpperCase();
     }
 
     // Gate 1: One faucet claim per wallet address
-    if (txs.some(t => t.from === 'FAUCET' && t.to === to))
+    if (ledger.isIgnited(to))
       return res.status(400).json({ error: 'This address has already been ignited' });
 
     // Gate 2: Reward cap — the server computes the authoritative reward and rejects
     // any claim above it (a modified client cannot sign itself a bigger faucet).
-    const maxReward = calcReward(userCount());
+    const maxReward = calcReward(ledger.userCount());
     if (amt > maxReward)
       return res.status(400).json({ error: `Faucet reward exceeds the current allowance (max ${maxReward})` });
 
@@ -345,7 +379,7 @@ ignitionCode = (ignitionCode || '').trim().toUpperCase();
   const systemAddresses = ['FAUCET', 'SWARM_RESERVE'];
   const isAllowedRecipient = systemAddresses.includes(to) || PLATFORM_ADDRESSES.has(to);
   if (!isAllowedRecipient && from !== 'FAUCET') {
-    if (!txs.some(t => t.from === 'FAUCET' && t.to === to))
+    if (!ledger.isIgnited(to))
       return res.status(400).json({ error: 'Recipient is not a registered Swarm node' });
   }
 
@@ -353,7 +387,7 @@ ignitionCode = (ignitionCode || '').trim().toUpperCase();
   // Applies to every non-faucet sender, including disconnect_penalty — a user
   // can never send (or be penalised) more than they hold. No negative balances.
   if (from !== 'FAUCET') {
-    const bal = getBalance(from);
+    const bal = ledger.balance(from);
     if (bal < amt)
       return res.status(400).json({ error: `Insufficient balance (have ${bal.toFixed(2)}, need ${amt})` });
 
@@ -362,11 +396,11 @@ ignitionCode = (ignitionCode || '').trim().toUpperCase();
     // allows. A fake's million is frozen; a real user unlocks theirs by
     // building distinct, honest relationships. This is what lets the grant
     // stay a flat million safely.
-    const movable = movableNow(from);
+    const movable = ledger.movableNow(from);
     if (amt > movable)
       return res.status(403).json({
         error: `Standing limit: you can move up to ${movable} right now. Transact honestly to unlock more.`,
-        movable, standing: standingOf(from),
+        movable, standing: ledger.standingOf(from),
       });
   }
   // ── Commit ─────────────────────────────────────────────────────────────
@@ -380,9 +414,7 @@ ignitionCode = (ignitionCode || '').trim().toUpperCase();
     sigPrefix: signature ? signature.substring(0, 16) : null,
   };
 
-  txs.unshift(tx);
-  indexTx(tx, true);            // keep the targeted-lookup indexes in sync
-  saveJSON(LEDGER_FILE,        txs);
+  ledger.commit(tx);            // append + index + persist via the single ledger write path
   saveJSON(REPLAY_FENCE_FILE,  seenSigs); // atomically commits the replay fence
 
   // On a successful ignition, consume the one-time invite code.
@@ -400,8 +432,8 @@ ignitionCode = (ignitionCode || '').trim().toUpperCase();
 // Returns counts only — never addresses or codes themselves.
 app.get('/stats', (req, res) => {
   res.json({
-    transactions:     txs.length,
-    registeredUsers:  userCount(),
+    transactions:     ledger.size(),
+    registeredUsers:  ledger.userCount(),
     faucetGate:       IGNITION_CODES.size > 0 ? 'ignition-code' : 'CLOSED',
     usedCodes:        Object.keys(usedCodes).length,
     replayFenceSize:  Object.keys(seenSigs).length,
@@ -414,7 +446,7 @@ app.listen(PORT, '0.0.0.0', () => {
   const gate = IGNITION_CODES.size > 0 ? `invite codes (${IGNITION_CODES.size})`
              : 'NONE — faucet CLOSED (set IGNITION_CODES to open)';
   console.log(`Faucet gate: ${gate}`);
-  console.log(`Registered users: ${userCount()} | Codes used: ${Object.keys(usedCodes).length}`);
+  console.log(`Registered users: ${ledger.userCount()} | Codes used: ${Object.keys(usedCodes).length}`);
   if (PLATFORM_ADDRESSES.size > 0)
     console.log(`Platform recipients: ${[...PLATFORM_ADDRESSES].join(', ')}`);
 });
