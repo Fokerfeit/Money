@@ -204,9 +204,10 @@ function createCentralLedger() {
 // (a tx already applied is a no-op), and enforces INTEGER money end-to-end.
 function createCommitteeLedger() {
   const STATE_FILE    = process.env.MONEY_COMMITTEE_FILE || path.join(DATA_DIR, 'committee_state.json');
-  const STATE_VERSION = 2;
+  const STATE_VERSION = 3;
   const accounts   = new Map(); // addr -> { balance, ignited, counterparties:Set, nextSeq }
   const appliedIds = new Set(); // idempotency: stable per-tx keys already applied
+  let   applied    = [];        // the committee's OWN ledger view (newest-first, like central) — serves /ledger
   let appliedCount = 0;
 
   const acct = (addr) => {
@@ -226,6 +227,7 @@ function createCommitteeLedger() {
     const id = txKey(tx);
     if (appliedIds.has(id)) return false;   // idempotent no-op (replay / catch-up safe)
     appliedIds.add(id);
+    applied.unshift(tx);                     // maintain the committee's ledger view (newest-first, like central)
     const f = acct(from), t = acct(to);
     t.balance += amount;
     f.balance -= amount;
@@ -238,16 +240,25 @@ function createCommitteeLedger() {
   };
 
   // ── durable persistence to the committee's OWN store (NEVER ledger.json) ──
-  const persist = () => saveJSON(STATE_FILE, {
-    version: STATE_VERSION, appliedCount, appliedIds: [...appliedIds],
-    accounts: Object.fromEntries([...accounts].map(([addr, a]) =>
-      [addr, { balance: a.balance, ignited: a.ignited, counterparties: [...a.counterparties], nextSeq: a.nextSeq }])),
-  });
+  // Phase 3: persist THROWS on write failure so the error is SURFACED (caught by
+  // the shadow → reconciler.noteError → /debug/shadow), never silently swallowed.
+  const persist = () => {
+    try {
+      fs.writeFileSync(STATE_FILE, JSON.stringify({
+        version: STATE_VERSION, appliedCount, applied,
+        accounts: Object.fromEntries([...accounts].map(([addr, a]) =>
+          [addr, { balance: a.balance, ignited: a.ignited, counterparties: [...a.counterparties], nextSeq: a.nextSeq }])),
+      }));
+    } catch (e) {
+      throw new Error(`committee persist failed (${path.basename(STATE_FILE)}): ${e.message}`);
+    }
+  };
   const load = () => {
     const d = loadJSON(STATE_FILE, null);
     if (!d || d.version !== STATE_VERSION) return;
     appliedCount = d.appliedCount || 0;
-    for (const id of (d.appliedIds || [])) appliedIds.add(id);
+    applied = Array.isArray(d.applied) ? d.applied : [];
+    for (const tx of applied) appliedIds.add(txKey(tx));   // rebuild idempotency index from the ledger view
     for (const [addr, a] of Object.entries(d.accounts || {}))
       accounts.set(addr, { balance: a.balance, ignited: !!a.ignited, counterparties: new Set(a.counterparties || []), nextSeq: a.nextSeq || 0 });
   };
@@ -260,23 +271,29 @@ function createCommitteeLedger() {
   const userCount  = () => { let n = 0; for (const a of accounts.values()) if (a.ignited) n++; return n; };
 
   return {
-    // Same interface as createCentralLedger(); the two response-serving reads are
-    // guarded to fail loudly if anything ever tries to serve a user from here.
-    all:   () => { throw new Error('committee.all() must never serve a response in shadow mode'); },
-    query: () => { throw new Error('committee.query() must never serve a response in shadow mode'); },
+    // Phase 3: the committee SERVES reads (via the read-source layer). all()
+    // returns the committee's own ledger view; query() stays guarded (/tx is still
+    // served by central). Reads are committee-sourced with central verify+fallback.
+    all:   () => applied,
+    query: () => { throw new Error('committee.query() is not a committee-served read in Phase 3 (/tx stays central)'); },
     size:  () => appliedCount,
     appliedCount: () => appliedCount,
     balance, standingOf, movableNow, userCount, isIgnited,
     // live write path: apply + durably persist (idempotent, integer-only)
-    commit: (tx) => { const applied = applyTx(tx); if (applied) persist(); return applied; },
+    commit: (tx) => { const ok = applyTx(tx); if (ok) persist(); return ok; },
     // boot catch-up / resync: replay central's ledger oldest→newest. Idempotent,
-    // so it applies every MISSING tx and double-applies NONE.
+    // so it applies every MISSING tx and double-applies NONE. Persists only if it
+    // actually applied something (so a no-op resync can't fail an unwritable boot).
     resync: (centralTxsNewestFirst) => {
-      let applied = 0;
-      for (let i = centralTxsNewestFirst.length - 1; i >= 0; i--) if (applyTx(centralTxsNewestFirst[i])) applied++;
-      persist();
-      return applied;
+      let n = 0;
+      for (let i = centralTxsNewestFirst.length - 1; i >= 0; i--) if (applyTx(centralTxsNewestFirst[i])) n++;
+      if (n > 0) persist();
+      return n;
     },
+    // test-only hook: perturb committee balance IN-MEMORY (never persisted) to force
+    // a committee≠central divergence — used by /debug/shadow/perturb to prove the
+    // read layer serves central, not the wrong value.
+    __perturbBalance: (addr, delta) => { acct(addr).balance += delta; },
     debugSnapshot: () => {
       const out = {};
       for (const [addr, a] of accounts) {
@@ -297,6 +314,7 @@ function createCommitteeLedger() {
 // has already committed; the user response must stay unaffected). Test fails on drift.
 function createReconciler(central, committee) {
   const liveDrifts = [], errors = [];
+  const reads = { committee: 0, central: 0 };   // read-source tally — proves the source flip + fallback/divergence routing
   const SYSTEM = new Set(['FAUCET', 'SWARM_RESERVE']);
   const check = (tx) => {
     for (const addr of [tx.from, tx.to].filter((a) => a && !SYSTEM.has(a))) {
@@ -308,7 +326,11 @@ function createReconciler(central, committee) {
     const csz = central.size(), ksz = committee.size();
     if (csz !== ksz) liveDrifts.push({ when: 'live', field: 'size', central: csz, committee: ksz });
   };
-  const noteError = (e, tx) => errors.push({ error: String((e && e.message) || e), from: tx.from, to: tx.to, amount: tx.amount });
+  const noteRead  = (source) => { if (source === 'committee') reads.committee++; else reads.central++; };
+  const noteError = (e, ctx) => errors.push({
+    error: String((e && e.message) || e),
+    ...(ctx && ctx.read ? { read: ctx.read, kind: ctx.kind } : { from: ctx && ctx.from, to: ctx && ctx.to, amount: ctx && ctx.amount }),
+  });
   // ACTIVE reconciliation across every account in central's ledger ∪ committee.
   const fullReconcile = () => {
     const addrs = new Set();
@@ -330,13 +352,14 @@ function createReconciler(central, committee) {
       backend: 'committee-shadow',
       reconciled: drifts.length === 0 && liveDrifts.length === 0 && errors.length === 0,
       driftCount: drifts.length, liveDriftCount: liveDrifts.length, errorCount: errors.length,
+      reads,
       drifts: drifts.slice(0, 20), liveDrifts: liveDrifts.slice(0, 20), errors: errors.slice(0, 5),
       size: { central: central.size(), committee: committee.size() },
       appliedCount: committee.appliedCount(),
       accounts: committee.debugSnapshot(),
     };
   };
-  return { check, noteError, report, fullReconcile };
+  return { check, noteError, noteRead, report, fullReconcile };
 }
 
 // ── Phase-1 SHADOWED ledger ──────────────────────────────────────────────────
@@ -359,9 +382,55 @@ function createShadowedLedger(central, committee, reconciler) {
   };
 }
 
+// ── Phase-3 COMMITTEE READ SOURCE ─────────────────────────────────────────────
+// User-facing reads are SOURCED from the committee, with central as VERIFY +
+// FALLBACK backstop. For each read: compute central's authoritative value, then
+// the committee's; if the committee read throws (fault/unavailable) or DIVERGES
+// from central, log it via reconciler.noteError and serve CENTRAL — never the
+// wrong value, never a user-facing 500. Otherwise serve the committee value
+// (committee-sourced). The WRITE path does NOT use this layer — it keeps reading
+// from central via `ledger` exactly as Phase 2 (writes stay central-authoritative).
+function createCommitteeReadSource(central, committee, reconciler) {
+  let fault = false;            // test hook: force committee reads to throw (fallback proof)
+  let lastSource = 'central';
+  const eq = (a, b) => (a !== null && typeof a === 'object' ? JSON.stringify(a) === JSON.stringify(b) : a === b);
+  const read = (name, kfn, cfn) => {
+    const cval = cfn();                       // central = authoritative verify / fallback value
+    let kval;
+    try {
+      if (fault) throw new Error('committee read fault (injected)');
+      kval = kfn();
+    } catch (e) {
+      reconciler.noteError(e, { read: name, kind: 'fallback' });
+      reconciler.noteRead('central'); lastSource = 'central';
+      return cval;                            // FALLBACK → central; caller never sees a throw
+    }
+    if (!eq(kval, cval)) {
+      reconciler.noteError(new Error(`read divergence on ${name}`), { read: name, kind: 'divergence' });
+      reconciler.noteRead('central'); lastSource = 'central';
+      return cval;                            // DIVERGENCE SAFETY → serve central (authoritative)
+    }
+    reconciler.noteRead('committee'); lastSource = 'committee';
+    return kval;                              // committee-sourced (verified == central)
+  };
+  return {
+    all:        ()  => read('all',        () => committee.all(),        () => central.all()),
+    size:       ()  => read('size',       () => committee.size(),       () => central.size()),
+    balance:    (a) => read('balance',    () => committee.balance(a),    () => central.balance(a)),
+    standingOf: (a) => read('standingOf', () => committee.standingOf(a), () => central.standingOf(a)),
+    movableNow: (a) => read('movableNow', () => committee.movableNow(a), () => central.movableNow(a)),
+    userCount:  ()  => read('userCount',  () => committee.userCount(),   () => central.userCount()),
+    isIgnited:  (a) => read('isIgnited',  () => committee.isIgnited(a),  () => central.isIgnited(a)),
+    lastReadSource: () => lastSource,
+    __setFault: (v) => { fault = !!v; },
+    __perturb:  (addr, delta) => committee.__perturbBalance(addr, delta),
+  };
+}
+
 const LEDGER_BACKEND = process.env.LEDGER_BACKEND || 'central';
 let shadowReconciler = null; // set in committee-shadow mode; exposed read-only via /debug/shadow
 let shadowResync = null;     // handle to re-run committee catch-up on demand (idempotent)
+let shadowReads  = null;     // Phase-3 committee-sourced read layer (central verify + fallback); null in central mode
 const ledger = (() => {
   if (LEDGER_BACKEND === 'central') return createCentralLedger();
   if (LEDGER_BACKEND === 'committee-shadow') {
@@ -372,6 +441,7 @@ const ledger = (() => {
       committee.resync(central.all());             // boot catch-up: replay any txs it is behind on
       shadowReconciler = createReconciler(central, committee);
       shadowResync = () => committee.resync(central.all());
+      shadowReads  = createCommitteeReadSource(central, committee, shadowReconciler); // flip user reads → committee
       return createShadowedLedger(central, committee, shadowReconciler);
     } catch (e) {
       // A committee/persistence fault must NEVER stop the authoritative server.
@@ -449,8 +519,8 @@ app.use(['/ledger', '/tx', '/balance', '/usercount'], rateLimit({
 
 // ── Routes ────────────────────────────────────────────────────────────────
 app.get('/health',    (req, res) => res.json({ status: 'ok', transactions: ledger.size(), seals: ledger.userCount() }));
-app.get('/usercount', (req, res) => res.json({ count: ledger.userCount() }));
-app.get('/ledger',    (req, res) => res.json(ledger.all()));
+app.get('/usercount', (req, res) => res.json({ count: (shadowReads || ledger).userCount() }));
+app.get('/ledger',    (req, res) => res.json((shadowReads || ledger).all()));
 
 // ── Targeted lookup ──────────────────────────────────────────────────────────
 // GET /tx?from=&to=&since=&reason=&limit=  → only the matching txs, newest-first.
@@ -462,7 +532,7 @@ app.get('/tx', (req, res) => {
 });
 
 app.get('/balance/:addr', (req, res) => {
-  const bal = ledger.balance(req.params.addr);
+  const bal = (shadowReads || ledger).balance(req.params.addr);
   res.json({ address: req.params.addr, balance: Math.max(0, parseFloat(bal.toFixed(2))) });
 });
 
@@ -635,6 +705,40 @@ if (LEDGER_BACKEND === 'committee-shadow' && shadowReconciler) {
   app.post('/debug/shadow/resync', (req, res) => {
     const applied = shadowResync ? shadowResync() : 0;
     res.json({ applied, ...shadowReconciler.report() });
+  });
+  // ── Phase-3 read-source probes (committee-shadow ONLY; never serve money) ──
+  // Direct source probe: the value the read layer WOULD serve + its source
+  // ('committee' normally; 'central' on divergence/fallback). Proves the flip.
+  app.get('/debug/read', (req, res) => {
+    if (!shadowReads) return res.status(404).json({ error: 'no shadow' });
+    const { what, addr } = req.query;
+    let value;
+    switch (what) {
+      case 'balance':   value = shadowReads.balance(addr); break;
+      case 'standing':  value = shadowReads.standingOf(addr); break;
+      case 'movable':   value = shadowReads.movableNow(addr); break;
+      case 'usercount': value = shadowReads.userCount(); break;
+      case 'size':      value = shadowReads.size(); break;
+      case 'ignited':   value = shadowReads.isIgnited(addr); break;
+      case 'ledgerlen': value = shadowReads.all().length; break;
+      default: return res.status(400).json({ error: 'unknown what' });
+    }
+    res.json({ what, addr: addr || null, value, source: shadowReads.lastReadSource() });
+  });
+  // Inject a committee≠central divergence (in-memory, not persisted) to prove the
+  // read layer serves CENTRAL and logs it. Reversible: send the negative delta.
+  app.post('/debug/shadow/perturb', (req, res) => {
+    const { addr, balanceDelta } = req.body || {};
+    if (!shadowReads || !addr || !Number.isInteger(balanceDelta)) return res.status(400).json({ error: 'addr + integer balanceDelta required' });
+    shadowReads.__perturb(addr, balanceDelta);
+    res.json({ ok: true });
+  });
+  // Toggle a committee-read fault to prove fallback to central (no user-facing 500).
+  app.post('/debug/shadow/fault', (req, res) => {
+    if (!shadowReads) return res.status(404).json({ error: 'no shadow' });
+    const on = !!(req.body && req.body.on);
+    shadowReads.__setFault(on);
+    res.json({ ok: true, fault: on });
   });
 }
 

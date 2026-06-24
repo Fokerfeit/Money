@@ -62,6 +62,7 @@ google_accounts.json
 .phase0_tmp/
 .phase1_tmp/
 .phase2_tmp/
+.phase3_tmp/
 phase0_golden.json
 committee_state.json
 
