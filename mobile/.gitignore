@@ -67,6 +67,7 @@ self_nullifiers.json
 .brick1_tmp/
 .self_gate_tmp/
 .brick2_tmp/
+.brick2cap_tmp/
 phase0_golden.json
 committee_state.json
 self_nullifiers.json
