@@ -72,6 +72,8 @@ function runNode(file) { return new Promise((res) => { const c = spawn(process.e
     (!v.valid && v.firstBadIndex === 0 && /merkleRoot/.test(v.reason)) ? ok('altered tx → root mismatch → verify invalid') : bad(`altered tx not caught: ${JSON.stringify(v)}`);
     const three = sampleTxs(3), dupLast = [...three, three[2]];
     (merkleRoot(three) !== merkleRoot(dupLast)) ? ok('CVE-2012-2459: duplicated-final-leaf yields a DIFFERENT root (not malleable)') : bad('CVE-2012-2459: duplicate-last-leaf collides!');
+    const ord = sampleTxs(5), swp = sampleTxs(5); [swp[0], swp[1]] = [swp[1], swp[0]];   // swap two leaves
+    (merkleRoot(ord) !== merkleRoot(swp)) ? ok('intra-block reorder → DIFFERENT root (tx ORDER is committed, not just the set)') : bad('reorder undetected — root is order-insensitive');
   }
 
   // (3) TIP HASH
@@ -92,6 +94,9 @@ function runNode(file) { return new Promise((res) => { const c = spawn(process.e
     (reTip !== tip0) ? ok(`tip CHANGED after mutating an old tx (${tip0.slice(0, 8)}… → ${reTip.slice(0, 8)}…)`) : bad('tip unchanged after tamper');
     const v = verifyChain({ blocks: t.blocks });
     (!v.valid && v.firstBadIndex === 0) ? ok('verify() reports INVALID, first broken block = 0') : bad(`verify wrong: ${JSON.stringify(v)}`);
+    const base = buildChain(sampleTxs(12), 8);                                    // block 0 holds 8 txs
+    const reTxs = flatten(clone(base).blocks); [reTxs[1], reTxs[3]] = [reTxs[3], reTxs[1]];   // swap two txs within block 0
+    (buildChain(reTxs, base.blockSize).tip !== base.tip) ? ok('swapping two txs WITHIN a block changes the tip (order committed end-to-end)') : bad('intra-block reorder did not change the tip');
   }
 
   // (5) INDEPENDENT VERIFY (chain data only)
