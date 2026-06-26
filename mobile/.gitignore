@@ -57,6 +57,7 @@ replay_fence.json
 devices.json
 ignition_codes_used.json
 google_accounts.json
+self_nullifiers.json
 
 # phase-0/1/2 ledger-seam test artifacts (regenerated; not source)
 .phase0_tmp/
@@ -64,8 +65,10 @@ google_accounts.json
 .phase2_tmp/
 .phase3_tmp/
 .brick1_tmp/
+.self_gate_tmp/
 phase0_golden.json
 committee_state.json
+self_nullifiers.json
 
 # typescript
 *.tsbuildinfo

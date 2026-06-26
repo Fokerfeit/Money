@@ -5,6 +5,7 @@ const path      = require('path');
 const nacl      = require('tweetnacl');
 const rateLimit = require('express-rate-limit');
 const ledgerChain = require('./ledger_chain');   // Brick 1: tamper-evident integrity layer (additive, read-only)
+const selfGate    = require('./self_gate');      // Self personhood-ignition gate (pure; @selfxyz loaded lazily only if enabled)
 
 const app = express();
 // SECURITY: default to NOT trusting X-Forwarded-For (0). A directly-exposed or
@@ -692,6 +693,73 @@ ignitionCode = (ignitionCode || '').trim().toUpperCase();
   console.log(`TX: ${from} → ${to} | ${amt} MONEY${reason ? ` [${reason}]` : ''}`);
   res.json({ success: true, tx });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ── SELF PERSONHOOD GATE — nullifier-bound ignition (additive, flag-gated) ────
+// Enabled ONLY when SELF_GATE=1. A SECOND ignition path beside invite codes: prove
+// you are a unique human via Self (mock mode); the proof's NULLIFIER seals one
+// wallet and mints exactly 1,000,000 through the SAME FAUCET commit. One nullifier
+// = one ignition, forever — no invite code is consulted here. Default-off, so every
+// existing flow (and the phase/Brick regression suites) is byte-for-byte unchanged.
+// ─────────────────────────────────────────────────────────────────────────────
+if (process.env.SELF_GATE === '1') {
+  const SELF_FILE = process.env.MONEY_SELF_FILE || path.join(DATA_DIR, 'self_nullifiers.json');
+  // File-backed sync KV for the nullifier ledger (one logical key → one file).
+  const selfStorage = {
+    getItem: () => { try { return fs.readFileSync(SELF_FILE, 'utf8'); } catch { return null; } },
+    setItem: (_k, v) => { try { fs.writeFileSync(SELF_FILE, v); } catch (e) { console.error('Save error (self_nullifiers):', e.message); } },
+  };
+  const selfStore = selfGate.createNullifierStore(selfStorage);
+
+  // Verifier: the real SelfBackendVerifier (mock mode) in production; a stub in
+  // tests. The stub is gated behind NODE_ENV=test AND SELF_GATE_STUB=1 so it can
+  // NEVER run in production — the request simply carries the desired verdict.
+  let verify;
+  if (process.env.NODE_ENV === 'test' && process.env.SELF_GATE_STUB === '1') {
+    verify = async (payload) => ({
+      valid:     !!(payload && payload.stub && payload.stub.valid),
+      nullifier: payload && payload.stub ? payload.stub.nullifier : undefined,
+    });
+    console.log('[self-gate] TEST STUB verifier active (NODE_ENV=test, SELF_GATE_STUB=1)');
+  } else {
+    verify = selfGate.realSelfVerifier({
+      scope:    process.env.SELF_SCOPE,
+      endpoint: process.env.SELF_ENDPOINT,
+    }).verify;
+  }
+
+  // The Self mint shares the WRITE-AUTHORITATIVE `ledger` (central), exactly like
+  // the faucet — so isIgnited / standing / the Brick 1 tip all advance identically.
+  const gate = selfGate.createSelfGate({ verify, ledger, store: selfStore });
+
+  // Ignition is irreversible: cap proof submissions per IP (the nullifier is the
+  // real one-per-human gate; this only blunts proof-spam DoS).
+  const selfLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000,
+    max: process.env.NODE_ENV === 'test' ? 100000 : 10,
+    message: { error: 'Too many ignition attempts — try again later.' },
+  });
+
+  app.post('/ignite/self', selfLimiter, async (req, res) => {
+    try {
+      const body   = req.body || {};
+      const wallet = body.wallet || body.to;          // M_ address to ignite
+      const result = await gate.claim(body, wallet);
+      if (!result.ok) {
+        const status = (result.code === 'nullifier-used' || result.code === 'wallet-ignited') ? 409
+                     : (result.code === 'invalid-proof'  || result.code === 'verify-error')   ? 401
+                     : 400;
+        return res.status(status).json({ error: result.reason, code: result.code, ...(result.boundTo ? { boundTo: result.boundTo } : {}) });
+      }
+      console.log(`[self-gate] ignited ${result.wallet} via nullifier ${String(result.nullifier).slice(0, 10)}…`);
+      res.json({ success: true, wallet: result.wallet, amount: result.amount, tx: result.tx });
+    } catch (e) {
+      console.error('[self-gate] error:', e.message);
+      res.status(500).json({ error: 'self ignition failed' });
+    }
+  });
+  console.log(`[self-gate] ENABLED — POST /ignite/self (mock mode${process.env.NODE_ENV === 'test' && process.env.SELF_GATE_STUB === '1' ? ', test stub' : ''})`);
+}
 
 // ── Debug endpoint (dev-only — remove or auth-gate before public launch) ──
 // Returns counts only — never addresses or codes themselves.
