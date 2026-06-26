@@ -75,6 +75,7 @@ const authenticator = {
   check: (token, secret) => [-1,0,1].some(d => _totpAt(secret, Math.floor(Date.now()/1000/30)+d) === String(token).padStart(6,'0')),
 };
 import { BACKEND_URL, BASE_PENALTY, DISCONNECT_GRACE_MS, RESERVE_ADDRESS } from './config';
+import { lookupAddress, isValidAddress as isExplorerAddr } from './explorer';
 import MoneySymbol from './MoneySymbol';
 import {
   SealMedallion, GoldCoin, IgnitedCoin, ForgeHammerSVG, AnvilSVG, ForgeSparks,
@@ -463,6 +464,12 @@ function AppInner() {
   const [txs,       setTxs]       = useState([]);
   const [claimed,   setClaimed]   = useState(false);
   const [recipient, setRecipient] = useState('');
+  // ── Block explorer (search any address) state ───────────────────────────
+  const [explorerInput,  setExplorerInput]  = useState('');
+  const [explorerResult, setExplorerResult] = useState(null);   // lookupAddress() result or null
+  const [explorerError,  setExplorerError]  = useState('');
+  const [explorerBusy,   setExplorerBusy]   = useState(false);
+  const [txDetailTx,     setTxDetailTx]     = useState(null);    // tx tapped for the detail modal
   const [amount,    setAmount]    = useState('');
 
   // Wallet backup / restore (key recovery)
@@ -1455,6 +1462,19 @@ function AppInner() {
       else Alert.alert('Trade failed', data.error);
     } catch (e) { Alert.alert('The tablets are unreachable', e.message); }
   };
+
+  // ── Block explorer handlers (READ-ONLY over the existing public endpoints) ──
+  const runExplorerSearch = async (raw) => {
+    const query = (raw != null ? raw : explorerInput).trim();
+    setExplorerError(''); setExplorerResult(null);
+    if (!isExplorerAddr(query)) { setExplorerError('That is not a seal mark (M_ + 32 hex). Check and try again.'); return; }
+    setExplorerBusy(true);
+    try { setExplorerResult(await lookupAddress(fetch, BACKEND_URL, query)); }
+    catch (e) { setExplorerError(e.message || 'Lookup failed.'); }
+    setExplorerBusy(false);
+  };
+  const openAddressInExplorer = (addr) => { setTxDetailTx(null); setExplorerInput(addr); runExplorerSearch(addr); };
+  const clearExplorer = () => { setExplorerInput(''); setExplorerResult(null); setExplorerError(''); };
 
   const invite = () => Share.share({
     message: `I just joined the Swarm.\nNo banks. No CEOs. Just people and phones.\n\nMy seal mark: ${address}\n\nMoney. For Everyone. Forever.`,
@@ -2487,14 +2507,64 @@ function AppInner() {
           </TouchableOpacity>
         </View>
 
-        {/* CLAY TABLETS (ledger) */}
+        {/* CLAY TABLETS (ledger) + BLOCK EXPLORER */}
         <View style={s.section}>
           <Text style={s.label}>THE CLAY TABLETS — PUBLIC RECORD</Text>
-          <Text style={s.sublabel}>Every trade. Forever. Cannot be erased.</Text>
+          <Text style={s.sublabel}>Every trade. Forever. Search any seal mark.</Text>
+
+          {/* Explorer search bar — the ledger is intentionally public */}
+          <View style={s.recipientRow}>
+            <TextInput
+              style={[s.input, { flex: 1, marginBottom: 0 }]}
+              placeholder="Search any seal mark (M_…)"
+              placeholderTextColor="#5A3D1A"
+              value={explorerInput}
+              onChangeText={setExplorerInput}
+              autoCapitalize="none"
+              onSubmitEditing={() => runExplorerSearch()}
+            />
+            <TouchableOpacity style={s.qrScanBtn} onPress={() => runExplorerSearch()}>
+              <Text style={{ fontSize: 18 }}>🔍</Text>
+            </TouchableOpacity>
+            {(explorerResult || explorerError) ? (
+              <TouchableOpacity style={s.qrScanBtn} onPress={clearExplorer}>
+                <Text style={{ fontSize: 18 }}>✕</Text>
+              </TouchableOpacity>
+            ) : null}
+          </View>
+          {explorerBusy ? <Text style={s.sublabel}>Searching the tablets…</Text> : null}
+          {explorerError ? <Text style={s.explorerError}>{explorerError}</Text> : null}
+
+          {/* Per-address result: balance + standing + that address's history (newest first) */}
+          {explorerResult ? (
+            <View style={s.explorerCard}>
+              <Text style={s.explorerAddr} numberOfLines={1}>{explorerResult.address}</Text>
+              <View style={s.explorerStatsRow}>
+                <View style={s.explorerStat}><Text style={s.explorerStatLabel}>BALANCE</Text><Text style={s.explorerStatVal}>{fmt(explorerResult.balance)}</Text></View>
+                <View style={s.explorerStat}><Text style={s.explorerStatLabel}>STANDING</Text><Text style={s.explorerStatVal}>{explorerResult.standing}</Text></View>
+                <View style={s.explorerStat}><Text style={s.explorerStatLabel}>CAN MOVE</Text><Text style={s.explorerStatVal}>{fmt(explorerResult.movable)}</Text></View>
+              </View>
+              {explorerResult.found
+                ? explorerResult.txs.map((tx, i) => (
+                    <TouchableOpacity key={i} style={s.tablet} onPress={() => setTxDetailTx(tx)}>
+                      <View style={s.tabletRow}>
+                        <Text style={s.tabletFromLabel}>{tx.to === explorerResult.address ? 'RECV ←' : 'SENT →'}</Text>
+                        <Text style={s.tabletAddr} numberOfLines={1}>{displayAddr(tx.to === explorerResult.address ? tx.from : tx.to)}</Text>
+                      </View>
+                      <View style={s.tabletAmtRow}>
+                        <MoneyAmount value={tx.amount} size={13} color={tx.to === explorerResult.address ? '#7DB87A' : '#C98A4A'} textStyle={s.tabletAmt} />
+                      </View>
+                    </TouchableOpacity>
+                  ))
+                : <Text style={s.empty}>No history for this seal mark yet.</Text>}
+            </View>
+          ) : null}
+
+          {/* The public feed (full ledger) — each row taps through to tx detail */}
           {txs.length === 0
             ? <Text style={s.empty}>No trades yet. Be the first to inscribe.</Text>
             : txs.map((tx, i) => (
-              <View key={i} style={[s.tablet, tx.reason === 'disconnect_penalty' && s.tabletPenalty]}>
+              <TouchableOpacity key={i} style={[s.tablet, tx.reason === 'disconnect_penalty' && s.tabletPenalty]} onPress={() => setTxDetailTx(tx)}>
                 <View style={s.tabletHeader}>
                   <Text style={s.tabletNum}>ENTRY {txs.length - i}</Text>
                   <Text style={s.tabletTime}>{tx.time}</Text>
@@ -2513,9 +2583,37 @@ function AppInner() {
                     : null}
                   <MoneyAmount value={tx.amount} size={13} color="#7DB87A" textStyle={s.tabletAmt} />
                 </View>
-              </View>
+              </TouchableOpacity>
             ))}
         </View>
+
+        {/* TX DETAIL — every field of a tapped trade; explore either party */}
+        <Modal visible={txDetailTx !== null} animationType="fade" transparent onRequestClose={() => setTxDetailTx(null)}>
+          <View style={s.explorerBackdrop}>
+            <View style={s.explorerSheet}>
+              <Text style={s.label}>📜 TRADE DETAIL</Text>
+              {txDetailTx ? (
+                <View>
+                  {[['FROM', displayAddr(txDetailTx.from)], ['TO', displayAddr(txDetailTx.to)], ['AMOUNT', fmt(txDetailTx.amount)],
+                    ['REASON', txDetailTx.reason || '—'], ['TIME', txDetailTx.time || '—'],
+                    ['TIMESTAMP', String(txDetailTx.timestamp || '—')], ['SIGNATURE', txDetailTx.sigPrefix ? txDetailTx.sigPrefix + '…' : '—']].map(([k, v]) => (
+                    <View key={k} style={s.txDetailRow}>
+                      <Text style={s.txDetailKey}>{k}</Text>
+                      <Text style={s.txDetailVal} numberOfLines={1}>{v}</Text>
+                    </View>
+                  ))}
+                  {txDetailTx.from && txDetailTx.from !== 'FAUCET' ? (
+                    <TouchableOpacity style={[s.btnSage, { marginTop: 8 }]} onPress={() => openAddressInExplorer(txDetailTx.from)}><Text style={s.btnText}>🔍 EXPLORE SENDER</Text></TouchableOpacity>
+                  ) : null}
+                  {txDetailTx.to ? (
+                    <TouchableOpacity style={[s.btnSage, { marginTop: 8 }]} onPress={() => openAddressInExplorer(txDetailTx.to)}><Text style={s.btnText}>🔍 EXPLORE RECIPIENT</Text></TouchableOpacity>
+                  ) : null}
+                </View>
+              ) : null}
+              <TouchableOpacity style={[s.btnLapis, { marginTop: 12 }]} onPress={() => setTxDetailTx(null)}><Text style={s.btnText}>CLOSE</Text></TouchableOpacity>
+            </View>
+          </View>
+        </Modal>
       </ScrollView>
     </SafeAreaView>
     </ScreenWrapper>
@@ -2964,6 +3062,19 @@ const s = StyleSheet.create({
     borderWidth: 1, borderColor: 'rgba(212,175,55,0.35)',
     alignItems: 'center', justifyContent: 'center',
   },
+  // ── Block explorer ──
+  explorerError:    { color: '#C98A4A', fontSize: 12, marginBottom: 8, textAlign: 'center' },
+  explorerCard:     { backgroundColor: 'rgba(212,175,55,0.06)', borderRadius: 12, borderWidth: 1, borderColor: 'rgba(212,175,55,0.25)', padding: 12, marginBottom: 12 },
+  explorerAddr:     { color: '#D4AF37', fontSize: 12, letterSpacing: 0.5, marginBottom: 8 },
+  explorerStatsRow: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 10 },
+  explorerStat:     { alignItems: 'center', flex: 1 },
+  explorerStatLabel:{ color: '#9A7B4A', fontSize: 10, letterSpacing: 1 },
+  explorerStatVal:  { color: '#E8D5A8', fontSize: 15, fontWeight: '600', marginTop: 2 },
+  explorerBackdrop: { flex: 1, backgroundColor: 'rgba(0,0,0,0.6)', justifyContent: 'center', padding: 20 },
+  explorerSheet:    { backgroundColor: '#1A120A', borderRadius: 16, borderWidth: 1, borderColor: 'rgba(212,175,55,0.3)', padding: 18 },
+  txDetailRow:      { flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: 'rgba(212,175,55,0.1)', gap: 12 },
+  txDetailKey:      { color: '#9A7B4A', fontSize: 11, letterSpacing: 1 },
+  txDetailVal:      { color: '#E8D5A8', fontSize: 13, flexShrink: 1, textAlign: 'right' },
   // QR frame overlay on camera
   qrOverlay: {
     flex: 1, alignItems: 'center', justifyContent: 'center',
