@@ -7,19 +7,27 @@
 //
 // THE MAPPING (MONEY tx  ↔  swarm message):
 //   • FAUCET mint  {from:'FAUCET', to:X, amount:1,000,000}   ↔  a `seal` (membership):
-//     in the engine, sealing mints exactly MINT=1,000,000 to the new member — the
-//     same 1,000,000 the live faucet grants — so both models start a member at 1M.
+//     in the engine, sealing mints exactly MINT=1,000,000 to the new member, which
+//     equals a faucet/Self-gate grant IN THE FIXED-1M REGIME (see SCOPE) — so both
+//     models start a member at 1M.
 //   • transfer     {from:A, to:B, amount:N}                   ↔  the promise→accept
 //     →vote→certify→apply cycle: A signs a nonce-ordered promise, B counter-signs
 //     (accept), A's deterministic 5-of-7 committee votes to quorum, and fold()
 //     applies it. Money moves ONLY for a quorum-certified, accepted, non-fraudulent
 //     promise — the engine's BFT guarantee.
 //
-// SCOPE (honest): the committee validates BFT correctness (quorum + double-spend),
-// NOT MONEY's standing/movement-cap policy — that policy decides which txs central
-// COMMITS, and is a separate, later brick. So we drive the committee with the txs
-// central accepts and prove balances match. We do NOT make the committee re-derive
-// the cap (it doesn't, by design, yet).
+// SCOPE (honest) — two boundaries this brick deliberately does NOT cross:
+//   1. STANDING / MOVEMENT-CAP: the committee validates BFT correctness (quorum +
+//      double-spend), NOT MONEY's standing/movement-cap policy. That policy decides
+//      which txs central COMMITS; we drive the committee with the txs central
+//      accepts and prove balances match. We do NOT make the committee re-derive the
+//      cap (it doesn't, by design, yet — a later brick).
+//   2. FAUCET REWARD DECAY: the seal↔mint 1:1 equality assumes the fixed-1M regime —
+//      Self-gate ignition, or the faucet while userCount < 1,000,000. The live
+//      server's calcReward decays ×0.8 per 1,000,000 users (so at 1e6 users a mint
+//      is 800,000, not 1,000,000), while the engine MINT is hard-coded 1,000,000.
+//      This brick stays in the pre-decay regime; beyond it, a seal would over-credit
+//      vs the decayed central mint and the models would diverge by design.
 'use strict';
 
 const E = require('./swarm_engine');
@@ -46,8 +54,10 @@ function hashSeed(label) {
   return b;
 }
 
-// central balance = the EXACT formula in server.js (getBalance): credits − debits
-// over the committed MONEY tx set. This IS the authoritative central balance.
+// central balance = server.js getBalance's EXACT formula — credits − debits over the
+// committed MONEY tx set. This matches the authoritative central balance FOR THE TXS
+// CENTRAL ACCEPTS; the cap/validation gate that decides WHICH txs commit is a
+// separate brick (see SCOPE), so feed this only txs central would commit.
 function centralBalanceOf(txs, addr) {
   return txs.reduce((b, t) => (t.to === addr ? b + t.amount : t.from === addr ? b - t.amount : b), 0);
 }
@@ -110,11 +120,18 @@ function createBridge({ founders, epoch = 0 } = {}) {
   const members = () => fold().pool.slice();
   const committeeBalanceOf = (addr) => (fold().bal[addr] || 0);
   const centralBalance = (addr) => centralBalanceOf(moneyTxs, addr);
-  // The core claim: committee fold == central reduction, for every member.
+  // The core claim: committee fold == central reduction, for EVERY address — not
+  // just sealed members. We iterate the union of the committee pool and every
+  // address appearing in the MONEY tx set (minus FAUCET), so a credit to a
+  // non-member "ghost" recipient (which central counts but the committee withholds,
+  // since the engine only applies to sealed recipients) is flagged DIRECTLY on the
+  // recipient, not merely incidentally via the sender's debit.
   function reconcile() {
     const f = fold();
+    const addrs = new Set(f.pool);
+    for (const t of moneyTxs) { if (t.from !== FAUCET) addrs.add(t.from); if (t.to !== FAUCET) addrs.add(t.to); }
     const out = { agree: true, perAddress: {}, mismatches: [] };
-    for (const addr of f.pool) {
+    for (const addr of addrs) {
       const c = centralBalance(addr), k = f.bal[addr] || 0;
       out.perAddress[addr] = { committee: k, central: c, equal: c === k };
       if (c !== k) { out.agree = false; out.mismatches.push({ addr, committee: k, central: c }); }

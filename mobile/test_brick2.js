@@ -1,6 +1,7 @@
 // test_brick2.js — BRICK 2 (Bite 1): committee bridge. Every probe must pass; exit 0.
 //   1 MEMBERSHIP+MINT   2 SINGLE TRANSFER   3 CHAIN   4 FAN-OUT/FAN-IN
 //   5 INVITED MEMBER    6 QUORUM ENFORCED   7 DOUBLE-SPEND CAUGHT   8 DETERMINISM
+//   8b NON-MEMBER RECIPIENT (reconcile covers every address, not just members)
 //   9 REAL-SERVER AGREEMENT (committee == central reduction == live /balance)
 //  10 REGRESSION (Self gate -> Brick 1 -> Phase 0-3 still exit 0)
 //
@@ -172,11 +173,27 @@ function runNode(file) { return new Promise((res) => { const c = spawn(process.e
       : bad(`determinism failed: h1=${h1} h2=${h2} stable=${f1 === f2}`);
   }
 
+  // (8b) NON-MEMBER RECIPIENT — reconcile flags a ghost credit DIRECTLY (coverage)
+  console.log('  (8b) NON-MEMBER RECIPIENT');
+  {
+    const { br, A } = freshBridge(8, 'b2ghost_');
+    const ghost = mkIdentity('b2ghost_OUTSIDER');          // never sealed → not a member
+    br.register(ghost);                                    // known key (can sign accept), no membership
+    br.promise(A[0], ghost.address, 20000, { record: true }); // central debits A0 + credits ghost; committee withholds (recipient unsealed)
+    const rec = br.reconcile();
+    const ghostFlagged = rec.mismatches.some((m) => m.addr === ghost.address && m.committee === 0 && m.central === 20000);
+    (!rec.agree && ghostFlagged && !br.members().includes(ghost.address))
+      ? ok('credit to a NON-member recipient is caught DIRECTLY on the ghost (reconcile covers every address, not just members)')
+      : bad(`ghost coverage failed: agree=${rec.agree} flagged=${ghostFlagged} member=${br.members().includes(ghost.address)}`);
+  }
+
   // (9) REAL-SERVER AGREEMENT — committee == central reduction == live /balance
   console.log('  (9) REAL-SERVER AGREEMENT (live central code)');
   try {
     // a comprehensive scenario: 8 members, several transfers ≤ 50k (within the live
-    // movement cap), each sender solvent in issue order.
+    // movement cap), each sender solvent in issue order. Mints stay in the fixed-1M
+    // regime (Self-gate ignition), so seal↔mint is 1:1 (no calcReward decay — see
+    // committee_bridge.js SCOPE).
     const { br, founders, A } = freshBridge(8, 'b2srv_');
     br.pay(A[0], A[1], 50000); br.pay(A[1], A[2], 30000); br.pay(A[2], A[3], 20000);
     br.pay(A[3], A[4], 10000); br.pay(A[0], A[5], 25000); br.pay(A[6], A[7], 40000);
