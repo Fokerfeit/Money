@@ -63,6 +63,7 @@ google_accounts.json
 .phase1_tmp/
 .phase2_tmp/
 .phase3_tmp/
+.brick1_tmp/
 phase0_golden.json
 committee_state.json
 

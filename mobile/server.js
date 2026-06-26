@@ -4,6 +4,7 @@ const fs        = require('fs');
 const path      = require('path');
 const nacl      = require('tweetnacl');
 const rateLimit = require('express-rate-limit');
+const ledgerChain = require('./ledger_chain');   // Brick 1: tamper-evident integrity layer (additive, read-only)
 
 const app = express();
 // SECURITY: default to NOT trusting X-Forwarded-For (0). A directly-exposed or
@@ -520,6 +521,15 @@ app.use(['/ledger', '/tx', '/balance', '/usercount'], rateLimit({
 // ── Routes ────────────────────────────────────────────────────────────────
 app.get('/health',    (req, res) => res.json({ status: 'ok', transactions: ledger.size(), seals: ledger.userCount() }));
 app.get('/usercount', (req, res) => res.json({ count: (shadowReads || ledger).userCount() }));
+// ── Brick 1: tamper-evident tip ──────────────────────────────────────────────
+// A single hash that fingerprints the ENTIRE ledger (hash-linked blocks, each
+// with a Merkle root over its txs). Anyone can rebuild the chain from GET /ledger
+// and confirm it ends at this tip — verification without trusting the operator.
+// Additive + read-only: it derives from the existing ledger, changing no money rule.
+app.get('/tip', (req, res) => {
+  const chain = ledgerChain.buildChain([...ledger.all()].reverse());   // newest-first → chronological
+  res.json({ tip: chain.tip, blocks: chain.blocks.length, txs: chain.txCount, blockSize: chain.blockSize });
+});
 app.get('/ledger',    (req, res) => res.json((shadowReads || ledger).all()));
 
 // ── Targeted lookup ──────────────────────────────────────────────────────────
