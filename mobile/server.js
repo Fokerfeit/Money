@@ -6,6 +6,7 @@ const nacl      = require('tweetnacl');
 const rateLimit = require('express-rate-limit');
 const ledgerChain = require('./ledger_chain');   // Brick 1: tamper-evident integrity layer (additive, read-only)
 const selfGate    = require('./self_gate');      // Self personhood-ignition gate (pure; @selfxyz loaded lazily only if enabled)
+const safeStore   = require('./safe_store');     // atomic, fail-closed JSON persistence (saveAtomic / loadStrict)
 
 const app = express();
 // SECURITY: default to NOT trusting X-Forwarded-For (0). A directly-exposed or
@@ -26,17 +27,33 @@ const REPLAY_FENCE_FILE    = process.env.MONEY_FENCE_FILE    || path.join(DATA_D
 const USED_CODES_FILE      = process.env.MONEY_CODES_FILE    || path.join(DATA_DIR, 'ignition_codes_used.json');
 
 // ── Persistence helpers ────────────────────────────────────────────────────
+// loadJSON stays fail-OPEN — used only for the committee SHADOW state, which is
+// designed to rebuild from central on a miss (a reset there is safe, not lossy).
 const loadJSON = (file, fallback) => {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
   catch { return fallback; }
 };
+// saveJSON now writes ATOMICALLY (safe_store): tmp → rename, keeping a .bak. The main
+// file is never a half-written state. We still swallow+log a write failure so a
+// transient disk error can't crash the server mid-request; the on-disk file stays
+// intact (old-complete or new-complete, never torn).
 const saveJSON = (file, data) => {
-  try { fs.writeFileSync(file, JSON.stringify(data, null, 2)); }
+  try { safeStore.saveAtomic(file, data); }
   catch (e) { console.error(`Save error (${path.basename(file)}):`, e.message); }
 };
 
 // ── Load state ──────────────────────────────────────────────────────────────
-let txs = loadJSON(LEDGER_FILE, []);
+// FAIL-CLOSED: a ledger that EXISTS but is unreadable (and has no recoverable .bak)
+// must REFUSE to boot. A silently-empty ledger would wipe every balance — the single
+// most catastrophic failure. A genuine first boot (no file, no .bak) → [] as before.
+let txs;
+try {
+  txs = safeStore.loadStrict(LEDGER_FILE, []);
+} catch (e) {
+  console.error(`[FATAL] ${e.message}`);
+  console.error('Refusing to boot: a silently-empty ledger would erase every balance. Restore ledger.json (or its .bak) and retry.');
+  process.exit(1);
+}
 
 // ── In-memory indexes for O(1) targeted lookups ──────────────────────────────
 // The scalability fix: instead of every client re-downloading the ENTIRE ledger
@@ -60,7 +77,13 @@ for (let i = txs.length - 1; i >= 0; i--) indexTx(txs[i], true);
 
 // replay_fence.json stores { messageKey: timestampMs } — a persistent replay
 // fence so a signature can never be replayed, even across a server restart.
-let seenSigs = loadJSON(REPLAY_FENCE_FILE, {});
+// The replay fence recovers from .bak if the main file is corrupt; if BOTH are
+// unreadable it self-heals to empty (SAFE: entries are time-gated to a 2-minute
+// window and pruned constantly, so a reset only briefly re-opens replay — never a
+// re-mint). This is the one store where fail-open is the correct trade.
+let seenSigs;
+try { seenSigs = safeStore.loadStrict(REPLAY_FENCE_FILE, {}); }
+catch (e) { console.error(`[replay-fence] unreadable with no backup — resetting (safe: time-gated). ${e.message}`); seenSigs = {}; }
 
 // ── Anti-Sybil: server-issued single-use invite (ignition) codes ────────────
 // IGNITION_CODES (comma-separated) are codes YOU hand out. The server controls
@@ -73,7 +96,17 @@ let seenSigs = loadJSON(REPLAY_FENCE_FILE, {});
 const IGNITION_CODES = new Set(
   (process.env.IGNITION_CODES || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean)
 );
-let usedCodes = loadJSON(USED_CODES_FILE, {});   // code → address (consumed)
+// FAIL-CLOSED: the used-invite-code ledger is a re-mint vector — if it silently reset
+// to {}, every consumed code would look unused and could mint again. Recover from
+// .bak; refuse to boot if both are unreadable. First boot (no file, no .bak) → {}.
+let usedCodes;
+try {
+  usedCodes = safeStore.loadStrict(USED_CODES_FILE, {});   // code → address (consumed)
+} catch (e) {
+  console.error(`[FATAL] ${e.message}`);
+  console.error('Refusing to boot: a reset invite-code ledger would let already-used codes mint again.');
+  process.exit(1);
+}
 
 // ── Platform recipient allowlist ────────────────────────────────────────────
 // Addresses (comma-separated in MONEY_PLATFORM_ADDRESSES) that may RECEIVE
@@ -704,12 +737,25 @@ ignitionCode = (ignitionCode || '').trim().toUpperCase();
 // ─────────────────────────────────────────────────────────────────────────────
 if (process.env.SELF_GATE === '1') {
   const SELF_FILE = process.env.MONEY_SELF_FILE || path.join(DATA_DIR, 'self_nullifiers.json');
-  // File-backed sync KV for the nullifier ledger (one logical key → one file).
+  // Atomic, fail-CLOSED storage for the nullifier ledger. A corrupt store must NEVER
+  // silently reset — that would free every used nullifier to mint a SECOND time.
   const selfStorage = {
-    getItem: () => { try { return fs.readFileSync(SELF_FILE, 'utf8'); } catch { return null; } },
-    setItem: (_k, v) => { try { fs.writeFileSync(SELF_FILE, v); } catch (e) { console.error('Save error (self_nullifiers):', e.message); } },
+    load: () => safeStore.loadStrict(SELF_FILE, {}),
+    save: (map) => safeStore.saveAtomic(SELF_FILE, map),
   };
-  const selfStore = selfGate.createNullifierStore(selfStorage);
+  let selfStore;
+  try {
+    selfStore = selfGate.createNullifierStore(selfStorage);
+  } catch (e) {
+    console.error(`[FATAL] self-gate nullifier store: ${e.message}`);
+    console.error('Refusing to enable the Self gate on a corrupt nullifier store — a reset would let a human mint twice.');
+    process.exit(1);
+  }
+  // Crash recovery: claim() SEALS the nullifier before it mints, so a crash between
+  // the two leaves a sealed-but-unminted wallet. Complete any such pending mint here,
+  // exactly once (idempotent — an already-ignited wallet is skipped).
+  const repairedPending = selfGate.repairPending(ledger, selfStore);
+  if (repairedPending) console.log(`[self-gate] crash repair: completed ${repairedPending} pending mint(s)`);
 
   // Verifier: the real SelfBackendVerifier (mock mode) in production; a stub in
   // tests. The stub is gated behind NODE_ENV=test AND SELF_GATE_STUB=1 so it can

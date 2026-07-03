@@ -58,6 +58,9 @@ devices.json
 ignition_codes_used.json
 google_accounts.json
 self_nullifiers.json
+# safe_store atomic-write sidecars (machine-local, regenerated)
+*.json.bak
+*.json.tmp
 
 # phase-0/1/2 ledger-seam test artifacts (regenerated; not source)
 .phase0_tmp/
@@ -68,6 +71,7 @@ self_nullifiers.json
 .self_gate_tmp/
 .brick2_tmp/
 .brick2cap_tmp/
+.hardening_tmp/
 phase0_golden.json
 committee_state.json
 self_nullifiers.json
