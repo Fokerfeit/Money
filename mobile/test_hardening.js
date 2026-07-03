@@ -43,7 +43,7 @@ const crypto = require('crypto');
 const seed = (l) => new Uint8Array(crypto.createHash('sha256').update(l).digest());
 function wallet(l) { const kp = nacl.sign.keyPair.fromSeed(seed(l)); const pub = toHex(kp.publicKey); return { address: 'M_' + pub.slice(0, 32).toUpperCase(), publicKey: pub, secretKey: kp.secretKey }; }
 function signMsg(from, to, amount, ts, sk) { const m = `${from}:${to}:${amount}:${ts}`; return toHex(nacl.sign.detached(Uint8Array.from(Array.from(m).map((c) => c.charCodeAt(0))), sk)); }
-let portCounter = 39360;
+let portCounter = 39360 + Math.floor(Math.random() * 8000);  // random base avoids TIME_WAIT collisions across nested re-runs
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function envFor(dir, port) {
   return { ...process.env, NODE_ENV: 'test', PORT: String(port), MONEY_DATA_DIR: dir,
@@ -175,6 +175,21 @@ function runNode(file) { return new Promise((res) => { const c = spawn(process.e
     (SG.auditSeals(led3, emptyStore).includes(W('Z')) && SG.auditSeals(led3, boundStore).length === 0)
       ? ok('auditSeals flags a minted-but-unsealed wallet (dropped seal) and passes when the binding is present')
       : bad('auditSeals wrong');
+
+    // FAIL-CLOSED dual-.bak: if the .bak copy fails mid-save, the mint is REFUSED (never
+    // renamed against a lagging backup) — closes the swallowed-.bak-copy re-mint window.
+    const realCopy = fs.copyFileSync;
+    fs.copyFileSync = (src, dst) => { if (String(dst).endsWith('.bak')) throw Object.assign(new Error('ENOSPC (injected)'), { code: 'ENOSPC' }); return realCopy(src, dst); };
+    let bakFailOk = false;
+    try {
+      const bd = freshDir('bakfail'); const bf = path.join(bd, 'self.json');
+      const ledB = mockLedger();
+      const gB = SG.createSelfGate({ verify: () => Promise.resolve({ valid: true, nullifier: 'N' }), ledger: ledB, store: SG.createNullifierStore(fileStorage(bf)) });
+      const rB = await gB.claim({}, W('A'));
+      bakFailOk = !rB.ok && rB.code === 'seal-failed' && ledB._txs.length === 0 && !fs.existsSync(bf);
+    } finally { fs.copyFileSync = realCopy; }
+    (bakFailOk) ? ok('a .bak-copy failure on the dual path → seal-failed, NO mint, main not flipped (never mints against a lagging backup)')
+                : bad('.bak-copy failure was not fail-closed');
 
     // END-TO-END on the real server: the reviewer's exact attack now yields NO 2nd mint
     const d2 = freshDir('remint_live');

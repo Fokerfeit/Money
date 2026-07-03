@@ -54,14 +54,20 @@ function saveAtomic(file, data, { dualBak = false } = {}) {
   const tmp = file + '.tmp';
   const bak = file + '.bak';
   writeFsync(tmp, json);                              // 1) stage the new bytes + flush
-  try {
-    if (dualBak) {
-      fs.copyFileSync(tmp, bak); fsyncPath(bak);      // 2a) .bak := NEW content (never lags)
-    } else if (fs.existsSync(file)) {                 // 2b) .bak := current good main, ONLY if valid
-      const cur = fs.readFileSync(file, 'utf8');
-      if (isParseable(cur)) { fs.copyFileSync(file, bak); fsyncPath(bak); }
-    }
-  } catch { /* backup is best-effort; the atomic rename below is the real guarantee */ }
+  if (dualBak) {
+    // append-only set: .bak MUST carry the NEW content BEFORE main flips, or the
+    // "never lags" invariant breaks. A copy/fsync failure PROPAGATES (no rename) — the
+    // caller's seal() then throws and claim() returns seal-failed, refusing the mint,
+    // rather than minting against a lagging backup (a re-mint window).
+    fs.copyFileSync(tmp, bak); fsyncPath(bak);        // 2a) .bak := NEW content (fail-closed)
+  } else {
+    try {                                             // 2b) rollback .bak := current good main, best-effort
+      if (fs.existsSync(file)) {
+        const cur = fs.readFileSync(file, 'utf8');
+        if (isParseable(cur)) { fs.copyFileSync(file, bak); fsyncPath(bak); }
+      }
+    } catch { /* a stale rollback .bak is the intended fallback; the atomic rename is the real guarantee */ }
+  }
   fs.renameSync(tmp, file);                           // 3) atomic replace
   fsyncPath(path.dirname(file));                      // 4) make the rename durable
 }

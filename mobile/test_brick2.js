@@ -40,7 +40,7 @@ const totalCommittee = (br) => Object.values(br.fold().bal).reduce((s, v) => s +
 const toHex = (u8) => Buffer.from(u8).toString('hex');
 function signMsg(from, to, amount, ts, sk) { const m = `${from}:${to}:${amount}:${ts}`; return toHex(nacl.sign.detached(Uint8Array.from(Array.from(m).map((c) => c.charCodeAt(0))), sk)); }
 const TMP = path.join(__dirname, '.brick2_tmp');
-let portCounter = 39280, BASE = '', child = null, logs = [];
+let portCounter = 39280 + Math.floor(Math.random() * 8000), BASE = '', child = null, logs = [];  // random base avoids TIME_WAIT collisions across nested re-runs
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function boot() {
   fs.rmSync(TMP, { recursive: true, force: true }); fs.mkdirSync(TMP, { recursive: true });

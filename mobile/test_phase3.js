@@ -32,7 +32,7 @@ const seed  = (l) => new Uint8Array(crypto.createHash('sha256').update(l).digest
 function wallet(l) { const kp = nacl.sign.keyPair.fromSeed(seed(l)); const pub = toHex(kp.publicKey); return { address: 'M_' + pub.slice(0, 32).toUpperCase(), publicKey: pub, secretKey: kp.secretKey }; }
 function signMsg(from, to, amount, ts, sk) { const m = `${from}:${to}:${amount}:${ts}`; return toHex(nacl.sign.detached(Uint8Array.from(Array.from(m).map((c) => c.charCodeAt(0))), sk)); }
 
-let portCounter = Number(process.env.PHASE3_PORT || 39150);
+let portCounter = Number(process.env.PHASE3_PORT || (39150 + Math.floor(Math.random() * 8000)));  // random base avoids TIME_WAIT port collisions across nested re-runs
 let BASE = '', serverLogs = [], currentChild = null;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function bootServer(reset, committeeFile = COMMITTEE_FILE) {
