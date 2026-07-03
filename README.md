@@ -96,7 +96,7 @@ The phone in your pocket is enough.
 
 - **Kaspa** — DAG architecture and transaction speed model
 - **Pi Network** — Smartphone-first validation concept
-- *"Somewhere in the Milky Way"* by Luca Urbani — the philosophy behind this project
+- *"Somewhere in the Milky Way"* https://www.amazon.ca/Somewhere-Milky-Way-Luca-Urbani-ebook/dp/B0F73VCSG3 by Luca Urbani — the philosophy behind this project 
 
 ---
 
