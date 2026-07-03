@@ -4,6 +4,7 @@
 
 <h1 align="center">MONEY</h1>
 <p align="center"><em>Proof of Swarm — Money. For Everyone. Forever.</em></p>
+<img width="1024" height="852" alt="Poem with icon MONEY signed Luca" src="https://github.com/user-attachments/assets/fc17e392-134e-40ed-8ace-11058330fa24" />
 
 <p align="center">
   <img src="https://img.shields.io/badge/status-building-gold?style=flat-square"/>
