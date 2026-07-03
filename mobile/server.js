@@ -161,8 +161,11 @@ const calcReward = (count) => {
   return Math.max(Math.floor(r), 1);
 };
 
+// A self-transfer (from===to) nets to zero — credit and debit cancel — so a historical
+// self-tx already in a ledger can NEVER inflate a balance (defence in depth behind the
+// POST /transaction reject below).
 const getBalance = (addr) =>
-  txs.reduce((b, t) => t.to === addr ? b + t.amount : t.from === addr ? b - t.amount : b, 0);
+  txs.reduce((b, t) => (t.from === t.to ? b : t.to === addr ? b + t.amount : t.from === addr ? b - t.amount : b), 0);
 // -- Standing & movement cap ---------------------------------------------
 // Standing = trust EARNED, not money. Your whole million is always yours;
 // standing decides how much you can MOVE at once. Computed live from the ledger:
@@ -633,6 +636,14 @@ ignitionCode = (ignitionCode || '').trim().toUpperCase();
     if (!verifyTx(from, to, amt, timestamp, signature, publicKey))
       return res.status(401).json({ error: 'Invalid signature — transaction rejected' });
   }
+
+  // ── Reject self-transfers (from === to) ────────────────────────────────────
+  // A send to yourself moves no money, but the ledger's credit/debit accounting would
+  // otherwise count only the credit → a balance-inflating money-printer. Rejected AFTER
+  // signature verification (a valid signature does NOT bypass it) and BEFORE any state
+  // change (no replay-fence write, no commit, no tip change).
+  if (from === to)
+    return res.status(400).json({ error: 'Self-transfers are not allowed' });
 
   // ── Replay fence — keyed on the SIGNED MESSAGE, checked AFTER verification ──
   // (1) Keying on the message (from:to:amount:timestamp) instead of the signature

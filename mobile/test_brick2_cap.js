@@ -145,13 +145,14 @@ function runNode(file) { return new Promise((res) => { const c = spawn(process.e
     // FAUCET not counted: after only a seal (a FAUCET mint), standing is baseline 5, not 6.
     const { br, A } = fresh(8, 'cap6_', true);
     const faucetExcluded = br.committeeStandingOf(A[0]) === 5;
-    // self not counted: a self-transfer does not raise standing.
+    // self-transfer REJECTED (parity with central, which 400s from===to) — so it can
+    // neither inflate standing nor balance.
     const selfBefore = br.committeeStandingOf(A[0]);
-    const selfTx = br.pay(A[0], A[0], 40000);                      // A0 → A0 (≤ movable 50k)
+    const selfTx = br.pay(A[0], A[0], 40000);                      // A0 → A0 rejected
     const selfAfter = br.committeeStandingOf(A[0]);
-    (faucetExcluded && selfTx.admitted && selfBefore === 5 && selfAfter === 5 && br.committeeBalanceOf(A[0]) === MINT)
-      ? ok('FAUCET seal is NOT a counterparty (standing stays 5); a self-transfer does NOT inflate standing (stays 5) — identical to central')
-      : bad(`exclusion failed: faucet=${faucetExcluded} self ${selfBefore}->${selfAfter} bal=${br.committeeBalanceOf(A[0])}`);
+    (faucetExcluded && !selfTx.admitted && selfTx.reason === 'self-transfer' && selfBefore === 5 && selfAfter === 5 && br.committeeBalanceOf(A[0]) === MINT)
+      ? ok('FAUCET seal is NOT a counterparty (standing stays 5); a self-transfer is REJECTED (no standing/balance inflation) — identical to central')
+      : bad(`exclusion failed: faucet=${faucetExcluded} selfAdmitted=${selfTx.admitted} self ${selfBefore}->${selfAfter} bal=${br.committeeBalanceOf(A[0])}`);
   }
 
   // (7) REAL-SERVER PARITY — committee cap decisions == live server; 3-way balances
