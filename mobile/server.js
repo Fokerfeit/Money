@@ -33,13 +33,20 @@ const loadJSON = (file, fallback) => {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
   catch { return fallback; }
 };
-// saveJSON now writes ATOMICALLY (safe_store): tmp → rename, keeping a .bak. The main
-// file is never a half-written state. We still swallow+log a write failure so a
-// transient disk error can't crash the server mid-request; the on-disk file stays
-// intact (old-complete or new-complete, never torn).
+// A persistent save failure (e.g. a read-only/locked file) is swallowed so a transient
+// disk error can't crash the server mid-request — but it is TRACKED so /health can
+// report a degraded persistence state instead of a green light over a dead disk (a
+// silent in-memory/disk divergence is dangerous for a money server).
+let lastSaveError = null;
+const noteSaveError = (file, e) => {
+  lastSaveError = { file: path.basename(file), message: e.message, at: new Date().toISOString() };
+  console.error(`Save error (${path.basename(file)}):`, e.message);
+};
+// saveJSON now writes ATOMICALLY (safe_store): tmp → fsync → rename → dir fsync, keeping
+// a .bak. The main file is never a half-written state; a returned write is durable.
 const saveJSON = (file, data) => {
   try { safeStore.saveAtomic(file, data); }
-  catch (e) { console.error(`Save error (${path.basename(file)}):`, e.message); }
+  catch (e) { noteSaveError(file, e); }
 };
 
 // ── Load state ──────────────────────────────────────────────────────────────
@@ -101,7 +108,7 @@ const IGNITION_CODES = new Set(
 // .bak; refuse to boot if both are unreadable. First boot (no file, no .bak) → {}.
 let usedCodes;
 try {
-  usedCodes = safeStore.loadStrict(USED_CODES_FILE, {});   // code → address (consumed)
+  usedCodes = safeStore.loadUnion(USED_CODES_FILE, {});   // code → address (consumed) — append-only set, union both copies
 } catch (e) {
   console.error(`[FATAL] ${e.message}`);
   console.error('Refusing to boot: a reset invite-code ledger would let already-used codes mint again.');
@@ -716,10 +723,12 @@ ignitionCode = (ignitionCode || '').trim().toUpperCase();
   ledger.commit(tx);            // append + index + persist via the single ledger write path
   saveJSON(REPLAY_FENCE_FILE,  seenSigs); // atomically commits the replay fence
 
-  // On a successful ignition, consume the one-time invite code.
+  // On a successful ignition, consume the one-time invite code. Dual-.bak write so a
+  // consumed code (a re-mint vector) is never dropped by a single-copy corruption.
   if (from === 'FAUCET' && ignitionCode && IGNITION_CODES.size > 0) {
     usedCodes[ignitionCode] = to;
-    saveJSON(USED_CODES_FILE, usedCodes);
+    try { safeStore.saveAtomicDual(USED_CODES_FILE, usedCodes); }
+    catch (e) { noteSaveError(USED_CODES_FILE, e); }
     console.log(`[invite-code] consumed code → ${to}`);
   }
 
@@ -737,11 +746,13 @@ ignitionCode = (ignitionCode || '').trim().toUpperCase();
 // ─────────────────────────────────────────────────────────────────────────────
 if (process.env.SELF_GATE === '1') {
   const SELF_FILE = process.env.MONEY_SELF_FILE || path.join(DATA_DIR, 'self_nullifiers.json');
-  // Atomic, fail-CLOSED storage for the nullifier ledger. A corrupt store must NEVER
-  // silently reset — that would free every used nullifier to mint a SECOND time.
+  // Atomic, fail-CLOSED storage for the nullifier set. The nullifier set is APPEND-ONLY,
+  // so we use dual-.bak writes + union load: a used nullifier present in EITHER copy is
+  // never dropped (closes the ".bak lags by one" re-mint window). A corrupt store must
+  // NEVER silently reset — that would free used nullifiers to mint again.
   const selfStorage = {
-    load: () => safeStore.loadStrict(SELF_FILE, {}),
-    save: (map) => safeStore.saveAtomic(SELF_FILE, map),
+    load: () => safeStore.loadUnion(SELF_FILE, {}),
+    save: (map) => safeStore.saveAtomicDual(SELF_FILE, map),
   };
   let selfStore;
   try {
@@ -751,11 +762,20 @@ if (process.env.SELF_GATE === '1') {
     console.error('Refusing to enable the Self gate on a corrupt nullifier store — a reset would let a human mint twice.');
     process.exit(1);
   }
-  // Crash recovery: claim() SEALS the nullifier before it mints, so a crash between
-  // the two leaves a sealed-but-unminted wallet. Complete any such pending mint here,
-  // exactly once (idempotent — an already-ignited wallet is skipped).
+  // Crash recovery: claim() SEALS the nullifier before it mints, so a crash between the
+  // two leaves a sealed-but-unminted wallet. Complete any such pending mint here, once
+  // (idempotent — an already-ignited wallet is skipped).
   const repairedPending = selfGate.repairPending(ledger, selfStore);
   if (repairedPending) console.log(`[self-gate] crash repair: completed ${repairedPending} pending mint(s)`);
+  // HUMAN-keyed backstop: if any self_ignition-minted wallet has NO backing nullifier
+  // seal (a seal was lost to corruption / stale-.bak recovery), that nullifier is
+  // silently re-mintable → REFUSE to enable the gate rather than allow a second mint.
+  const orphanMints = selfGate.auditSeals(ledger, selfStore);
+  if (orphanMints.length) {
+    console.error(`[FATAL] self-gate: ${orphanMints.length} minted wallet(s) have no nullifier seal — a seal was lost, leaving a nullifier re-mintable.`);
+    console.error('Refusing to enable the Self gate. Restore self_nullifiers.json (or its .bak) so every minted wallet has its binding.');
+    process.exit(1);
+  }
 
   // Verifier: the real SelfBackendVerifier (mock mode) in production; a stub in
   // tests. The stub is gated behind NODE_ENV=test AND SELF_GATE_STUB=1 so it can
@@ -816,6 +836,11 @@ app.get('/stats', (req, res) => {
     faucetGate:       IGNITION_CODES.size > 0 ? 'ignition-code' : 'CLOSED',
     usedCodes:        Object.keys(usedCodes).length,
     replayFenceSize:  Object.keys(seenSigs).length,
+    // degraded when a persistence write has failed and not since succeeded — surfaces a
+    // silent in-memory/disk divergence (e.g. a read-only/locked data file) that would
+    // otherwise leave /health green over a dead disk.
+    persistence:      lastSaveError ? 'degraded' : 'ok',
+    ...(lastSaveError ? { lastSaveError } : {}),
   });
 });
 

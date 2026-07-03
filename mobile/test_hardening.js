@@ -1,8 +1,9 @@
 // test_hardening.js — atomic fail-closed storage + crash-safe self-gate mint.
 // Every probe must pass; exit 0.
 //   1 ATOMICITY        (torn write → last GOOD state, never garbage/empty)
-//   2 FAIL-CLOSED      (corrupt→.bak; corrupt both→THROW / server REFUSES boot; first boot→clean)
-//   3 NO RE-MINT ON CORRUPTION  (a used nullifier can NEVER mint twice — Cowork WARN P2c, dead)
+//   2 FAIL-CLOSED      (corrupt→.bak; both→THROW / server REFUSES boot; null-shape + empty-wipe caught; first boot clean)
+//   3 NO RE-MINT ON CORRUPTION  (dual-.bak + union survive the last-seal window; auditSeals refuses a dropped seal;
+//                                LIVE reproduced attack yields no 2nd mint — Cowork WARN P2c, dead)
 //   4 CRASH REPAIR     (seal-without-mint → repairPending mints once, idempotent; standing 5; tip advances)
 //   5 ORDER            (seal-before-commit in claim(); a verifier failure mints/seals nothing)
 //   6 REGRESSION       (Self gate / Brick 1 / Brick 2 both bites / Phase 0–3 pass; no bare writeFileSync for the 3 stores)
@@ -31,7 +32,8 @@ function mockLedger() {
 }
 const memStorage = (init = {}) => { let map = { ...init }; return { load: () => map, save: (m) => { map = m; }, _get: () => map }; };
 // a real file-backed storage using safe_store (what the server uses)
-const fileStorage = (file) => ({ load: () => S.loadStrict(file, {}), save: (m) => S.saveAtomic(file, m) });
+// the EXACT production wiring for the nullifier set: union-load + dual-.bak write.
+const fileStorage = (file) => ({ load: () => S.loadUnion(file, {}), save: (m) => S.saveAtomicDual(file, m) });
 const W = (c) => 'M_' + c.repeat(32);
 
 // ── server boot harness (for the refuse-boot + crash-repair integration probes) ──
@@ -114,6 +116,13 @@ function runNode(file) { return new Promise((res) => { const c = spawn(process.e
     let shapeThrew = false; try { S.loadStrict(sd, {}); } catch { shapeThrew = true; }
     (shapeThrew) ? ok('null/primitive in BOTH main + .bak → THROWS (no silent reset via a parseable non-object)') : bad('null-shape both did not throw');
 
+    // a valid-but-EMPTY main while .bak holds data is a suspicious wipe → recover .bak
+    const ed = path.join(freshDir('emptywipe'), 'ledger.json');
+    S.saveAtomic(ed, [1, 2, 3]); S.saveAtomic(ed, [1, 2, 3, 4]);        // bak=[1,2,3]
+    fs.writeFileSync(ed, '[]');                                         // main externally reset to empty
+    const wipeRec = S.loadStrict(ed, []);
+    (Array.isArray(wipeRec) && wipeRec.length === 3) ? ok('empty [] main while .bak is non-empty → recovers .bak (never a silent wipe)') : bad(`empty-wipe not caught: ${JSON.stringify(wipeRec)}`);
+
     // nullifier store fails closed on corruption (does NOT reset to {})
     const nf = path.join(freshDir('nullstore'), 'self.json');
     S.saveAtomic(nf, { N1: W('A') }); S.saveAtomic(nf, { N1: W('A'), N2: W('B') });  // bak={N1}
@@ -131,34 +140,72 @@ function runNode(file) { return new Promise((res) => { const c = spawn(process.e
       : bad(`ledger refuse-boot failed: code=${res.code} out=${res.out.slice(-200)}`);
   }
 
-  // (3) NO RE-MINT ON CORRUPTION (Cowork WARN P2c)
+  // (3) NO RE-MINT ON CORRUPTION (Cowork WARN P2c) — the reviewer reproduced a 2nd mint
+  //     via the ".bak lags by one" window; dual-.bak + union-load + the auditSeals
+  //     backstop close it: a used nullifier survives single-copy corruption, and a
+  //     truly-lost seal REFUSES rather than silently re-mints.
   console.log('  (3) NO RE-MINT ON CORRUPTION');
   {
-    // .bak-restore branch: N is a non-last seal → recovered → re-claim rejected, no 2nd mint
+    // DUAL-.bak RECOVERY: the exact reviewer window — N2 is the LAST seal — now survives
     const d = freshDir('remint'); const f = path.join(d, 'self.json');
     const led = mockLedger();
-    const gate = SG.createSelfGate({ verify: () => Promise.resolve({ valid: true, nullifier: 'N' }), ledger: led, store: SG.createNullifierStore(fileStorage(f)) });
-    await gate.claim({}, W('A'));                                        // seal N → mint A   (file={N})
-    // a second, later seal so N lands in .bak
-    const gate2 = SG.createSelfGate({ verify: () => Promise.resolve({ valid: true, nullifier: 'M' }), ledger: led, store: SG.createNullifierStore(fileStorage(f)) });
-    await gate2.claim({}, W('B'));                                       // seal M → mint B   (file={N,M}, bak={N})
+    const g1 = SG.createSelfGate({ verify: () => Promise.resolve({ valid: true, nullifier: 'N1' }), ledger: led, store: SG.createNullifierStore(fileStorage(f)) });
+    await g1.claim({}, W('A'));                                          // seal N1 → mint A (main=bak={N1})
+    const g2 = SG.createSelfGate({ verify: () => Promise.resolve({ valid: true, nullifier: 'N2' }), ledger: led, store: SG.createNullifierStore(fileStorage(f)) });
+    await g2.claim({}, W('B'));                                          // seal N2 → mint B (main=bak={N1,N2})
     const mintsBefore = led._txs.length;
-    corrupt(f);                                                         // corrupt MAIN self store
-    const recovered = SG.createNullifierStore(fileStorage(f));          // loadStrict → recovers .bak={N}
-    const reclaimGate = SG.createSelfGate({ verify: () => Promise.resolve({ valid: true, nullifier: 'N' }), ledger: led, store: recovered });
-    const r = await reclaimGate.claim({}, W('C'));                      // re-present N with a NEW wallet C
-    (recovered.has('N') && !r.ok && r.code === 'nullifier-used' && led._txs.length === mintsBefore)
-      ? ok('.bak restores nullifier N after main-file corruption → re-claim REJECTED, no second mint')
-      : bad(`re-mint via bak-recovery: ${JSON.stringify({ hasN: recovered.has('N'), r, mints: led._txs.length, before: mintsBefore })}`);
+    corrupt(f);                                                         // corrupt MAIN only (the reviewer's trigger)
+    const recovered = SG.createNullifierStore(fileStorage(f));          // loadUnion → dual .bak still has N2
+    const reclaim = SG.createSelfGate({ verify: () => Promise.resolve({ valid: true, nullifier: 'N2' }), ledger: led, store: recovered });
+    const r = await reclaim.claim({}, W('C'));                          // re-present the LAST nullifier on a new wallet
+    (recovered.has('N2') && !r.ok && r.code === 'nullifier-used' && led._txs.length === mintsBefore)
+      ? ok('the LAST-sealed nullifier survives main-file corruption (dual-.bak + union) → re-claim REJECTED, no second mint')
+      : bad(`dual-bak re-mint hole: ${JSON.stringify({ hasN2: recovered.has('N2'), r, mints: led._txs.length, before: mintsBefore })}`);
 
-    // refuse branch: N is the ONLY seal (no .bak) → corrupt main → store load THROWS → gate cannot operate
-    const d2 = freshDir('remint2'); const f2 = path.join(d2, 'self.json');
-    const led2 = mockLedger();
-    const g = SG.createSelfGate({ verify: () => Promise.resolve({ valid: true, nullifier: 'N' }), ledger: led2, store: SG.createNullifierStore(fileStorage(f2)) });
-    await g.claim({}, W('A'));                                          // file={N}, no bak
-    corrupt(f2);
-    let refused = false; try { SG.createNullifierStore(fileStorage(f2)); } catch { refused = true; }
-    (refused) ? ok('no .bak yet → corrupt main → store load THROWS → the gate refuses to operate (N cannot re-mint)') : bad('single-seal corruption did not refuse');
+    // BOTH copies corrupt → union THROWS → the gate refuses (fail-closed, no re-mint)
+    corrupt(f + '.bak');
+    let refused = false; try { SG.createNullifierStore(fileStorage(f)); } catch { refused = true; }
+    (refused) ? ok('both copies corrupt → store load THROWS → gate refuses (a used nullifier can never re-mint)') : bad('corrupt-both did not refuse');
+
+    // auditSeals BACKSTOP (unit): a self_ignition mint with NO backing seal is an orphan
+    const led3 = mockLedger();
+    led3.commit({ from: 'FAUCET', to: W('Z'), amount: 1_000_000, reason: 'self_ignition' });  // minted, seal lost
+    const emptyStore = SG.createNullifierStore(memStorage());
+    const boundStore = SG.createNullifierStore(memStorage({ NZ: W('Z') }));
+    (SG.auditSeals(led3, emptyStore).includes(W('Z')) && SG.auditSeals(led3, boundStore).length === 0)
+      ? ok('auditSeals flags a minted-but-unsealed wallet (dropped seal) and passes when the binding is present')
+      : bad('auditSeals wrong');
+
+    // END-TO-END on the real server: the reviewer's exact attack now yields NO 2nd mint
+    const d2 = freshDir('remint_live');
+    const A = wallet('remint-A'); const Bw = wallet('remint-B'); const C = wallet('remint-C');
+    let s = bootLive(d2); await ready(s.BASE, s.logs);
+    await mintSelf(s.BASE, A.address, 'RN1');
+    await mintSelf(s.BASE, Bw.address, 'RN2');                          // RN2 is the last seal (main-only pre-dual; now dual)
+    const balB1 = (await getJSON(s.BASE, `/balance/${Bw.address}`)).balance;
+    await killChild(s.child);
+    corrupt(path.join(d2, 'self_nullifiers.json'));                    // corrupt MAIN self store only
+    s = bootLive(d2); await ready(s.BASE, s.logs);                      // reboot → union recovers RN2 from .bak
+    const reMint = await mintSelf(s.BASE, C.address, 'RN2');           // re-present RN2 on a fresh wallet
+    const balC = (await getJSON(s.BASE, `/balance/${C.address}`)).balance;
+    await killChild(s.child);
+    (balB1 === 1_000_000 && reMint.status === 409 && reMint.body.code === 'nullifier-used' && balC === 0)
+      ? ok('LIVE reproduced attack: corrupt-main + reboot + re-present last nullifier → 409, new wallet gets 0 (one human, one 1,000,000)')
+      : bad(`live re-mint: ${JSON.stringify({ balB1, reMint, balC })}`);
+
+    // auditSeals REFUSE-BOOT (live): a seal truly lost from BOTH copies while the mint
+    // persists → server refuses to boot rather than leave the nullifier re-mintable.
+    const d3 = freshDir('audit_refuse');
+    const Aw = wallet('audit-A');
+    let s2 = bootLive(d3); await ready(s2.BASE, s2.logs);
+    await mintSelf(s2.BASE, Aw.address, 'AUD1');                        // ledger: self_ignition → Aw; store {AUD1:Aw}
+    await killChild(s2.child);
+    const sf = path.join(d3, 'self_nullifiers.json');
+    fs.writeFileSync(sf, '{}'); fs.writeFileSync(sf + '.bak', '{}');    // seal wiped from BOTH copies (mint remains)
+    const refuseRes = await bootExpectExit(d3);
+    (refuseRes.code !== 0 && refuseRes.code !== 'TIMEOUT' && /no nullifier seal/i.test(refuseRes.out))
+      ? ok(`minted wallet with its seal wiped from both copies → server REFUSES to boot (exit ${refuseRes.code}) — never leaves a nullifier re-mintable`)
+      : bad(`auditSeals refuse-boot failed: code=${refuseRes.code} out=${refuseRes.out.slice(-200)}`);
   }
 
   // (4) CRASH REPAIR

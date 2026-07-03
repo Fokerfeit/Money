@@ -150,6 +150,24 @@ function repairPending(ledger, store, { amount = MINT_AMOUNT, now = () => Date.n
   return repaired;
 }
 
+// ── auditSeals: the HUMAN-keyed backstop against a dropped seal ───────────────
+// The per-mint check (ledger.isIgnited) is per-WALLET, so a nullifier whose seal was
+// LOST (corruption, a stale-.bak recovery) could mint AGAIN to a fresh wallet. The
+// durable money record catches it: every self_ignition FAUCET mint MUST have a
+// nullifier binding pointing at it. A minted wallet with NO backing seal means a seal
+// was dropped → that nullifier is silently re-mintable. Returns the orphan wallets;
+// the caller REFUSES to enable the gate rather than proceed (fail-closed, not re-mint).
+function auditSeals(ledger, store) {
+  if (!ledger || typeof ledger.all !== 'function' || !store || typeof store.entries !== 'function') return [];
+  const sealedWallets = new Set(store.entries().map(([, w]) => w));
+  const orphans = [];
+  for (const t of ledger.all()) {
+    if (t && t.from === 'FAUCET' && t.reason === 'self_ignition' && !sealedWallets.has(t.to) && !orphans.includes(t.to))
+      orphans.push(t.to);
+  }
+  return orphans;   // minted-but-unsealed self_ignition wallets → a seal was lost
+}
+
 // ── Production verifier (LAZY — @selfxyz/core loaded only when the gate runs) ──
 // Wraps SelfBackendVerifier in MOCK mode (mockPassport=true → staging/testnet,
 // per the Self docs: older <1.1.0-beta.1 used the wrong network for mock).
@@ -190,4 +208,4 @@ function realSelfVerifier(config = {}) {
   };
 }
 
-module.exports = { createSelfGate, createNullifierStore, realSelfVerifier, repairPending, MINT_AMOUNT, WALLET_RE };
+module.exports = { createSelfGate, createNullifierStore, realSelfVerifier, repairPending, auditSeals, MINT_AMOUNT, WALLET_RE };

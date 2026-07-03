@@ -1,66 +1,113 @@
-// mobile/safe_store.js — atomic, fail-CLOSED JSON persistence.
+// mobile/safe_store.js — atomic, durable, fail-CLOSED JSON persistence.
 //
 // Replaces the fail-OPEN pattern (write-in-place; on any read error silently return
-// {} / []). Two failure classes that pattern caused:
-//   • a torn/interrupted write left a half-written file → next boot read garbage or,
-//     worse, reset the store to empty (a silently-empty ledger wipes every balance);
-//   • a corrupt store looked identical to a first boot → silent reset (which, for the
-//     nullifier store, freed a used nullifier to mint a SECOND time).
+// {} / []). Failure classes that pattern caused: a torn write left garbage or an
+// empty store (a silently-empty ledger wipes every balance); a corrupt store looked
+// like a first boot → silent reset (which, for the nullifier store, freed a used
+// nullifier to mint a SECOND time).
 //
-// saveAtomic writes a sidecar then atomically renames it over the target, keeping the
-// previous good copy as .bak. loadStrict returns the fallback ONLY for a genuine first
-// boot; a corrupt store with no recoverable backup THROWS rather than silently reset.
+// GUARANTEES
+//   • ATOMIC   : the main file is never a half-written state — write .tmp, fsync it,
+//                rename over the target, fsync the directory. A reader always sees the
+//                old-complete or new-complete file; a leftover .tmp is ignored.
+//   • DURABLE  : fsync of the file AND the containing directory before returning, so a
+//                rename that returned survives power-loss (best-effort on platforms
+//                where directory fsync is unsupported).
+//   • FAIL-CLOSED: loadStrict/loadUnion return the fallback ONLY on a genuine first
+//                boot; a corrupt store with no recoverable backup THROWS. A file that
+//                parses to a non-object, or an EMPTY main while a non-empty .bak
+//                exists, is treated as corruption — never a silent reset.
+//   • APPEND-ONLY SETS: saveAtomicDual + loadUnion keep the nullifier/codes sets safe
+//                even against the classic ".bak lags by one" re-mint window — .bak
+//                carries the NEW content (never lags), and load UNIONS both copies, so
+//                a used key present in EITHER copy is never dropped.
 'use strict';
 
 const fs = require('fs');
+const path = require('path');
 
 const isParseable = (text) => {
   if (text == null) return false;
   try { JSON.parse(text); return true; } catch { return false; }
 };
 
-// saveAtomic(file, data): stage `.tmp` → preserve current-good as `.bak` → atomic
-// rename `.tmp`→file. THROWS on I/O failure so callers can surface it (the server's
-// saveJSON wrapper swallows+logs to stay up; the committee persist re-throws with
-// context). The rename is the guarantee: the main file is NEVER a half-written state
-// — a reader always sees either the old complete file or the new complete file.
-function saveAtomic(file, data) {
+// write `data` to `p` and fsync the file descriptor before returning (durability).
+function writeFsync(p, data) {
+  const fd = fs.openSync(p, 'w');
+  try { fs.writeSync(fd, data); try { fs.fsyncSync(fd); } catch { /* fsync unsupported → best effort */ } }
+  finally { fs.closeSync(fd); }
+}
+// fsync a path best-effort (a rename is only durable once the DIRECTORY entry is flushed).
+function fsyncPath(p) {
+  let fd;
+  try { fd = fs.openSync(p, fs.existsSync(p) && fs.statSync(p).isDirectory() ? 'r' : 'r+'); fs.fsyncSync(fd); }
+  catch { /* directory fsync unsupported on some platforms (e.g. Windows) → best effort */ }
+  finally { if (fd !== undefined) { try { fs.closeSync(fd); } catch {} } }
+}
+
+// saveAtomic(file, data, {dualBak}): stage .tmp (fsync'd) → preserve a .bak → atomic
+// rename → fsync the directory. dualBak=false (default): .bak is the PREVIOUS good main
+// (rollback semantics). dualBak=true (append-only sets): .bak is the NEW content, so it
+// never lags the main — a single-copy corruption always leaves the full set in the other.
+function saveAtomic(file, data, { dualBak = false } = {}) {
   const json = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
   const tmp = file + '.tmp';
   const bak = file + '.bak';
-  fs.writeFileSync(tmp, json);                       // 1) stage the new bytes in a sidecar
-  try {                                              // 2) preserve the current file as .bak — ONLY if it is
-    if (fs.existsSync(file)) {                       //    currently valid, so a torn/corrupt main file can never
-      const cur = fs.readFileSync(file, 'utf8');     //    overwrite a known-good backup
-      if (isParseable(cur)) fs.copyFileSync(file, bak);
+  writeFsync(tmp, json);                              // 1) stage the new bytes + flush
+  try {
+    if (dualBak) {
+      fs.copyFileSync(tmp, bak); fsyncPath(bak);      // 2a) .bak := NEW content (never lags)
+    } else if (fs.existsSync(file)) {                 // 2b) .bak := current good main, ONLY if valid
+      const cur = fs.readFileSync(file, 'utf8');
+      if (isParseable(cur)) { fs.copyFileSync(file, bak); fsyncPath(bak); }
     }
   } catch { /* backup is best-effort; the atomic rename below is the real guarantee */ }
-  fs.renameSync(tmp, file);                          // 3) atomic replace (POSIX rename / NTFS MoveFileEx-replace)
+  fs.renameSync(tmp, file);                           // 3) atomic replace
+  fsyncPath(path.dirname(file));                      // 4) make the rename durable
 }
+const saveAtomicDual = (file, data) => saveAtomic(file, data, { dualBak: true });
+
+// parse a file to a non-null object/array, or undefined (missing/unreadable/wrong-shape).
+// A top-level null/number/string/bool is treated as corruption (not a valid store).
+function readObjOrArr(p) {
+  try { const v = JSON.parse(fs.readFileSync(p, 'utf8')); return (v !== null && typeof v === 'object') ? v : undefined; }
+  catch { return undefined; }
+}
+const isEmpty = (v) => v !== undefined && (Array.isArray(v) ? v.length === 0 : Object.keys(v).length === 0);
 
 // loadStrict(file, fallback): fail-CLOSED.
-//   • no file AND no .bak            → fallback   (genuine first boot — nothing was ever written)
-//   • main parses                    → main
-//   • main missing/unparseable, .bak parses → .bak   (recover from the last good copy)
-//   • BOTH unparseable               → THROW      (refuse to silently reset a store that held data)
-// A leftover garbage `.tmp` is ignored entirely (an interrupted write that never
-// completed the rename), so a torn write can never surface as data.
+//   • no file AND no .bak                     → fallback (genuine first boot)
+//   • main parses (object/array) & not a wipe → main
+//   • main missing/unparseable/wipe, .bak ok  → .bak
+//   • BOTH unreadable                         → THROW
+// "wipe" = main is EMPTY while .bak is NON-empty (main was reset externally) → prefer .bak.
 function loadStrict(file, fallback) {
   const bak = file + '.bak';
   const hasFile = fs.existsSync(file);
   const hasBak  = fs.existsSync(bak);
   if (!hasFile && !hasBak) return fallback;          // pristine first boot
-  // A valid store is a JSON object or array. Content that parses to a top-level
-  // null/number/string/bool is treated as CORRUPTION (not returned), so a file of
-  // literal `null` can never slip past as a silent reset. readOne returns undefined
-  // for missing/unreadable/wrong-shape, so the caller falls through to .bak / throw.
-  const readOne = (p) => {
-    try { const v = JSON.parse(fs.readFileSync(p, 'utf8')); return (v !== null && typeof v === 'object') ? v : undefined; }
-    catch { return undefined; }
-  };
-  if (hasFile) { const v = readOne(file); if (v !== undefined) return v; }
-  if (hasBak)  { const v = readOne(bak);  if (v !== undefined) return v; }
+  const mv = hasFile ? readObjOrArr(file) : undefined;
+  const bv = hasBak  ? readObjOrArr(bak)  : undefined;
+  // prefer a valid main UNLESS it is empty while .bak holds data (a suspicious wipe).
+  if (mv !== undefined && !(isEmpty(mv) && bv !== undefined && !isEmpty(bv))) return mv;
+  if (bv !== undefined) return bv;
   throw new Error(`safe_store: "${file}" is unreadable/malformed and no valid backup exists — refusing to silently reset (fail-closed).`);
 }
 
-module.exports = { saveAtomic, loadStrict, isParseable };
+// loadUnion(file, fallback): for APPEND-ONLY OBJECT stores (nullifier, codes). UNIONS
+// main + .bak so a key present in EITHER copy survives — closing the ".bak lags by one"
+// re-mint window. First boot → fallback; both unreadable → THROW (fail-closed).
+function loadUnion(file, fallback) {
+  const bak = file + '.bak';
+  const hasFile = fs.existsSync(file);
+  const hasBak  = fs.existsSync(bak);
+  if (!hasFile && !hasBak) return fallback;
+  const readObj = (p) => { const v = readObjOrArr(p); return (v !== undefined && !Array.isArray(v)) ? v : undefined; };
+  const a = hasFile ? readObj(file) : undefined;
+  const b = hasBak  ? readObj(bak)  : undefined;
+  if (a === undefined && b === undefined)
+    throw new Error(`safe_store: "${file}" and its .bak are both unreadable — refusing to silently reset (fail-closed).`);
+  return { ...(b || {}), ...(a || {}) };             // union; main overrides .bak on conflict (identical value for append-only)
+}
+
+module.exports = { saveAtomic, saveAtomicDual, loadStrict, loadUnion, isParseable };
