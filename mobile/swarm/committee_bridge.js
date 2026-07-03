@@ -59,11 +59,12 @@ function hashSeed(label) {
 }
 
 // central balance = server.js getBalance's EXACT formula — credits − debits over the
-// committed MONEY tx set. This matches the authoritative central balance FOR THE TXS
-// CENTRAL ACCEPTS; the cap/validation gate that decides WHICH txs commit is a
-// separate brick (see SCOPE), so feed this only txs central would commit.
+// committed MONEY tx set, with a self-tx (from===to) netted to zero (kept byte-identical
+// to central so the mirror can never drift). This matches the authoritative central
+// balance FOR THE TXS CENTRAL ACCEPTS; the cap/validation gate that decides WHICH txs
+// commit is a separate brick (see SCOPE), so feed this only txs central would commit.
 function centralBalanceOf(txs, addr) {
-  return txs.reduce((b, t) => (t.to === addr ? b + t.amount : t.from === addr ? b - t.amount : b), 0);
+  return txs.reduce((b, t) => (t.from === t.to ? b : t.to === addr ? b + t.amount : t.from === addr ? b - t.amount : b), 0);
 }
 
 // ── BRICK 2 (Bite 2): the STANDING movement cap, computed IDENTICALLY to central ──
