@@ -50,13 +50,17 @@ function loadStrict(file, fallback) {
   const hasFile = fs.existsSync(file);
   const hasBak  = fs.existsSync(bak);
   if (!hasFile && !hasBak) return fallback;          // pristine first boot
-  if (hasFile) {
-    try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { /* fall through to .bak */ }
-  }
-  if (hasBak) {
-    try { return JSON.parse(fs.readFileSync(bak, 'utf8')); } catch { /* fall through to throw */ }
-  }
-  throw new Error(`safe_store: "${file}" is unreadable and no valid backup exists — refusing to silently reset (fail-closed).`);
+  // A valid store is a JSON object or array. Content that parses to a top-level
+  // null/number/string/bool is treated as CORRUPTION (not returned), so a file of
+  // literal `null` can never slip past as a silent reset. readOne returns undefined
+  // for missing/unreadable/wrong-shape, so the caller falls through to .bak / throw.
+  const readOne = (p) => {
+    try { const v = JSON.parse(fs.readFileSync(p, 'utf8')); return (v !== null && typeof v === 'object') ? v : undefined; }
+    catch { return undefined; }
+  };
+  if (hasFile) { const v = readOne(file); if (v !== undefined) return v; }
+  if (hasBak)  { const v = readOne(bak);  if (v !== undefined) return v; }
+  throw new Error(`safe_store: "${file}" is unreadable/malformed and no valid backup exists — refusing to silently reset (fail-closed).`);
 }
 
 module.exports = { saveAtomic, loadStrict, isParseable };

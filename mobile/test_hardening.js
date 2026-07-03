@@ -103,6 +103,17 @@ function runNode(file) { return new Promise((res) => { const c = spawn(process.e
     const fresh = path.join(freshDir('firstboot'), 'nope.json');
     (JSON.stringify(S.loadStrict(fresh, [])) === '[]') ? ok('first boot (no file, no .bak) → clean fallback []') : bad('first boot fallback wrong');
 
+    // a file that PARSES but to a non-object (literal null / primitive) is corruption,
+    // NOT a first boot — must not slip past as a silent reset.
+    const sd = path.join(freshDir('shape'), 'store.json');
+    S.saveAtomic(sd, { keep: 'X' }); S.saveAtomic(sd, { keep: 'Y' });   // bak={X}
+    fs.writeFileSync(sd, 'null');                                       // parses to null (not garbage)
+    const shapeRec = S.loadStrict(sd, null);
+    (shapeRec && shapeRec.keep === 'X') ? ok('a file of literal `null` is treated as corruption → recovers .bak, never a silent {}') : bad(`null-shape not caught: ${JSON.stringify(shapeRec)}`);
+    fs.writeFileSync(sd + '.bak', '12345');                             // both non-object now
+    let shapeThrew = false; try { S.loadStrict(sd, {}); } catch { shapeThrew = true; }
+    (shapeThrew) ? ok('null/primitive in BOTH main + .bak → THROWS (no silent reset via a parseable non-object)') : bad('null-shape both did not throw');
+
     // nullifier store fails closed on corruption (does NOT reset to {})
     const nf = path.join(freshDir('nullstore'), 'self.json');
     S.saveAtomic(nf, { N1: W('A') }); S.saveAtomic(nf, { N1: W('A'), N2: W('B') });  // bak={N1}
