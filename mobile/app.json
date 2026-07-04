@@ -22,7 +22,7 @@
         "backgroundColor": "#0a0a0a"
       },
       "package": "com.fokerfeit.money",
-      "versionCode": 10,
+      "versionCode": 12,
       "edgeToEdgeEnabled": true,
       "permissions": []
     },

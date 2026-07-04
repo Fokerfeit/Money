@@ -697,43 +697,46 @@ function AppInner() {
     })();
   }, []);
 
-  // ── Load / create wallet ──────────────────────────────────────────────
-  // SecureStore = Android Keystore-backed encrypted storage.
-  // Key never lives in a plain SQLite file — Gap 2 closed.
-  useEffect(() => {
-    (async () => {
-      try {
-        // 1. Try SecureStore (new, secure path)
-        let raw = await SecureStore.getItemAsync('keypair_v3');
+  // ── Per-network wallet storage ─────────────────────────────────────────
+  // SecureStore = Android Keystore-backed encrypted storage. Key never lives in
+  // a plain SQLite file — Gap 2 closed.
+  //
+  // Each network has its OWN wallet, keyed by network name — a testnet wallet
+  // must NEVER appear on mainnet and vice-versa. `walletKey('mainnet')` and
+  // `walletKey('testnet')` are fully independent SecureStore slots.
+  const walletKey = (net) => `keypair_v3_${net}`;
 
-        // 2. One-time migration: if old AsyncStorage key exists, move it over
-        if (!raw) {
-          const legacy = await AsyncStorage.getItem('keypair_v2');
-          if (legacy) {
-            await SecureStore.setItemAsync('keypair_v3', legacy);
-            await AsyncStorage.removeItem('keypair_v2'); // wipe plaintext copy
-            raw = legacy;
-          }
-        }
+  const applyWalletToState = (kp) => {
+    setAddress(kp.address);
+    addrRef.current   = kp.address;
+    pubKeyRef.current = kp.publicKey;
+    secKeyRef.current = kp.secretKey;
+  };
 
-        // 3. First-ever install: generate and store
-        let kp = raw ? JSON.parse(raw) : createKeypair();
-        if (!raw) await SecureStore.setItemAsync('keypair_v3', JSON.stringify(kp));
+  const saveWallet = async (net, kp) => {
+    await SecureStore.setItemAsync(walletKey(net), JSON.stringify(kp)).catch(() => {});
+  };
 
-        setAddress(kp.address);
-        addrRef.current   = kp.address;
-        pubKeyRef.current = kp.publicKey;
-        secKeyRef.current = kp.secretKey;
-      } catch {
-        // Fallback: keep in memory only (lost on restart, but won't crash)
-        const kp = createKeypair();
-        setAddress(kp.address);
-        addrRef.current   = kp.address;
-        pubKeyRef.current = kp.publicKey;
-        secKeyRef.current = kp.secretKey;
+  // Loads the wallet for `net`, or forges + persists a new one if this network
+  // has never had one. MAINNET-ONLY: migrates an existing user's wallet from
+  // the old, un-namespaced keys (pre-dating per-network storage) — testnet has
+  // no legacy data since it never existed before.
+  const loadOrCreateWallet = async (net) => {
+    let raw = await SecureStore.getItemAsync(walletKey(net)).catch(() => null);
+
+    if (!raw && net === 'mainnet') {
+      let legacy = await SecureStore.getItemAsync('keypair_v3').catch(() => null);
+      if (!legacy) {
+        const legacyAsync = await AsyncStorage.getItem('keypair_v2').catch(() => null);
+        if (legacyAsync) { legacy = legacyAsync; await AsyncStorage.removeItem('keypair_v2').catch(() => {}); }
       }
-    })();
-  }, []);
+      if (legacy) { raw = legacy; await saveWallet(net, JSON.parse(legacy)); }
+    }
+
+    const kp = raw ? JSON.parse(raw) : createKeypair();
+    if (!raw) await saveWallet(net, kp);   // first time on this network — forge + persist
+    return kp;
+  };
 
   // ── Sync ledger ───────────────────────────────────────────────────────
   const sync = async () => {
@@ -759,24 +762,35 @@ function AppInner() {
     } catch {}
   };
 
-  // ── Network toggle — mainnet ⇄ testnet ──────────────────────────────────
-  // Restore a persisted choice at startup (independent of the address-load
-  // effect above — order doesn't matter: whichever finishes second re-syncs
-  // against the correct URL, so this is correct regardless of interleaving).
+  // ── Network + wallet — resolve the active network FIRST, then load (or
+  // forge) THAT network's wallet. A single sequential effect — not two racing
+  // mount effects — so the very first wallet loaded is always the one for the
+  // persisted network, never a transient mainnet default.
   useEffect(() => {
     (async () => {
-      await loadNetwork(AsyncStorage);
-      setNetworkState(getNetwork());
-      if (addrRef.current) sync();
+      try {
+        await loadNetwork(AsyncStorage);
+        const net = getNetwork();
+        setNetworkState(net);
+        const kp = await loadOrCreateWallet(net);
+        applyWalletToState(kp);
+      } catch {
+        // Fallback: keep in memory only (lost on restart, but won't crash)
+        applyWalletToState(createKeypair());
+      }
     })();
   }, []);
 
   // Switch networks: persist the choice, flip BACKEND_URL immediately (every
-  // existing fetch call site reads it live), then reload data from the new URL.
+  // existing fetch call site reads it live), load (or forge) THAT network's
+  // own wallet — never carrying the old network's identity across — then
+  // reload data from the new URL.
   const toggleNetwork = async () => {
     const next = network === 'mainnet' ? 'testnet' : 'mainnet';
     await setNetwork(next, AsyncStorage);
     setNetworkState(next);
+    const kp = await loadOrCreateWallet(next);
+    applyWalletToState(kp);
     await sync();
   };
 
@@ -2131,11 +2145,8 @@ function AppInner() {
   const applyRestore = async () => {
     if (!restorePreview) return;
     const kp = restorePreview;
-    try { await SecureStore.setItemAsync('keypair_v3', JSON.stringify(kp)); } catch {}
-    setAddress(kp.address);
-    addrRef.current   = kp.address;
-    pubKeyRef.current = kp.publicKey;
-    secKeyRef.current = kp.secretKey;
+    await saveWallet(network, kp);   // restores into the CURRENTLY ACTIVE network's slot only
+    applyWalletToState(kp);
     // A restored wallet already exists on the ledger — mark this device sealed +
     // ignited so the user lands in the wallet now AND stays there on future
     // launches (re-auth then uses the device fingerprint/PIN, same as a normal seal).
@@ -2463,13 +2474,37 @@ function AppInner() {
 
         {/* CLAIM */}
         {!claimed && (
-          <AnimatedPress style={[s.btnSage, glassButton]} onPress={claim}>
-            <View style={{ flexDirection:'row', alignItems:'center', justifyContent:'center', flexWrap:'wrap', gap: 4 }}>
-              <Text style={s.btnText}>RECEIVE YOUR FOUNDING SHARE —</Text>
-              <MoneySymbol size={14} color="#160B00" style={{ marginTop: 1 }} />
-              <Text style={s.btnText}>{isMillion ? ' 1,000,000' : ` ${Number(reward).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}</Text>
+          <>
+            {/* Invite (ignition) code — the server's one-per-human faucet gate.
+                Reachable here whenever this wallet hasn't claimed yet (e.g. right
+                after switching to a fresh network's wallet), not just during
+                first-time onboarding. */}
+            <View style={{ width: '100%', marginBottom: 10, paddingHorizontal: 16 }}>
+              <Text style={{ color: '#9A7B4A', fontSize: 11, letterSpacing: 3, textAlign: 'center', marginBottom: 8 }}>
+                ✦ INVITE CODE
+              </Text>
+              <TextInput
+                value={ignitionCode}
+                onChangeText={setIgnitionCode}
+                placeholder="enter your invite code"
+                placeholderTextColor="#5A3D1A"
+                autoCapitalize="characters"
+                autoCorrect={false}
+                style={{
+                  backgroundColor: 'rgba(28,17,4,0.6)', borderWidth: 1, borderColor: 'rgba(212,175,55,0.35)',
+                  borderRadius: 12, paddingVertical: 12, paddingHorizontal: 16, color: '#F1E2C0',
+                  fontSize: 15, letterSpacing: 2, textAlign: 'center',
+                }}
+              />
             </View>
-          </AnimatedPress>
+            <AnimatedPress style={[s.btnSage, glassButton]} onPress={claim}>
+              <View style={{ flexDirection:'row', alignItems:'center', justifyContent:'center', flexWrap:'wrap', gap: 4 }}>
+                <Text style={s.btnText}>RECEIVE YOUR FOUNDING SHARE —</Text>
+                <MoneySymbol size={14} color="#160B00" style={{ marginTop: 1 }} />
+                <Text style={s.btnText}>{isMillion ? ' 1,000,000' : ` ${Number(reward).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}</Text>
+              </View>
+            </AnimatedPress>
+          </>
         )}
         {claimed && (
           <View style={[s.btnSage, s.btnDone]}>
