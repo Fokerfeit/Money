@@ -74,7 +74,7 @@ const authenticator = {
   generate:  (secret) => _totpAt(secret, Math.floor(Date.now()/1000/30)),
   check: (token, secret) => [-1,0,1].some(d => _totpAt(secret, Math.floor(Date.now()/1000/30)+d) === String(token).padStart(6,'0')),
 };
-import { BACKEND_URL, BASE_PENALTY, DISCONNECT_GRACE_MS, RESERVE_ADDRESS } from './config';
+import { BACKEND_URL, BASE_PENALTY, DISCONNECT_GRACE_MS, RESERVE_ADDRESS, getNetwork, isTestnet, setNetwork, loadNetwork } from './config';
 import MoneySymbol from './MoneySymbol';
 import {
   SealMedallion, GoldCoin, IgnitedCoin, ForgeHammerSVG, AnvilSVG, ForgeSparks,
@@ -465,6 +465,9 @@ function AppInner() {
   const [recipient, setRecipient] = useState('');
   const [amount,    setAmount]    = useState('');
 
+  // Network toggle — mainnet ⇄ testnet, no rebuild required (config.js).
+  const [network, setNetworkState] = useState(getNetwork());
+
   // Wallet backup / restore (key recovery)
   const [seedInput,      setSeedInput]      = useState('');   // recovery key typed on Restore screen
   const [restorePreview, setRestorePreview] = useState(null); // { address, publicKey, secretKey } once a valid key is checked
@@ -754,6 +757,27 @@ function AppInner() {
         t.to === addr ? b + t.amount : t.from === addr ? b - t.amount : b, 0);
       setBalance(Math.max(0, parseFloat(bal.toFixed(2))));
     } catch {}
+  };
+
+  // ── Network toggle — mainnet ⇄ testnet ──────────────────────────────────
+  // Restore a persisted choice at startup (independent of the address-load
+  // effect above — order doesn't matter: whichever finishes second re-syncs
+  // against the correct URL, so this is correct regardless of interleaving).
+  useEffect(() => {
+    (async () => {
+      await loadNetwork(AsyncStorage);
+      setNetworkState(getNetwork());
+      if (addrRef.current) sync();
+    })();
+  }, []);
+
+  // Switch networks: persist the choice, flip BACKEND_URL immediately (every
+  // existing fetch call site reads it live), then reload data from the new URL.
+  const toggleNetwork = async () => {
+    const next = network === 'mainnet' ? 'testnet' : 'mainnet';
+    await setNetwork(next, AsyncStorage);
+    setNetworkState(next);
+    await sync();
   };
 
   useEffect(() => {
@@ -2339,6 +2363,12 @@ function AppInner() {
       </Modal>
 
       <ScrollView contentContainerStyle={s.scroll}>
+        {/* TESTNET BANNER — unmistakable, only rendered on testnet, nothing shown on mainnet */}
+        {network === 'testnet' && (
+          <View style={s.testnetBanner}>
+            <Text style={s.testnetBannerText}>🧪 TESTNET MODE — this is NOT real MONEY</Text>
+          </View>
+        )}
         {/* HEADER */}
         <View nativeID="app-header" style={s.header}>
           {/* Native: pulsing clock-ring logo with pulse rings
@@ -2363,6 +2393,16 @@ function AppInner() {
           {bioKeyActive && (
             <View style={s.sealBadge}><Text style={s.sealBadgeText}>🔐 SEAL ACTIVE</Text></View>
           )}
+          {/* Network toggle — tap to switch mainnet ⇄ testnet, no rebuild required */}
+          <TouchableOpacity
+            style={[s.networkBadge, network === 'testnet' && s.networkBadgeTestnet]}
+            onPress={toggleNetwork}
+            activeOpacity={0.7}
+          >
+            <Text style={s.networkBadgeText}>
+              {network === 'testnet' ? '🧪 TESTNET · tap for Mainnet' : '🌐 MAINNET · tap for Testnet'}
+            </Text>
+          </TouchableOpacity>
           {userCount === 0 ? (
             <View style={{ flexDirection:'row', flexWrap:'wrap', alignItems:'center', justifyContent:'center', paddingHorizontal: 8 }}>
               <Text style={s.stat}>Be the first — claim your founding share of </Text>
@@ -2562,6 +2602,20 @@ const s = StyleSheet.create({
     borderRadius: 20, paddingHorizontal: 14, paddingVertical: 5, marginBottom: 10,
   },
   sealBadgeText: { color: '#D4AF37', fontSize: 11, fontWeight: 'bold', letterSpacing: 2 },
+
+  // ── Network toggle (mainnet ⇄ testnet) ──────────────────────────────────
+  networkBadge: {
+    backgroundColor: 'rgba(42,21,8,0.8)', borderWidth: 1, borderColor: 'rgba(125,184,122,0.4)',
+    borderRadius: 20, paddingHorizontal: 14, paddingVertical: 5, marginBottom: 10,
+  },
+  networkBadgeTestnet: { borderColor: 'rgba(230,160,40,0.7)', backgroundColor: 'rgba(60,38,4,0.85)' },
+  networkBadgeText:    { color: '#7DB87A', fontSize: 11, fontWeight: 'bold', letterSpacing: 1 },
+  // Unmistakable — high-contrast, full-width, always the first thing visible on testnet.
+  testnetBanner: {
+    backgroundColor: '#E6A028', paddingVertical: 8, paddingHorizontal: 12,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  testnetBannerText: { color: '#1A0A00', fontSize: 13, fontWeight: 'bold', letterSpacing: 0.5, textAlign: 'center' },
 
   // ── Glass cards ──────────────────────────────────────────────────────────
   card: {
