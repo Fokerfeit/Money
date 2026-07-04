@@ -6,103 +6,111 @@
 <p align="center"><em>Proof of Swarm — Money. For Everyone. Forever.</em></p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/status-building-gold?style=flat-square"/>
-  <img src="https://img.shields.io/badge/validation-Proof%20of%20Swarm-green?style=flat-square"/>
+  <img src="https://img.shields.io/badge/status-testnet%20live-gold?style=flat-square"/>
   <img src="https://img.shields.io/badge/pre--mine-NONE-red?style=flat-square"/>
   <img src="https://img.shields.io/badge/CEO-NONE-red?style=flat-square"/>
+  <img src="https://img.shields.io/badge/ledger-tamper--evident-green?style=flat-square"/>
+  <img src="https://img.shields.io/badge/built%20by-one%20person-blue?style=flat-square"/>
 </p>
 
 ---
 
 ## What is MONEY?
 
-MONEY is a decentralized digital currency validated by smartphones — not mining rigs, not data centers, not banks.
+MONEY is a decentralized digital currency where **every human gets the same amount** — validated by ordinary phones, not mining rigs, data centers, or banks.
 
-No pre-mine. No CEO. No central authority. Just people and their phones.
-
-The validation model is called **Proof of Swarm**: a peer-to-peer network where every participant's device acts as a node. The more people join, the stronger and more distributed the network becomes. Think Pi Network's accessibility meets Kaspa's DAG speed architecture — then improved on both.
+**No pre-mine. No CEO. No investors. No mining.** One human, one equal share, verified by math — not by who showed up first or who owns the most hardware.
 
 > *"The money of the future should belong to the people of the future."*
 
 ---
 
-## How It Works
+## Why it's different
+
+Most "fair launch" coins aren't. Early insiders farm huge amounts before anyone else arrives, then call it fair. MONEY removes that entirely:
+
+- 🎁 **Flat distribution** — every verified human receives the same allocation. Being early gives you no unfair advantage.
+- 🧬 **Proof of personhood** — one human = one identity, proven with zero-knowledge (nothing stored, nothing revealed). No Sybil farming.
+- ⛏️ **Not mined** — you can't earn more by owning more machines. The thing that makes other coins unfair simply doesn't exist here.
+- 🧾 **Tamper-evident ledger** — the entire history is cryptographically sealed. Anyone can verify it's untouched without trusting the operator.
+
+---
+
+## What actually works today (honest status)
+
+This is a solo project in active development. Here's the real state — nothing oversold:
+
+| Component | Status |
+|---|---|
+| 🧾 Tamper-evident ledger (hash-linked + Merkle + verifiable tip) | ✅ built & independently audited |
+| 🛂 Proof-of-personhood ignition gate (zk, nothing stored) | ✅ built & audited (mock mode) |
+| 🏛️ Byzantine-fault-tolerant committee validation | ✅ built & audited (single-process) |
+| ⚖️ Standing-based movement cap (anti-abuse) | ✅ built & audited |
+| 🧪 Public testnet | ✅ live |
+| 🌐 Real multi-node network (phones as validators) | 🔨 in progress |
+| 🚀 Mainnet launch | ⏳ pending audit + regulatory review |
+
+Every core component above was built, then **attacked by an independent adversarial auditor** before being accepted. This isn't a whitepaper promise — the code exists and survived being broken on purpose.
+
+---
+
+## How it works
 
 ### Proof of Swarm
-Each smartphone that joins the network becomes a validator node. Transactions are confirmed by the swarm — no single point of failure, no gatekeepers.
+Phones act as validator nodes. Transactions are confirmed by a committee of the swarm using Byzantine-fault-tolerant consensus — it stays correct even if some validators lie or go offline. No single point of failure, no gatekeeper.
 
-### Faucet & Decay Model
-New users claim an initial allocation through the faucet. The reward decays as the network grows:
+### One human, one share
+To claim your allocation you prove you're a unique human (zero-knowledge — no document or biometric is ever stored). That's the whole gate. No invite codes handed out by a founder, no "who you know."
 
-| Network Size | New User Reward |
+### Faucet & decay
+New humans claim an initial allocation. The base amount decays as the network grows, so the total supply self-regulates — but **everyone joining at the same stage gets exactly the same amount.** This is not mining: you cannot earn more by contributing more resources.
+
+| Network size | Reward per human |
 |---|---|
-| 0 – 1M users | 1,000,000 MONEY |
-| 1M – 2M users | 800,000 MONEY |
-| 2M – 3M users | 640,000 MONEY |
-| 3M+ users | Continues decaying at 20% per million |
+| 0 – 1M | 1,000,000 |
+| 1M – 2M | 800,000 |
+| 2M – 3M | 640,000 |
+| 3M+ | −20% per additional million |
 
-Early adopters are rewarded. The supply is self-regulating. No one prints money out of thin air.
-
-### Clay Tablet Ledger
-Every transaction is recorded on a public ledger — transparent, permanent, and verifiable by anyone. Inspired by the oldest record-keeping system in human history.
-
-### DAG Architecture (in progress)
-Transactions are structured as a Directed Acyclic Graph (DAG), enabling high throughput without traditional blockchain bottlenecks. Reference model: Kaspa.
+### Tamper-evident ledger
+Every block is hash-linked to the last, with a Merkle root over its transactions and a single **tip hash** that fingerprints the entire history. Change anything, anywhere, ever → the tip changes → it's caught. Anyone can verify the whole chain without trusting anyone.
 
 ---
 
-## Current Stack
+## Stack
 
-| Layer | Technology |
+| Layer | Tech |
 |---|---|
-| Mobile App | React Native + Expo 54 |
+| Mobile | React Native + Expo |
 | Backend | Node.js + Express |
-| Ledger | In-memory → DAG (in progress) |
-| Validation | Proof of Swarm (in progress) |
-| Languages | TypeScript, JavaScript, Python |
-| Desktop Simulator | Python (validator_simulator_main.py) |
-
----
-
-## Repo Structure
-
-```
-Money-main/
-├── logo.png                        # Brand mark
-├── mobile/                         # React Native app
-├── validator_simulator_main.py     # Desktop swarm simulator
-├── validator_cli_menu.py           # CLI validator tool
-├── ledger_state.py                 # Ledger logic
-├── transaction_generator.py        # Test transaction generator
-├── gui_validator.py                # GUI validator (Python)
-├── Earths Money Guide.pdf          # Full project guide
-└── MONEY_Decay_Graphs*.png         # Faucet decay model visualizations
-```
+| Ledger | Hash-linked, Merkle-rooted, tamper-evident |
+| Consensus | Proof of Swarm (BFT committee) |
+| Identity | Zero-knowledge proof of personhood |
+| Languages | TypeScript, JavaScript |
 
 ---
 
 ## Vision
 
-MONEY is not a crypto speculation vehicle. It is infrastructure.
+MONEY is not a speculation vehicle. It's infrastructure for fairness.
 
-The goal is a currency that works for a farmer in rural Africa, a student in Montreal North, and a mechanic in Calgary — without requiring a bank account, a credit score, or a powerful computer.
-
-The phone in your pocket is enough.
+The goal: a currency that works for a farmer in rural Africa, a student in Montréal-Nord, and a mechanic in Calgary — no bank account, no credit score, no powerful computer required. The phone in your pocket is enough.
 
 ---
 
-## References & Inspiration
+## The person behind it
 
-- **Kaspa** — DAG architecture and transaction speed model
-- **Pi Network** — Smartphone-first validation concept
-- *"Somewhere in the Milky Way"* by Luca Urbani — the philosophy behind this project
+Built by **Luca Urbani** — an aircraft mechanic in Québec — solo, over four years, with no team, no VC, and no investors. Just a phone, a laptop, and a refusal to accept that money has to be unfair.
+
+The philosophy behind the project is laid out in his book, *"Somewhere in the Milky Way"*:
+📖 https://www.amazon.ca/Somewhere-Milky-Way-Luca-Urbani-ebook/dp/B0F73VCSG3
 
 ---
 
 ## Status
 
-> This project is in active development. The mobile app prototype is functional locally. DAG architecture and full Proof of Swarm validation are in progress.
+> Active development. Testnet is live. Core cryptographic foundations are built and independently audited. Real multi-node validation and mainnet launch are the next milestones. Contributions, forks, and honest criticism are all welcome — the goal is sound money existing in the world, by anyone, however it happens.
 
 ---
 
-<p align="center">Built by one person with a phone, a laptop, and a vision.</p>
+<p align="center"><em>Built by one person with a phone, a laptop, and a vision.</em></p>
