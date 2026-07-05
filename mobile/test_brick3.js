@@ -51,8 +51,19 @@ async function waitUntil(predicate, timeoutMs = 8000, stepMs = 50) {
   while (Date.now() < deadline) { if (predicate()) return true; await sleep(stepMs); }
   return predicate();
 }
-async function killNode(n) { if (!n || !n.child) return; try { n.child.kill('SIGKILL'); } catch {} await sleep(100); }
-function runNode(file) { return new Promise((res) => { const c = spawn(process.execPath, [path.join(__dirname, file)], { stdio: 'ignore' }); c.on('exit', (code) => res(code)); }); }
+async function killNode(n) {
+  if (!n || !n.child) return;
+  const c = n.child; n.child = null;
+  await new Promise((r) => { c.once('exit', r); try { c.kill('SIGKILL'); } catch { r(); } });
+  await sleep(100);
+}
+function runNode(file) {
+  return new Promise((res) => {
+    const c = spawn(process.execPath, [path.join(__dirname, file)], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const out = []; c.stdout.on('data', (d) => out.push(d.toString())); c.stderr.on('data', (d) => out.push(d.toString()));
+    c.on('exit', (code) => { if (code !== 0) console.log(`      [${file} output tail]\n` + out.join('').split('\n').slice(-15).join('\n')); res(code); });
+  });
+}
 
 (async () => {
   console.log('\n  BRICK 3 (Bite 1) — TWO COMMITTEE NODES CONVERGE VIA RELAY\n');

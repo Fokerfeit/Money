@@ -89,6 +89,21 @@ class NodeClient {
       const ph = E.phashOf(p);
 
       // (1) committee duty: am I one of the sender's validators this epoch?
+      //
+      // KNOWN LIMITATION (documented during Brick 3's adversarial review, not
+      // introduced by it — this is pre-existing behavior): locking onto the
+      // FIRST promise seen at a (from,nonce) happens BEFORE any check that the
+      // promise can ever actually certify (e.g. a recipient who will never
+      // countersign). Since nonces are strictly sequential, one such promise —
+      // which can only ever be produced with the SENDER'S OWN PRIVATE KEY, so
+      // this is a self-inflicted/buggy-client hazard, not a third-party
+      // griefing vector — permanently blocks every later send from that
+      // account, with no fraud recorded (fraud detection needs TWO certified
+      // conflicting promises; here neither ever certifies). All nodes still
+      // converge on the same, merely-stuck, state — this does not affect
+      // cross-node agreement or enable theft. If/when this client layer is
+      // hardened for real user keys, consider validating a promise BEFORE
+      // locking its nonce, or a quorum-agreed way to re-key a stuck nonce.
       if (members[this.id.address] && members[p.from]) {
         const cmte = E.committeeFor(p.from, p.epoch, pool);
         if (cmte.includes(this.id.address)) {
