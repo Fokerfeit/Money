@@ -58,8 +58,20 @@ class NodeClient {
       this.ws = new this.WS(this.url);
       const onMsg = (raw) => {
         let m; try { m = JSON.parse(raw); } catch { return; }
-        if (m.t === 'sync') { for (const tx of m.msgs) this.ledger.add(tx); this._react(); this._persist(); this.onChange(this); }
-        else if (m.t === 'gossip') { if (this.ledger.add(m.tx)) { this._react(); this._persist(); this.onChange(this); } }
+        // A malicious/compromised relay is an explicit part of this design's
+        // threat model (see relay.js's own header comment) — the worst it
+        // should ever be able to do is drop or delay messages, never crash a
+        // node. JSON.parse("null") succeeds (returns null, no exception), and
+        // a bare string/number/array also parses fine; without this guard,
+        // touching m.t on a non-object would throw uncaught. Everything below
+        // is ALSO wrapped in try/catch as defence in depth (e.g. a 'sync'
+        // frame whose msgs field isn't iterable) — one bad frame is dropped,
+        // never a crash.
+        if (!m || typeof m !== 'object') return;
+        try {
+          if (m.t === 'sync') { for (const tx of m.msgs) this.ledger.add(tx); this._react(); this._persist(); this.onChange(this); }
+          else if (m.t === 'gossip') { if (this.ledger.add(m.tx)) { this._react(); this._persist(); this.onChange(this); } }
+        } catch { /* a malformed frame is dropped — never crash the node over one bad message */ }
       };
       if (this.ws.on) {                                   // Node 'ws' API
         this.ws.on('open', resolve);

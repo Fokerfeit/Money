@@ -72,3 +72,13 @@ rl.on('line', (line) => {
 
 process.on('SIGTERM', () => { client.close(); process.exit(0); });
 process.on('SIGINT',  () => { client.close(); process.exit(0); });
+
+// Defence in depth: node_client.js's onMsg already guards against a malformed
+// relay frame (a compromised relay is an explicit part of the threat model —
+// worst case should be a dropped/delayed message, never a crash). This is a
+// second, process-level backstop — one bad frame (or any other unexpected
+// exception) is logged and the process keeps running, rather than dying
+// silently with no operator visibility.
+process.on('uncaughtException', (e) => {
+  process.stderr.write(`[run_node] uncaught exception (continuing): ${e && e.stack || e}\n`);
+});
