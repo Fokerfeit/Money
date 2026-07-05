@@ -19,6 +19,13 @@
 //     {type:'ready', address, pub}                      — connected to the relay
 //     {type:'status', address, hash, members, frauds, balances}  — emitted on every
 //       ledger change (autonomous) AND in response to {op:'status'}
+//     {type:'connection', address, state}                — Bite 2: 'connected' |
+//       'disconnected', emitted on every relay socket transition (including
+//       automatic reconnects after a WAN drop)
+//
+// Bite 2 (separate machines) env vars, ALL optional — unset = unchanged
+// Bite-1 behavior:
+//   RECONNECT_BASE_MS, RECONNECT_MAX_MS   — reconnect backoff tuning (node_client.js)
 'use strict';
 
 const WS = require('ws');
@@ -32,6 +39,11 @@ const RELAY_URL    = process.env.RELAY_URL;
 const NODE_LABEL   = process.env.NODE_LABEL;
 const FOUNDERS     = JSON.parse(process.env.FOUNDERS_JSON || '[]');   // array of addresses
 const STORE_FILE   = process.env.STORE_FILE || null;                  // optional — persistence across restarts
+// Bite 2 (separate machines): optional reconnect-backoff tuning for a real WAN
+// link. Unset by default -> NodeClient's own defaults apply (unchanged from
+// what already worked on localhost).
+const RECONNECT_BASE_MS = process.env.RECONNECT_BASE_MS ? Number(process.env.RECONNECT_BASE_MS) : undefined;
+const RECONNECT_MAX_MS  = process.env.RECONNECT_MAX_MS  ? Number(process.env.RECONNECT_MAX_MS)  : undefined;
 
 if (!RELAY_URL || !NODE_LABEL) {
   process.stderr.write('run_node.js requires RELAY_URL and NODE_LABEL env vars\n');
@@ -51,7 +63,11 @@ const emitStatus = () => {
   emit({ type: 'status', address: id.address, hash: st.hash, members: st.members, frauds: st.frauds, balances: st.balances });
 };
 
-const client = new NodeClient(id, FOUNDERS, RELAY_URL, { ws: WS, store, onChange: emitStatus });
+const client = new NodeClient(id, FOUNDERS, RELAY_URL, {
+  ws: WS, store, onChange: emitStatus,
+  reconnectBaseMs: RECONNECT_BASE_MS, reconnectMaxMs: RECONNECT_MAX_MS,
+  onConnectionState: (state) => emit({ type: 'connection', address: id.address, state }),
+});
 
 client.connect().then(() => {
   emit({ type: 'ready', address: id.address, pub: id.pub });

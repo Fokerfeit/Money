@@ -18,16 +18,30 @@
  *
  *   node relay.js                       # ws://0.0.0.0:8080, no persistence
  *   DATA=swarm.jsonl node relay.js      # persistent archive
+ *
+ * BRICK 3 (Bite 2 — separate machines): three OPTIONAL, DEFAULT-OFF guards
+ * (maxFrameBytes / maxConnPerSec / maxConnections) exist so a later bite that
+ * exposes this relay on a public port has something to dial in; when unset,
+ * every knob behaves EXACTLY as before — Bite 1's localhost tests, and this
+ * relay's default CLI boot, are unchanged. `host` likewise defaults to unset
+ * (all interfaces, today's behavior); pass '127.0.0.1' to bind loopback-only
+ * for the SSH-tunnel deployment model (see NODE_RUN.md).
  */
 const WS = require('ws');
 const fs = require('fs');
 const path = require('path');
 const WSServer = WS.WebSocketServer || WS.Server;   // v8+ named export, or v7 .Server
 
-function startRelay({ port = 8080, dataFile = null, log = console.log } = {}) {
+function startRelay({
+  port = 8080, host = undefined, dataFile = null, log = console.log,
+  maxFrameBytes = null,     // e.g. 65536 — null/0 = no cap beyond ws's own default (unchanged)
+  maxConnPerSec = null,     // e.g. 20 — per-connection message rate limit; null/0 = unlimited (unchanged)
+  maxConnections = null,    // e.g. 50 — cap on simultaneous connections; null/0 = unlimited (unchanged)
+} = {}) {
   const archive = [];            // every signed message ever seen (for sync)
   const seen = new Set();        // de-dup by message id
   const clients = new Set();
+  const rateState = new Map();   // ws -> { count, windowStart } — only used when maxConnPerSec is set
 
   if (dataFile) {                // reload the archive from disk — restart-proof
     try {
@@ -48,8 +62,22 @@ function startRelay({ port = 8080, dataFile = null, log = console.log } = {}) {
     } catch (e) { log(`[relay] persist failed: ${e.message}`); }
   };
 
-  const wss = new WSServer({ port });
+  // Only pass host/maxPayload if explicitly given — an omitted key means `ws`
+  // gets EXACTLY the options object it always got, so default behavior
+  // (bind all interfaces, ws's own built-in maxPayload) is byte-identical.
+  const wssOpts = { port };
+  if (host !== undefined) wssOpts.host = host;
+  if (maxFrameBytes) wssOpts.maxPayload = maxFrameBytes;
+  const wss = new WSServer(wssOpts);
+
   wss.on('connection', (ws) => {
+    // Optional cap on simultaneous connections (off by default). Checked
+    // BEFORE adding to `clients`, so the rejected socket never counts.
+    if (maxConnections && clients.size >= maxConnections) {
+      log(`[relay] connection refused — at capacity (${maxConnections})`);
+      try { ws.close(1013, 'relay at capacity'); } catch {}
+      return;
+    }
     clients.add(ws);
     log(`[relay] phone connected (${clients.size} online)`);
 
@@ -58,6 +86,17 @@ function startRelay({ port = 8080, dataFile = null, log = console.log } = {}) {
     ws.send(JSON.stringify({ t: 'sync', msgs: archive }));
 
     ws.on('message', (raw) => {
+      // Optional per-connection message rate limit (off by default). A
+      // client over the limit just gets its excess messages silently
+      // dropped — the relay has no authority to punish anyone, it only
+      // ever drops or delays (see the header comment).
+      if (maxConnPerSec) {
+        const now = Date.now();
+        let st = rateState.get(ws);
+        if (!st || now - st.windowStart >= 1000) { st = { count: 0, windowStart: now }; rateState.set(ws, st); }
+        st.count++;
+        if (st.count > maxConnPerSec) return;
+      }
       let m; try { m = JSON.parse(raw); } catch { return; }
       if (!m || m.t !== 'gossip' || !m.tx || !m.tx.id) return;
       if (seen.has(m.tx.id)) return;
@@ -68,11 +107,11 @@ function startRelay({ port = 8080, dataFile = null, log = console.log } = {}) {
       for (const c of clients) if (c !== ws && c.readyState === 1) c.send(out);
     });
 
-    ws.on('close', () => { clients.delete(ws); log(`[relay] phone left (${clients.size} online)`); });
-    ws.on('error', () => { clients.delete(ws); });
+    ws.on('close', () => { clients.delete(ws); rateState.delete(ws); log(`[relay] phone left (${clients.size} online)`); });
+    ws.on('error', () => { clients.delete(ws); rateState.delete(ws); });
   });
 
-  log(`[relay] dumb post office on ws://0.0.0.0:${port} — holds no authority${dataFile ? `, archive: ${dataFile}` : ''}`);
+  log(`[relay] dumb post office on ws://${host || '0.0.0.0'}:${port} — holds no authority${dataFile ? `, archive: ${dataFile}` : ''}`);
   return {
     wss,
     stats: () => ({ clients: clients.size, archived: archive.length }),
@@ -81,4 +120,11 @@ function startRelay({ port = 8080, dataFile = null, log = console.log } = {}) {
 }
 
 module.exports = { startRelay };
-if (require.main === module) startRelay({ port: Number(process.env.PORT) || 8080, dataFile: process.env.DATA || null });
+if (require.main === module) startRelay({
+  port: Number(process.env.PORT) || 8080,
+  host: process.env.HOST || undefined,   // e.g. HOST=127.0.0.1 for the SSH-tunnel deployment model (see NODE_RUN.md)
+  dataFile: process.env.DATA || null,
+  maxFrameBytes:  process.env.MAX_FRAME_BYTES  ? Number(process.env.MAX_FRAME_BYTES)  : null,
+  maxConnPerSec:  process.env.MAX_CONN_PER_SEC ? Number(process.env.MAX_CONN_PER_SEC) : null,
+  maxConnections: process.env.MAX_CONNECTIONS  ? Number(process.env.MAX_CONNECTIONS)  : null,
+});

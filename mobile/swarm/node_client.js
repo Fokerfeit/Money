@@ -27,11 +27,22 @@ class NodeClient {
     this.locks = new Map();             // `${from}:${nonce}` -> phash  (committee lock)
     this.accepted = new Set();          // refs I have already countersigned
     this.onChange = opts.onChange || (() => {});
+    this.onConnectionState = opts.onConnectionState || (() => {});   // Bite 2: 'connected' | 'disconnected' notifications
     this.store = opts.store || null;
     this.WS = opts.ws || (typeof WebSocket !== 'undefined' ? WebSocket : null);
     if (!this.WS) throw new Error('No WebSocket available — pass one via opts.ws');
     this.ws = null;
     this._saveTimer = null;
+    // Bite 2 (separate machines): a WAN socket can drop; localhost never did.
+    // Reconnect with exponential backoff, capped — defaults match what worked
+    // fine on localhost (small/instant), so behavior is unchanged unless a
+    // caller (e.g. run_node.js, wired to env vars) explicitly passes larger
+    // values for a real flaky link.
+    this._closing = false;
+    this._reconnectTimer = null;
+    this._reconnectBaseMs = Number.isFinite(opts.reconnectBaseMs) ? opts.reconnectBaseMs : 200;
+    this._reconnectMaxMs  = Number.isFinite(opts.reconnectMaxMs)  ? opts.reconnectMaxMs  : 10_000;
+    this._reconnectDelay  = this._reconnectBaseMs;
   }
 
   // restore persisted state BEFORE touching the network
@@ -54,35 +65,62 @@ class NodeClient {
 
   async connect() {
     await this.restore();
-    return new Promise((resolve) => {
-      this.ws = new this.WS(this.url);
-      const onMsg = (raw) => {
-        let m; try { m = JSON.parse(raw); } catch { return; }
-        // A malicious/compromised relay is an explicit part of this design's
-        // threat model (see relay.js's own header comment) — the worst it
-        // should ever be able to do is drop or delay messages, never crash a
-        // node. JSON.parse("null") succeeds (returns null, no exception), and
-        // a bare string/number/array also parses fine; without this guard,
-        // touching m.t on a non-object would throw uncaught. Everything below
-        // is ALSO wrapped in try/catch as defence in depth (e.g. a 'sync'
-        // frame whose msgs field isn't iterable) — one bad frame is dropped,
-        // never a crash.
-        if (!m || typeof m !== 'object') return;
-        try {
-          if (m.t === 'sync') { for (const tx of m.msgs) this.ledger.add(tx); this._react(); this._persist(); this.onChange(this); }
-          else if (m.t === 'gossip') { if (this.ledger.add(m.tx)) { this._react(); this._persist(); this.onChange(this); } }
-        } catch { /* a malformed frame is dropped — never crash the node over one bad message */ }
-      };
-      if (this.ws.on) {                                   // Node 'ws' API
-        this.ws.on('open', resolve);
-        this.ws.on('message', (d) => onMsg(d.toString()));
-        this.ws.on('error', () => {});                    // unreachable relay must never crash the host app
-      } else {                                            // browser / React Native API
-        this.ws.onopen = resolve;
-        this.ws.onmessage = (ev) => onMsg(ev.data);
-        this.ws.onerror = () => {};
-      }
-    });
+    return new Promise((resolve) => { this._openSocket(resolve); });
+  }
+
+  // Opens (or re-opens, after a drop) the WebSocket. The relay ALWAYS sends a
+  // full { t:'sync', msgs: archive } on every new connection (relay.js), and
+  // Ledger.add() dedupes by id — so simply re-establishing the socket is the
+  // entire re-sync-to-tip mechanism: already-known messages are harmless
+  // no-ops, anything missed while disconnected arrives via the fresh sync.
+  // `onOpenOnce` (the connect()-Promise resolver) is only ever called once,
+  // on the FIRST successful open — later reconnects don't re-resolve it.
+  _openSocket(onOpenOnce) {
+    this.ws = new this.WS(this.url);
+    const onMsg = (raw) => {
+      let m; try { m = JSON.parse(raw); } catch { return; }
+      // A malicious/compromised relay is an explicit part of this design's
+      // threat model (see relay.js's own header comment) — the worst it
+      // should ever be able to do is drop or delay messages, never crash a
+      // node. JSON.parse("null") succeeds (returns null, no exception), and
+      // a bare string/number/array also parses fine; without this guard,
+      // touching m.t on a non-object would throw uncaught. Everything below
+      // is ALSO wrapped in try/catch as defence in depth (e.g. a 'sync'
+      // frame whose msgs field isn't iterable) — one bad frame is dropped,
+      // never a crash.
+      if (!m || typeof m !== 'object') return;
+      try {
+        if (m.t === 'sync') { for (const tx of m.msgs) this.ledger.add(tx); this._react(); this._persist(); this.onChange(this); }
+        else if (m.t === 'gossip') { if (this.ledger.add(m.tx)) { this._react(); this._persist(); this.onChange(this); } }
+      } catch { /* a malformed frame is dropped — never crash the node over one bad message */ }
+    };
+    const onOpen = () => {
+      this._reconnectDelay = this._reconnectBaseMs;   // reset backoff on a successful connection
+      this.onConnectionState('connected');
+      if (onOpenOnce) { const r = onOpenOnce; onOpenOnce = null; r(); }
+    };
+    const onDrop = () => {
+      if (this._closing) return;                      // a deliberate close() must never trigger a reconnect
+      this.onConnectionState('disconnected');
+      if (this._reconnectTimer) return;                // already scheduled (close+error can both fire)
+      const delay = this._reconnectDelay;
+      this._reconnectTimer = setTimeout(() => {
+        this._reconnectTimer = null;
+        this._reconnectDelay = Math.min(this._reconnectDelay * 2, this._reconnectMaxMs);
+        this._openSocket(onOpenOnce);
+      }, delay);
+    };
+    if (this.ws.on) {                                   // Node 'ws' API
+      this.ws.on('open', onOpen);
+      this.ws.on('message', (d) => onMsg(d.toString()));
+      this.ws.on('close', onDrop);
+      this.ws.on('error', () => {});                    // unreachable relay must never crash the host app; 'close' still fires and drives reconnect
+    } else {                                            // browser / React Native API
+      this.ws.onopen = onOpen;
+      this.ws.onmessage = (ev) => onMsg(ev.data);
+      this.ws.onclose = onDrop;
+      this.ws.onerror = () => {};
+    }
   }
 
   _send(tx) { if (this.ws && this.ws.readyState === 1) this.ws.send(JSON.stringify({ t: 'gossip', tx })); }
@@ -149,6 +187,8 @@ class NodeClient {
     return { hash: this.ledger.hash(), members: Object.keys(f.members).length, frauds: f.frauds, balances: f.bal };
   }
   close() {
+    this._closing = true;   // a deliberate close must never trigger a reconnect
+    if (this._reconnectTimer) { clearTimeout(this._reconnectTimer); this._reconnectTimer = null; }
     if (this._saveTimer) { clearTimeout(this._saveTimer); this._saveTimer = null;
       if (this.store) this.store.save({ txs: this.ledger.all(), locks: [...this.locks], accepted: [...this.accepted] });
     }
