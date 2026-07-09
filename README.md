@@ -47,7 +47,7 @@ This is a solo project in active development. Here's the real state — nothing 
 | 🏛️ Byzantine-fault-tolerant committee validation | ✅ built & audited (single-process) |
 | ⚖️ Standing-based movement cap (anti-abuse) | ✅ built & audited |
 | 🧪 Public testnet | ✅ live |
-| 🌐 Real multi-node network (phones as validators) | 🔨 in progress |
+| 🌐 Real multi-node network (phones as validators) | ✅ proven (two real machines over the internet, SSH-tunnel relay; phones-as-validators still to come) |
 | 🚀 Mainnet launch | ⏳ pending audit + regulatory review |
 
 Every core component above was built, then **attacked by an independent adversarial auditor** before being accepted. This isn't a whitepaper promise — the code exists and survived being broken on purpose.
