@@ -43,6 +43,28 @@ class NodeClient {
     this._reconnectBaseMs = Number.isFinite(opts.reconnectBaseMs) ? opts.reconnectBaseMs : 200;
     this._reconnectMaxMs  = Number.isFinite(opts.reconnectMaxMs)  ? opts.reconnectMaxMs  : 10_000;
     this._reconnectDelay  = this._reconnectBaseMs;
+
+    // Bite 2 follow-up (uplink-loss / vote-retry): a vote or accept I generate
+    // is sent exactly once by _react() — if THAT single frame is lost on the
+    // uplink (never reaches the relay), the relay's archive never has it, and
+    // _react()'s lock/accepted gates (unchanged, see below) mean I never
+    // re-generate it. Left alone, this stalls the sender's nonce forever, even
+    // though everyone stays in agreement (no split-brain — just stuck).
+    //
+    // _myEmitted tracks every vote/accept I've ever generated, keyed by id:
+    // { tx, nonce, kind }. On every 'sync' (i.e. every connect/reconnect — the
+    // one moment I learn the relay's authoritative view), RECONCILE: anything
+    // in _myEmitted that the synced archive confirms it received is pruned
+    // (done, never checked again); anything NOT found is queued for retry.
+    // This is deliberately NOT tied to acks — there are none — only to what a
+    // resync reveals, matching the relay's own no-authority design.
+    this._myEmitted = new Map();     // id -> { tx, nonce, kind: 'vote'|'accept' }
+    this._retryQueue = new Map();    // id -> { attempts, firstQueuedAt, nextAttemptAt }
+    this._retryDrainTimer = null;
+    this._voteRetryMaxAttempts = Number.isFinite(opts.voteRetryMaxAttempts) ? opts.voteRetryMaxAttempts : 3;
+    this._voteRetryBackoffMs   = Number.isFinite(opts.voteRetryBackoffMs)   ? opts.voteRetryBackoffMs   : 500;
+    this._voteRetryAbandonMs   = Number.isFinite(opts.voteRetryAbandonMs)   ? opts.voteRetryAbandonMs   : 30_000;
+    this._log = opts.log || ((...a) => console.log(...a));
   }
 
   // restore persisted state BEFORE touching the network
@@ -90,7 +112,7 @@ class NodeClient {
       // never a crash.
       if (!m || typeof m !== 'object') return;
       try {
-        if (m.t === 'sync') { for (const tx of m.msgs) this.ledger.add(tx); this._react(); this._persist(); this.onChange(this); }
+        if (m.t === 'sync') { for (const tx of m.msgs) this.ledger.add(tx); this._react(); this._reconcile(m.msgs); this._persist(); this.onChange(this); }
         else if (m.t === 'gossip') { if (this.ledger.add(m.tx)) { this._react(); this._persist(); this.onChange(this); } }
       } catch { /* a malformed frame is dropped — never crash the node over one bad message */ }
     };
@@ -164,6 +186,7 @@ class NodeClient {
               this.locks.set(k, ph);
               const v = E.makeVote(this.id, ph);
               if (this.ledger.add(v)) this._send(v);
+              this._myEmitted.set(v.id, { tx: v, nonce: p.nonce, kind: 'vote' });   // tracked for uplink-loss retry
               this._persist();
             }
           }
@@ -176,9 +199,77 @@ class NodeClient {
         this.accepted.add(ph);
         const a = E.acceptPromise(this.id, p);
         if (this.ledger.add(a)) this._send(a);
+        this._myEmitted.set(a.id, { tx: a, nonce: p.nonce, kind: 'accept' });   // tracked for uplink-loss retry
         this._persist();
       }
     }
+  }
+
+  // ── RECONCILIATION (runs once per sync, i.e. once per connect/reconnect) ──
+  // syncedMsgs is the relay's full archive, exactly as just received. For
+  // every vote/accept I've ever generated (_myEmitted) that ISN'T in it, the
+  // relay never got it — queue it for retry. Anything that IS in it is
+  // CONFIRMED — the only real "did it work" signal there is, since the relay
+  // issues no acks — so that's where "succeeded" is logged (only when it was
+  // actually missing before, i.e. we were retrying it), then pruned.
+  _reconcile(syncedMsgs) {
+    if (this._myEmitted.size === 0) return;
+    const syncedIds = new Set(syncedMsgs.map((t) => t && t.id).filter(Boolean));
+    const now = this._now();
+    for (const [id, entry] of this._myEmitted) {
+      if (syncedIds.has(id)) {
+        if (this._retryQueue.has(id)) this._log(`[retry] ${entry.kind} for nonce ${entry.nonce} succeeded`);
+        this._myEmitted.delete(id); this._retryQueue.delete(id);
+        continue;
+      }
+      if (entry.firstMissingAt == null) entry.firstMissingAt = now;   // start the abandon clock on first-ever detection
+      if (!this._retryQueue.has(id)) this._retryQueue.set(id, { attempts: 0, nextAttemptAt: now });
+    }
+    this._scheduleRetryDrain();
+  }
+
+  _now() { return Date.now(); }
+
+  _scheduleRetryDrain() {
+    if (this._retryDrainTimer || this._retryQueue.size === 0) return;
+    this._retryDrainTimer = setTimeout(() => { this._retryDrainTimer = null; this._drainRetryQueue(); }, 50);
+  }
+
+  // Re-emits every due retry via the SAME _send() path as the original
+  // vote/accept emission — no new wire format, no relay acks. There is no
+  // local "success" signal (a dispatched frame can still be lost on the wire,
+  // same as the original) — confirmation only ever comes from _reconcile()
+  // on the NEXT sync, which is also where "succeeded" is logged. This drain
+  // loop's only job is: keep re-dispatching (with backoff) until either that
+  // happens, or we give up. Abandons (log only, testnet scope; "Phase 4:
+  // alert" is a later concern) after voteRetryMaxAttempts attempts OR
+  // voteRetryAbandonMs elapsed since first detected missing, whichever first.
+  _drainRetryQueue() {
+    const now = this._now();
+    for (const [id, q] of this._retryQueue) {
+      const entry = this._myEmitted.get(id);
+      if (!entry) { this._retryQueue.delete(id); continue; }   // reconciled already this tick — nothing to do
+      const { tx, nonce, kind, firstMissingAt } = entry;
+
+      if (now - firstMissingAt >= this._voteRetryAbandonMs) {
+        this._log(`[retry] ${kind} for nonce ${nonce} abandoned after ${this._voteRetryAbandonMs}ms`);
+        this._retryQueue.delete(id); this._myEmitted.delete(id);
+        continue;
+      }
+      if (now < q.nextAttemptAt) continue;   // backoff window not elapsed yet
+      if (q.attempts >= this._voteRetryMaxAttempts) {
+        this._log(`[retry] ${kind} for nonce ${nonce} abandoned after ${q.attempts} attempts`);
+        this._retryQueue.delete(id); this._myEmitted.delete(id);
+        continue;
+      }
+      if (!this.ws || this.ws.readyState !== 1) continue;   // not connected right now — wait for the next tick or a fresh sync
+
+      q.attempts++;
+      this._log(`[retry] ${kind} for nonce ${nonce} attempt ${q.attempts}/${this._voteRetryMaxAttempts}`);
+      this._send(tx);
+      q.nextAttemptAt = now + this._voteRetryBackoffMs * Math.pow(2, q.attempts - 1);   // 500, 1000, 2000, ...
+    }
+    if (this._retryQueue.size > 0) this._scheduleRetryDrain();
   }
 
   balance(addr) { return this.ledger.fold().bal[addr || this.id.address] || 0; }
@@ -189,6 +280,7 @@ class NodeClient {
   close() {
     this._closing = true;   // a deliberate close must never trigger a reconnect
     if (this._reconnectTimer) { clearTimeout(this._reconnectTimer); this._reconnectTimer = null; }
+    if (this._retryDrainTimer) { clearTimeout(this._retryDrainTimer); this._retryDrainTimer = null; }   // a closed node must not keep retrying in the background
     if (this._saveTimer) { clearTimeout(this._saveTimer); this._saveTimer = null;
       if (this.store) this.store.save({ txs: this.ledger.all(), locks: [...this.locks], accepted: [...this.accepted] });
     }

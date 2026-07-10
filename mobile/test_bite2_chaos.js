@@ -5,6 +5,8 @@
 // pass K/K trials; exit 0.
 //   1 LATENCY   2 DROPS   3 REORDER   4 RECONNECT   5 NO SPLIT-BRAIN (aggregate)
 //   6 SUPPLY CONSERVED   7 BITE-1 BYTE-IDENTICAL (env vars unset)
+//   8 VOTE RETRY ON RECONNECT (the uplink-stall fix — a dropped QUORUM vote,
+//     which the OLD behavior stalled on forever, now recovers)
 //
 // DESIGN: Bite 1's test_brick3.js already proved process-level isolation
 // (genuinely separate OS processes). This suite's job is different: proving
@@ -66,6 +68,36 @@ function makeChaosWS({ dropRate = 0, minDelay = 0, maxDelay = 0, downlinkOnly = 
       if (!downlinkOnly && dropRate && Math.random() < dropRate) return;
       const d = minDelay + Math.random() * (maxDelay - minDelay);
       setTimeout(() => { try { this._real.send(data); } catch {} }, d);
+    }
+    close(...a) { try { this._real.close(...a); } catch {} }
+    _emit(ev, args) { for (const fn of this._h[ev] || []) fn(...args); }
+  };
+}
+
+// ── surgical, deterministic drop (for probe 8) ────────────────────────────────
+// Unlike makeChaosWS's percentage-based randomness, this drops the FIRST
+// outgoing frame matching `dropOncePredicate` — and only that one — modeling a
+// single, specific lost uplink frame (e.g. "the vote that would have completed
+// quorum") rather than general noise. Everything else passes through untouched.
+function makeSurgicalDropWS(dropOncePredicate) {
+  return class SurgicalDropSocket {
+    constructor(url) {
+      this._real = new RealWS(url);
+      this._h = { open: [], message: [], close: [], error: [] };
+      this._dropped = false;
+      this._real.on('open', (...a) => this._emit('open', a));
+      this._real.on('message', (raw) => this._emit('message', [raw]));
+      this._real.on('close', (...a) => this._emit('close', a));
+      this._real.on('error', (...a) => this._emit('error', a));
+    }
+    on(ev, fn) { (this._h[ev] = this._h[ev] || []).push(fn); }
+    get readyState() { return this._real.readyState; }
+    send(data) {
+      if (!this._dropped) {
+        let parsed; try { parsed = JSON.parse(data); } catch {}
+        if (parsed && dropOncePredicate(parsed)) { this._dropped = true; return; }   // drop this ONE frame, silently
+      }
+      try { this._real.send(data); } catch {}
     }
     close(...a) { try { this._real.close(...a); } catch {} }
     _emit(ev, args) { for (const fn of this._h[ev] || []) fn(...args); }
@@ -331,6 +363,104 @@ function forceAnnounce(client, sealTx) {
     (code === 0) ? ok('test_brick3.js (the ENTIRE Bite-1 localhost suite, including its own Brick2/Self-gate/Brick1/Phase0-3 regression chain) still exits 0 — unchanged with all new env vars unset')
                  : bad(`test_brick3.js → exit ${code}`);
   }
+
+  // ── PROBE 8: VOTE RETRY ON RECONNECT (the uplink-stall fix) ──────────────
+  // A full 7-member committee (8 founders: 1 sender + V1..V7), so "the 5th
+  // vote" is literally the QUORUM-COMPLETING vote (quorumOf(7)=5) — but ONLY
+  // V1-V5 are kept online; V6 and V7 seal (needed so committeeFor's candidate
+  // pool is the full 7, matching quorumOf(7)=5) and then deliberately
+  // disconnect via a normal close() BEFORE the payment, so they never see or
+  // vote on the promise. That leaves EXACTLY 5 possible voters — if all 5
+  // voted, quorum would be trivially met regardless of any one being dropped,
+  // which would test nothing. V1-V4 vote normally; V5's vote is surgically
+  // dropped on the uplink — it never reaches the relay. Under the OLD
+  // behavior this stalls forever: the promise sits at 4-of-5, _react()'s lock
+  // gate never re-votes, and V5's socket staying open forever means no resync
+  // ever happens either. Here we force V5 to reconnect (a real WAN drop would
+  // do this on its own) — its fresh sync's reconciliation discovers its own
+  // vote is missing from the archive and retries it with backoff; this time
+  // nothing drops it, quorum is reached, and the payment certifies.
+  console.log('\n  (8) VOTE RETRY ON RECONNECT (dropped quorum vote recovers)');
+  let r8;
+  try {
+    const port = portCounter++; const url = `ws://127.0.0.1:${port}`;
+    r8 = startRelay({ port, log: () => {} });
+    const S = mkIdentity('bt8_S');   // sender — NOT a committee member for its own promise
+    const voters = Array.from({ length: 7 }, (_, i) => mkIdentity('bt8_V' + (i + 1)));   // V1..V7
+    const founders = [S, ...voters];
+    const clean = makeChaosWS({ minDelay: 2, maxDelay: 15 });   // light, symmetric — just realism, no loss
+
+    const nS = makeNode(S, founders, url, clean);
+    const nV = voters.slice(0, 5).map((v, i) => {
+      if (i === 4) {   // V5 (index 4) — its vote gets surgically dropped ONCE
+        const dropV5Vote = makeSurgicalDropWS((msg) =>
+          msg.t === 'gossip' && msg.tx && msg.tx.type === 'vote' && msg.tx.from === voters[4].address);
+        return makeNode(v, founders, url, dropV5Vote);
+      }
+      return makeNode(v, founders, url, clean);
+    });
+    const nV5 = nV[4];
+    // fast reconnect backoff for this node specifically, so the test doesn't
+    // need to wait through the (much larger) real-world default
+    nV5._reconnectBaseMs = 100; nV5._reconnectMaxMs = 400; nV5._reconnectDelay = 100;
+    nV5._voteRetryBackoffMs = 150;   // 150, 300, 600ms — fast enough for a snappy test, still real exponential backoff
+
+    // V6, V7: short-lived, seal-only connections. They exist so the SEALED
+    // pool has all 8 members (committeeFor needs the full 7-candidate pool
+    // for quorumOf(7)=5 to apply) but never see the promise at all.
+    const nV6 = makeNode(voters[5], founders, url, clean);
+    const nV7 = makeNode(voters[6], founders, url, clean);
+
+    const voterClients = [...nV, nV6, nV7];   // index i -> client for voters[i]
+    const allLiveForSealing = [nS, ...voterClients];
+    await Promise.all(allLiveForSealing.map((c) => c.connect()));
+    const sealed = await untilConverged(
+      () => { forceAnnounce(nS, E.founderSeal(S)); voters.forEach((v, i) => forceAnnounce(voterClients[i], E.founderSeal(v))); },
+      () => allLiveForSealing.every((c) => Object.keys(c.ledger.fold().members).length === 8),
+      12000,
+    );
+    if (!sealed) throw new Error('seals never converged (8 founders)');
+
+    nV6.close(); nV7.close();   // deliberate close() — never reconnects, never sees the promise
+    const allNodes = [nS, ...nV];
+
+    // S sends one promise to V1. Committee = all 7 voters (V1-V7), quorum 5 —
+    // but only V1-V5 are online, so exactly 5 votes are even POSSIBLE.
+    nS.pay(voters[0].address, 60000, 1, 0);
+    // V1-V4 vote normally (their own _react() reflex handles it automatically
+    // once they see the promise); give the network a moment to settle at 4 votes.
+    const stalledAt4 = await waitUntil(() => {
+      const f = nS.ledger.fold();
+      // still MINT balance everywhere = the promise has NOT certified/applied yet
+      return f.bal[S.address] === 1_000_000 && f.bal[voters[0].address] === 1_000_000;
+    }, 3000);
+    if (!stalledAt4) throw new Error('promise unexpectedly certified before V5 ever voted — test setup invalid');
+
+    // confirm it's GENUINELY stuck (not just slow) — hold a bit longer with no
+    // intervention; balances must still be unmoved (V5's dropped vote means
+    // only 4-of-5 quorum, exactly the "stalls forever" bug under old behavior)
+    await sleep(800);
+    const stillStuck = nS.ledger.fold().bal[S.address] === 1_000_000;
+    if (!stillStuck) throw new Error('promise certified without V5 — quorum math or test wiring is wrong');
+
+    // NOW force V5 to reconnect — a real WAN drop would trigger this on its
+    // own; here we simulate it directly, exactly like probe 4's reconnect test.
+    nV5.ws._real.terminate();
+
+    const recovered = await waitUntil(() => {
+      const f = nS.ledger.fold();
+      return f.bal[S.address] === 940000 && f.bal[voters[0].address] === 1_060_000;
+    }, 8000);
+
+    const hashes = allNodes.map((c) => c.ledger.hash());
+    const allAgree = hashes.every((h) => h === hashes[0]);
+    (recovered && allAgree)
+      ? ok(`V5's dropped quorum vote recovered via reconnect + retry-with-backoff: quorum reached, payment certified (S=940000, V1=1,060,000), all 8 nodes agree (${hashes[0]})`)
+      : bad(`vote retry did not recover: recovered=${recovered} allAgree=${allAgree} S_bal=${nS.ledger.fold().bal[S.address]} hashes=${JSON.stringify(hashes)}`);
+
+    allNodes.forEach((c) => c.close());
+  } catch (e) { bad('probe8 exception: ' + e.message); }
+  finally { if (r8) await r8.close(); }
 
   console.log(`\n  ${fails === 0 ? '🎉' : '💥'}  Bite 2 chaos: ${fails === 0 ? 'ALL PROBES PASS' : fails + ' FAILURE(S)'} — two nodes converge over a faulty transport; Bite 1 unaffected.\n`);
   process.exit(fails === 0 ? 0 : 1);

@@ -26,6 +26,9 @@
 // Bite 2 (separate machines) env vars, ALL optional — unset = unchanged
 // Bite-1 behavior:
 //   RECONNECT_BASE_MS, RECONNECT_MAX_MS   — reconnect backoff tuning (node_client.js)
+//   VOTE_RETRY_MAX_ATTEMPTS, VOTE_RETRY_BACKOFF_MS, VOTE_RETRY_ABANDON_MS —
+//     uplink-loss vote/accept retry tuning (node_client.js; the "Bite 2
+//     follow-up" fix for a lost quorum vote stalling a nonce forever)
 'use strict';
 
 const WS = require('ws');
@@ -44,6 +47,11 @@ const STORE_FILE   = process.env.STORE_FILE || null;                  // optiona
 // what already worked on localhost).
 const RECONNECT_BASE_MS = process.env.RECONNECT_BASE_MS ? Number(process.env.RECONNECT_BASE_MS) : undefined;
 const RECONNECT_MAX_MS  = process.env.RECONNECT_MAX_MS  ? Number(process.env.RECONNECT_MAX_MS)  : undefined;
+// Bite 2 follow-up: optional vote/accept uplink-retry tuning. Unset -> NodeClient's
+// own defaults (3 attempts, 500ms backoff base, 30s abandon).
+const VOTE_RETRY_MAX_ATTEMPTS = process.env.VOTE_RETRY_MAX_ATTEMPTS ? Number(process.env.VOTE_RETRY_MAX_ATTEMPTS) : undefined;
+const VOTE_RETRY_BACKOFF_MS   = process.env.VOTE_RETRY_BACKOFF_MS   ? Number(process.env.VOTE_RETRY_BACKOFF_MS)   : undefined;
+const VOTE_RETRY_ABANDON_MS   = process.env.VOTE_RETRY_ABANDON_MS   ? Number(process.env.VOTE_RETRY_ABANDON_MS)   : undefined;
 
 if (!RELAY_URL || !NODE_LABEL) {
   process.stderr.write('run_node.js requires RELAY_URL and NODE_LABEL env vars\n');
@@ -66,7 +74,9 @@ const emitStatus = () => {
 const client = new NodeClient(id, FOUNDERS, RELAY_URL, {
   ws: WS, store, onChange: emitStatus,
   reconnectBaseMs: RECONNECT_BASE_MS, reconnectMaxMs: RECONNECT_MAX_MS,
+  voteRetryMaxAttempts: VOTE_RETRY_MAX_ATTEMPTS, voteRetryBackoffMs: VOTE_RETRY_BACKOFF_MS, voteRetryAbandonMs: VOTE_RETRY_ABANDON_MS,
   onConnectionState: (state) => emit({ type: 'connection', address: id.address, state }),
+  log: (msg) => process.stderr.write(msg + '\n'),
 });
 
 client.connect().then(() => {
