@@ -124,6 +124,7 @@ here, tested, and ready, not yet needed.
 
 - **Public/open relay** accepting arbitrary internet joiners — a separate,
   later bite (still testnet-only, but it adds real exposure this one avoids).
+  → That bite now exists: see [`NODE_RUN_PUBLIC.md`](./NODE_RUN_PUBLIC.md).
 - **Node-level Sybil resistance** — unsolved research problem, not a blocker
   for proving two-machine convergence.
 - **Anything moving real value** — this is testnet/play-money only. Moving

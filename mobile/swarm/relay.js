@@ -26,6 +26,14 @@
  * relay's default CLI boot, are unchanged. `host` likewise defaults to unset
  * (all interfaces, today's behavior); pass '127.0.0.1' to bind loopback-only
  * for the SSH-tunnel deployment model (see NODE_RUN.md).
+ *
+ * BRICK 3 (public testnet relay bite): that "later bite" is this one. No
+ * code here changed to enable it — `host` unset was ALWAYS all-interfaces,
+ * so exposing this relay publicly is a config choice (don't set HOST, or set
+ * it to '0.0.0.0'), plus turning the three guards ON. See NODE_RUN_PUBLIC.md
+ * for the recommended deployment (nginx/Cloudflare WSS proxy in front,
+ * relay itself still loopback-only) and the guard defaults chosen for a
+ * small friends/family beta.
  */
 const WS = require('ws');
 const fs = require('fs');
