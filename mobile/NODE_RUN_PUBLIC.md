@@ -160,6 +160,12 @@ If going with **Option B**:
 2. Same pm2 env as above but `HOST=0.0.0.0` instead of `127.0.0.1`.
 3. Friends/family point `run_node.js` at `RELAY_URL=ws://<testnet-box-ip>:8080`.
 
+Either option: **don't set `NODE_LABEL`** for a real friend/family launch —
+leaving it unset is what makes `run_node.js` load-or-create a real, persisted
+identity in `IDENTITY_FILE` instead of a disposable random one, so restarting
+the node keeps the same address and balance. See NODE_RUN.md's "Persisted
+node identity" section — that `identity.json` file is the wallet; back it up.
+
 ## Explicitly out of scope for this bite
 
 - **Mainnet exposure of any kind** — not attempted, not touched.

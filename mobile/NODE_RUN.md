@@ -105,11 +105,42 @@ by a `status` line showing it caught back up to the same tip as Node B.
 | Var | Default | Effect |
 |---|---|---|
 | `RELAY_URL` | *(required)* | e.g. `ws://localhost:8080` |
-| `NODE_LABEL` | *(required)* | deterministic identity seed |
+| `NODE_LABEL` | unset | if SET: deterministic identity seed (`committee_bridge.mkIdentity`), no file I/O — this is what every test harness uses, so a test can precompute a node's address from its label. If UNSET: real persisted identity, see below. |
+| `IDENTITY_FILE` | `identity.json` next to `run_node.js` | only consulted when `NODE_LABEL` is unset. **⚠️ THIS FILE IS THE WALLET** — see "Persisted node identity" below. |
 | `FOUNDERS_JSON` | `[]` | JSON array of founder addresses |
-| `STORE_FILE` | unset (no persistence) | local snapshot file |
+| `STORE_FILE` | unset (no persistence) | local snapshot file (ledger/locks/accepted-state — NOT the identity/keypair; see `IDENTITY_FILE`) |
 | `RECONNECT_BASE_MS` | `200` | initial reconnect delay after a drop |
 | `RECONNECT_MAX_MS` | `10000` | reconnect delay cap (doubles each attempt up to this) |
+
+## Persisted node identity — ⚠️ `identity.json` IS THE WALLET
+
+Before this bite, every `run_node.js` launch with no `NODE_LABEL` would mint a
+**genuinely random** identity (`swarm_engine.newId()`) — fine for throwaway
+test nodes, but it meant a friend restarting their node lost their address
+(and therefore their balance, from their perspective) on every restart. That's
+now fixed for the real "download and run" path:
+
+- **`NODE_LABEL` set** (all existing tests): unchanged. Deterministic identity,
+  no file touched.
+- **`NODE_LABEL` unset** (a real friend/family node): on first boot, a real
+  random identity is generated and **written to `IDENTITY_FILE`** (via
+  `mobile/safe_store.js`'s atomic write — stage `.tmp`, fsync, rename — so a
+  crash mid-save can never leave a used-but-unsaved identity around) before
+  the node ever announces or connects. On every later boot, that same file is
+  loaded and the SAME address/keypair is reused.
+- **⚠️ `identity.json` (or wherever `IDENTITY_FILE` points) contains the
+  node's actual private key. It IS the wallet.**
+  - **Back it up.** Losing it is the same as losing the wallet — there is no
+    recovery path today (that's a separate, tracked priority: see
+    `START_HERE_MONEY.md`'s "Key recovery priority").
+  - **Never share it, never commit it.** It's in `.gitignore` (`identity.json`,
+    `identity.json.bak`, `identity.json.tmp`) — don't override that.
+  - **If it gets corrupted** (disk error, partial copy, hand-edited and now
+    invalid), the node **refuses to start** rather than silently generating a
+    replacement — see `identity_store.js`. Restore it from a backup; if you
+    are certain it was never funded, delete it (and its `.bak`) to start
+    fresh. There is deliberately no "just make a new one" auto-recovery here,
+    because that would silently orphan whatever balance the real identity held.
 
 ## Optional guards — why they're off by default
 

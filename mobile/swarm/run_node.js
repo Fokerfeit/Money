@@ -5,9 +5,18 @@
 // ledger purely by talking to a relay over a real WebSocket.
 //
 // ADDITIVE: does not modify node_client.js, swarm_engine.js, relay.js, or
-// committee_bridge.js — it only requires them. Identity derivation reuses
-// committee_bridge.mkIdentity (same seeded-keypair scheme already adversarially
-// reviewed in Brick 2), so a test can precompute a node's address from its label.
+// committee_bridge.js — it only requires them (identity_store.js, added for
+// persisted identity below, is likewise a pure wrapper — see its own header).
+//
+// Identity: two modes, selected by whether NODE_LABEL is set.
+//   • NODE_LABEL set (every existing test harness) — deterministic identity via
+//     committee_bridge.mkIdentity(label) (same seeded-keypair scheme already
+//     adversarially reviewed in Brick 2), so a test can precompute a node's
+//     address from its label. No file I/O. Unchanged from before this bite.
+//   • NODE_LABEL unset (the real "download and run" path) — a REAL, persisted
+//     identity loaded from (or generated once and saved to) IDENTITY_FILE, so
+//     restarting the process gets back the SAME address/balance instead of a
+//     fresh random one. See identity_store.js + NODE_RUN.md.
 //
 // Protocol (JSON Lines):
 //   stdin  — one command object per line:
@@ -29,19 +38,32 @@
 //   VOTE_RETRY_MAX_ATTEMPTS, VOTE_RETRY_BACKOFF_MS, VOTE_RETRY_ABANDON_MS —
 //     uplink-loss vote/accept retry tuning (node_client.js; the "Bite 2
 //     follow-up" fix for a lost quorum vote stalling a nonce forever)
+//   IDENTITY_FILE — persisted-identity path, only consulted when NODE_LABEL is
+//     unset (default: identity.json next to this script). THIS FILE IS THE
+//     WALLET — see NODE_RUN.md.
 'use strict';
 
 const WS = require('ws');
 const fs = require('fs');
 const readline = require('readline');
+const path = require('path');
 const { NodeClient } = require('./node_client');
 const { founderSeal } = require('./swarm_engine');
 const { mkIdentity } = require('./committee_bridge');
+const identityStore = require('./identity_store');
 
 const RELAY_URL    = process.env.RELAY_URL;
 const NODE_LABEL   = process.env.NODE_LABEL;
 const FOUNDERS     = JSON.parse(process.env.FOUNDERS_JSON || '[]');   // array of addresses
 const STORE_FILE   = process.env.STORE_FILE || null;                  // optional — persistence across restarts
+// Persisted node identity ("download and run"): when NODE_LABEL is unset, the node's
+// keypair is loaded from — or, on first boot, generated and saved to — IDENTITY_FILE
+// (default: identity.json next to this script), so restarting the process reuses the
+// SAME M_ address and balance instead of minting a fresh random one every run. This is
+// additive: any caller that DOES pass NODE_LABEL (every existing test harness) is
+// completely unaffected — it keeps getting committee_bridge's deterministic
+// mkIdentity(label), with no file I/O at all, exactly as before.
+const IDENTITY_FILE = process.env.IDENTITY_FILE || path.join(__dirname, 'identity.json');
 // Bite 2 (separate machines): optional reconnect-backoff tuning for a real WAN
 // link. Unset by default -> NodeClient's own defaults apply (unchanged from
 // what already worked on localhost).
@@ -53,12 +75,28 @@ const VOTE_RETRY_MAX_ATTEMPTS = process.env.VOTE_RETRY_MAX_ATTEMPTS ? Number(pro
 const VOTE_RETRY_BACKOFF_MS   = process.env.VOTE_RETRY_BACKOFF_MS   ? Number(process.env.VOTE_RETRY_BACKOFF_MS)   : undefined;
 const VOTE_RETRY_ABANDON_MS   = process.env.VOTE_RETRY_ABANDON_MS   ? Number(process.env.VOTE_RETRY_ABANDON_MS)   : undefined;
 
-if (!RELAY_URL || !NODE_LABEL) {
-  process.stderr.write('run_node.js requires RELAY_URL and NODE_LABEL env vars\n');
+if (!RELAY_URL) {
+  process.stderr.write('run_node.js requires the RELAY_URL env var\n');
   process.exit(1);
 }
 
-const id = mkIdentity(NODE_LABEL);
+// NODE_LABEL set (every existing test harness): unchanged deterministic identity,
+// no file I/O — a test can still precompute a node's address from its label.
+// NODE_LABEL unset (the real "download and run" path): load-or-create a REAL,
+// persisted identity from IDENTITY_FILE. A corrupted/invalid identity file is a
+// hard error (see identity_store.js) — it never silently falls back to a fresh
+// identity, which would orphan whatever balance the real one held.
+let id;
+if (NODE_LABEL) {
+  id = mkIdentity(NODE_LABEL);
+} else {
+  try {
+    id = identityStore.loadOrCreate(IDENTITY_FILE, 'node');
+  } catch (e) {
+    process.stderr.write(`${e.message}\n`);
+    process.exit(1);
+  }
+}
 
 const store = STORE_FILE ? {
   load: () => { try { return JSON.parse(fs.readFileSync(STORE_FILE, 'utf8')); } catch { return null; } },

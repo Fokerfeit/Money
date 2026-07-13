@@ -38,6 +38,14 @@ desktop.ini
 platform_wallet.secret.json
 .secrets/
 
+# secrets — a run_node.js persisted node identity IS THE WALLET (private key +
+# address); never commit it, back it up separately instead. See NODE_RUN.md.
+identity.json
+identity.json.bak
+identity.json.tmp
+mobile/swarm/identity.json
+mobile/swarm/identity.json.bak
+
 # dev/session artifacts — not for the repo
 *.log
 serve_preview.log
@@ -69,6 +77,7 @@ self_nullifiers.json
 .brick2_tmp/
 .brick2cap_tmp/
 .brick3_tmp/
+.persist_identity_tmp/
 phase0_golden.json
 committee_state.json
 self_nullifiers.json
