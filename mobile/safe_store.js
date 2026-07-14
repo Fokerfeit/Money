@@ -32,8 +32,14 @@ const isParseable = (text) => {
 };
 
 // write `data` to `p` and fsync the file descriptor before returning (durability).
+// Mode 0o600 (owner read/write only): these stores can hold private keys
+// (identity_store.js) — fs.openSync's default mode is 0o666 as-modified-by-umask,
+// which on a typical 0o022 umask leaves the file world-readable. Explicit mode
+// here means the file is owner-only regardless of the process/system umask.
+// `renameSync` (below, in saveAtomic) preserves the mode of the file being
+// renamed, so the FINAL file inherits this 0o600, not whatever `file` had before.
 function writeFsync(p, data) {
-  const fd = fs.openSync(p, 'w');
+  const fd = fs.openSync(p, 'w', 0o600);
   try { fs.writeSync(fd, data); try { fs.fsyncSync(fd); } catch { /* fsync unsupported → best effort */ } }
   finally { fs.closeSync(fd); }
 }
@@ -59,12 +65,14 @@ function saveAtomic(file, data, { dualBak = false } = {}) {
     // "never lags" invariant breaks. A copy/fsync failure PROPAGATES (no rename) — the
     // caller's seal() then throws and claim() returns seal-failed, refusing the mint,
     // rather than minting against a lagging backup (a re-mint window).
-    fs.copyFileSync(tmp, bak); fsyncPath(bak);        // 2a) .bak := NEW content (fail-closed)
+    // copyFileSync creates `bak` subject to the process umask (it does NOT preserve
+    // `tmp`'s 0o600), so chmod it explicitly — same reasoning as writeFsync above.
+    fs.copyFileSync(tmp, bak); fs.chmodSync(bak, 0o600); fsyncPath(bak);        // 2a) .bak := NEW content (fail-closed)
   } else {
     try {                                             // 2b) rollback .bak := current good main, best-effort
       if (fs.existsSync(file)) {
         const cur = fs.readFileSync(file, 'utf8');
-        if (isParseable(cur)) { fs.copyFileSync(file, bak); fsyncPath(bak); }
+        if (isParseable(cur)) { fs.copyFileSync(file, bak); fs.chmodSync(bak, 0o600); fsyncPath(bak); }
       }
     } catch { /* a stale rollback .bak is the intended fallback; the atomic rename is the real guarantee */ }
   }
