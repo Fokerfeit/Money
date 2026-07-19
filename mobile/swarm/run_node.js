@@ -53,7 +53,16 @@
 //   stdout — one event object per line:
 //     {type:'ready', address, pub}                      — connected to the relay
 //     {type:'invite', invite:{...}}                      — a freshly issued invite (deliver out of band)
-//     {type:'redeemed', inviteId}                        — the newcomer's self-seal was announced
+//     {type:'redeem-sent', inviteId}                     — the self-seal was ANNOUNCED (not yet proof of
+//                                                          membership — the invite could still be bad)
+//     {type:'redeemed', inviteId}                        — CONFIRMED: our address now appears in the
+//                                                          folded member set (the honest ack)
+//     {type:'redeem-failed', inviteId, hint}             — membership never appeared within
+//                                                          REDEEM_TIMEOUT_MS (invite invalid/used/quota,
+//                                                          or network unreachable)
+//     {type:'warning', code:'possible-fork', ...}        — observation only: the relay archive carries a
+//                                                          founder seal NOT in this node's genesis founder
+//                                                          set → likely wrong/stale genesis.json or a fork
 //     {type:'error', op, reason}                         — a stdin op was malformed/rejected (no crash)
 //     {type:'status', address, hash, members, frauds, balances}  — emitted on every
 //       ledger change (autonomous) AND in response to {op:'status'}
@@ -70,6 +79,8 @@
 //   IDENTITY_FILE — persisted-identity path, only consulted when NODE_LABEL is
 //     unset (default: identity.json next to this script). THIS FILE IS THE
 //     WALLET — see NODE_RUN.md.
+//   REDEEM_TIMEOUT_MS — how long a pending redeem waits for confirmed membership
+//     before emitting redeem-failed (default 30000).
 'use strict';
 
 const WS = require('ws');
@@ -81,33 +92,57 @@ const { NodeClient } = require('./node_client');
 const { founderSeal, makeInvite, seal } = require('./swarm_engine');
 const { mkIdentity } = require('./committee_bridge');
 const identityStore = require('./identity_store');
-const safeStore = require('../safe_store');
+// (safe_store.js is still part of this node's dependency closure — identity_store
+// requires it — but run_node itself no longer does: genesis is a plain direct
+// read on purpose, see the GENESIS comment below.)
 
 const NODE_LABEL   = process.env.NODE_LABEL;
 const STORE_FILE   = process.env.STORE_FILE || null;                  // optional — persistence across restarts
 
 // ── GENESIS (self-serve join): founder set + default relay travel WITH the download ──
 // GENESIS_FILE (default: genesis.json beside this script) carries { founders:[...],
-// relay:"wss://..." } so a freshly-downloaded node needs NO hand-set env var. Read
-// FAIL-CLOSED via safe_store.loadStrict — a present-but-corrupt genesis is a hard
-// error (never a silent "empty founder set", which would make the node quietly fail
-// to validate the whole network). Absent genesis → falls back to env, so every
-// existing test harness (which sets FOUNDERS_JSON/RELAY_URL and ships no genesis
-// file) is byte-for-byte unchanged.
+// relay:"wss://..." } so a freshly-downloaded node needs NO hand-set env var.
+//
+// Read as a PLAIN fail-closed direct read — deliberately NOT safe_store.loadStrict.
+// loadStrict exists for stores this process WRITES (it falls back to a .bak copy on
+// corruption). Genesis is READ-ONLY for run_node — this process never writes it, so
+// no legitimate genesis.json.bak can exist here, and honoring one would let a
+// planted .bak file silently substitute a different founder set (audit finding on
+// 413d73a). Missing file = no genesis (env fallback); present-but-unreadable or
+// present-but-invalid = hard exit. Absent genesis → env fallback keeps every
+// existing test harness byte-for-byte unchanged.
+//
+// SEMANTIC validation (not just structure): a genesis that parses fine but carries
+// an empty founder list, or entries that aren't real M_ addresses, would make the
+// node quietly fail to validate the whole network (members forever 0) — that is a
+// misconfiguration, not a network state, so it fails CLOSED at boot. Address shape
+// derives from swarm_engine.addrOf: 'M_' + first 32 hex chars of the pubkey,
+// uppercased → /^M_[0-9A-F]{32}$/.
 const GENESIS_FILE = process.env.GENESIS_FILE || path.join(__dirname, 'genesis.json');
-const GENESIS_MISSING = Symbol('no-genesis-file');
+const ADDR_RE = /^M_[0-9A-F]{32}$/;
 let genesis = null;
-try {
-  const g = safeStore.loadStrict(GENESIS_FILE, GENESIS_MISSING);
-  if (g !== GENESIS_MISSING) {
+if (fs.existsSync(GENESIS_FILE)) {
+  try {
+    const g = JSON.parse(fs.readFileSync(GENESIS_FILE, 'utf8'));   // direct read: no .bak fallback (see above)
     if (!g || typeof g !== 'object' || Array.isArray(g) || !Array.isArray(g.founders)) {
       throw new Error('genesis must be a JSON object with a "founders" array (and optional "relay" string)');
     }
+    if (g.founders.length === 0) {
+      throw new Error('genesis "founders" array is EMPTY — a node with no founders can never validate anything; fill in the sealed testnet founder addresses');
+    }
+    for (const f of g.founders) {
+      if (typeof f !== 'string' || !ADDR_RE.test(f)) {
+        throw new Error(`genesis founder entry ${JSON.stringify(f)} is not a valid M_ address (expected M_ + 32 uppercase hex chars)`);
+      }
+    }
+    if (g.relay !== undefined && typeof g.relay !== 'string') {
+      throw new Error('genesis "relay" must be a string when present');
+    }
     genesis = g;
+  } catch (e) {
+    process.stderr.write(`[run_node] genesis file "${GENESIS_FILE}" is present but invalid — refusing to start (fail-closed): ${e.message}\n`);
+    process.exit(1);
   }
-} catch (e) {
-  process.stderr.write(`[run_node] genesis file "${GENESIS_FILE}" is present but invalid — refusing to start (fail-closed): ${e.message}\n`);
-  process.exit(1);
 }
 
 // Precedence: an explicit env var ALWAYS wins (keeps every existing test unchanged),
@@ -134,6 +169,10 @@ const RECONNECT_MAX_MS  = process.env.RECONNECT_MAX_MS  ? Number(process.env.REC
 const VOTE_RETRY_MAX_ATTEMPTS = process.env.VOTE_RETRY_MAX_ATTEMPTS ? Number(process.env.VOTE_RETRY_MAX_ATTEMPTS) : undefined;
 const VOTE_RETRY_BACKOFF_MS   = process.env.VOTE_RETRY_BACKOFF_MS   ? Number(process.env.VOTE_RETRY_BACKOFF_MS)   : undefined;
 const VOTE_RETRY_ABANDON_MS   = process.env.VOTE_RETRY_ABANDON_MS   ? Number(process.env.VOTE_RETRY_ABANDON_MS)   : undefined;
+// Honest redeem ack (audit fix on 413d73a): a redeem is only "redeemed" once our
+// address actually appears in the folded member set; until then it's "redeem-sent",
+// and after this window with no membership it's "redeem-failed".
+const REDEEM_TIMEOUT_MS = process.env.REDEEM_TIMEOUT_MS ? Number(process.env.REDEEM_TIMEOUT_MS) : 30_000;
 
 if (!RELAY_URL) {
   process.stderr.write('run_node.js needs a relay URL — set RELAY_URL, or ship a genesis.json with a "relay" field\n');
@@ -169,9 +208,59 @@ const store = STORE_FILE ? {
 } : null;
 
 const emit = (obj) => process.stdout.write(JSON.stringify(obj) + '\n');
+
+// ── FORK VISIBILITY (observation + logging ONLY — no wire messages, no consensus
+// change; audit fix on 413d73a). The ledger stores every gossiped message,
+// including founder seals for addresses OUTSIDE our genesis founder set (fold()
+// simply ignores them). Such a seal is the loudest available signal that this
+// node's genesis disagrees with what the network is actually running — a stale or
+// wrong genesis.json, or a genuine fork. We warn ONCE per unknown founder address.
+// The scan is incremental (each ledger entry inspected exactly once), so it adds
+// O(new messages) per status emit, not O(history).
+const _warnedUnknownFounders = new Set();
+let _forkScanIdx = 0;
+function scanForForeignFounderSeals() {
+  const all = client.ledger.all();   // Map insertion order — stable, append-only
+  for (; _forkScanIdx < all.length; _forkScanIdx++) {
+    const tx = all[_forkScanIdx];
+    if (!tx || tx.type !== 'seal' || !tx.founder) continue;
+    if (client.ledger.founders.has(tx.from) || _warnedUnknownFounders.has(tx.from)) continue;
+    _warnedUnknownFounders.add(tx.from);
+    emit({
+      type: 'warning', code: 'possible-fork', unknownFounder: tx.from,
+      reason: 'the relay archive contains a founder seal that is NOT in this node\'s genesis founder set — this node may have a stale/wrong genesis.json, or the network has forked',
+    });
+    process.stderr.write(`[run_node] ⚠️ POSSIBLE FORK: founder seal from ${tx.from} is not in this node's genesis founder set (${[...client.ledger.founders].join(', ') || 'empty'}) — check genesis.json\n`);
+  }
+}
+
+// ── HONEST REDEEM ACK: pending-redeem watcher ────────────────────────────────
+// 'redeemed' is only emitted when our address actually appears in fold().members.
+// Checked on every ledger change (emitStatus) AND on a small poll while pending —
+// the poll matters because announce() doesn't fire onChange for our OWN messages,
+// so a lone node's membership flip would otherwise go unobserved until the next
+// incoming frame.
+let pendingRedeem = null;   // { inviteId, deadline, poll }
+function checkPendingRedeem() {
+  if (!pendingRedeem) return;
+  const p = pendingRedeem;
+  if (client.ledger.fold().members[id.address]) {
+    clearInterval(p.poll); pendingRedeem = null;
+    emit({ type: 'redeemed', inviteId: p.inviteId });
+    process.stderr.write(`[run_node] redeem ${p.inviteId} CONFIRMED — this node is now a member\n`);
+    emitStatus();
+  } else if (Date.now() >= p.deadline) {
+    clearInterval(p.poll); pendingRedeem = null;
+    emit({ type: 'redeem-failed', inviteId: p.inviteId, hint: 'invite may be invalid, already used, or network unreachable' });
+    process.stderr.write(`[run_node] redeem ${p.inviteId} FAILED — no membership after ${REDEEM_TIMEOUT_MS}ms (invite invalid/used/quota, or network unreachable)\n`);
+  }
+}
+
 const emitStatus = () => {
   const st = client.status();
   emit({ type: 'status', address: id.address, hash: st.hash, members: st.members, frauds: st.frauds, balances: st.balances });
+  scanForForeignFounderSeals();
+  checkPendingRedeem();
 };
 
 const client = new NodeClient(id, FOUNDERS, RELAY_URL, {
@@ -203,6 +292,14 @@ rl.on('line', (line) => {
     // key, quota ≤5 enforced by the ledger fold). So it is emitted to stdout for
     // OUT-OF-BAND, point-to-point delivery to ONE newcomer — deliberately NOT
     // broadcast over the relay (broadcasting a bearer invite = an open Sybil door).
+    //
+    // ⚠️ QUOTA HONESTY (audit note on 413d73a): the ≤5 quota is per-ADDRESS rate
+    // limiting, NOT per-human Sybil resistance. Each invited member gets its own
+    // quota of 5, so one human can CHAIN identities (invite own sock puppet, which
+    // invites the next, ...) — bounded in speed, unbounded in depth, by design on
+    // this path. Per-HUMAN enforcement is the Self-gate nullifier path's job
+    // (self_gate.js — one passport-proven human, one ignition), not the invite
+    // quota's. Fine for a trusted friends/family beta; not an open-launch gate.
     case 'invite': {
       const inviteId = (typeof cmd.inviteId === 'string' && cmd.inviteId) || crypto.randomBytes(8).toString('hex');
       const invite = makeInvite(id, inviteId);   // swarm_engine — signs INVITE:<us>:<inviteId> with our key
@@ -212,8 +309,12 @@ rl.on('line', (line) => {
     }
     // Redeem an invite handed to us out of band → self-seal with OUR key and gossip
     // it. The seal is bound to our address (SEAL:<us>:<inviteId>), so sending it over
-    // the relay is safe (a compromised relay can neither forge nor reassign it). On
-    // the next fold across the network we become a member with our 1,000,000.
+    // the relay is safe (a compromised relay can neither forge nor reassign it).
+    // HONEST ACK (audit fix on 413d73a): announcing the seal proves nothing — the
+    // invite could be forged, already spent, or over quota, and the fold would just
+    // silently ignore our seal. So: 'redeem-sent' now, 'redeemed' ONLY once our
+    // address actually appears in fold().members, 'redeem-failed' if it never does
+    // within REDEEM_TIMEOUT_MS.
     case 'redeem': {
       const inv = cmd.invite;
       if (!inv || typeof inv !== 'object' || typeof inv.inviterAddr !== 'string'
@@ -221,9 +322,18 @@ rl.on('line', (line) => {
         emit({ type: 'error', op: 'redeem', reason: 'invite must be {inviterAddr, inviteId, inviterSig}' });
         break;
       }
+      if (pendingRedeem) {
+        emit({ type: 'error', op: 'redeem', reason: `a redeem (invite ${pendingRedeem.inviteId}) is already pending — wait for redeemed/redeem-failed` });
+        break;
+      }
       client.announce(seal(id, inv));   // swarm_engine.seal → type:'seal' tx, gossiped via the existing announce path
-      emit({ type: 'redeemed', inviteId: inv.inviteId });
-      emitStatus();
+      emit({ type: 'redeem-sent', inviteId: inv.inviteId });
+      pendingRedeem = {
+        inviteId: inv.inviteId,
+        deadline: Date.now() + REDEEM_TIMEOUT_MS,
+        poll: setInterval(checkPendingRedeem, Math.min(250, Math.max(50, Math.floor(REDEEM_TIMEOUT_MS / 6)))),
+      };
+      checkPendingRedeem();   // may confirm instantly (our own fold already has the seal + founders)
       break;
     }
   }

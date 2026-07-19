@@ -111,6 +111,44 @@ by a `status` line showing it caught back up to the same tip as Node B.
 | `STORE_FILE` | unset (no persistence) | local snapshot file (ledger/locks/accepted-state — NOT the identity/keypair; see `IDENTITY_FILE`) |
 | `RECONNECT_BASE_MS` | `200` | initial reconnect delay after a drop |
 | `RECONNECT_MAX_MS` | `10000` | reconnect delay cap (doubles each attempt up to this) |
+| `GENESIS_FILE` | `genesis.json` next to `run_node.js` | founder set + default relay for the "download and run" path. Explicit env vars always win. Read fail-closed, **no `.bak` fallback** (genesis is read-only for the node — a planted `.bak` must never substitute a founder set), and founder entries are validated to the exact `M_` + 32-uppercase-hex address shape at boot. |
+| `REDEEM_TIMEOUT_MS` | `30000` | how long a pending `{op:'redeem'}` waits for confirmed membership before `redeem-failed` |
+
+## Self-serve join — invites, and what the quota is (and is NOT)
+
+A member issues an invite with `{op:'invite'}` (delivered out of band); a
+newcomer joins with `{op:'redeem', invite:…}`. The redeem ack is **honest**:
+`redeem-sent` on announce → `redeemed` only once the address actually appears
+in the folded member set → `redeem-failed` after `REDEEM_TIMEOUT_MS` if it
+never does (bad/used invite, quota exhausted, or network unreachable).
+
+> ⚠️ **QUOTA HONESTY — read before trusting the ≤5 invite limit.** The
+> engine's ≤5-invites quota is **per-ADDRESS rate limiting, NOT per-human
+> Sybil resistance**. Every invited member gets its own fresh quota of 5, so
+> one human can *chain* identities (invite their own second wallet, which
+> invites a third, …) — bounded in speed, unbounded in depth, **by design on
+> this path**. Per-HUMAN enforcement ("one human, one million") is the job of
+> the Self-gate nullifier path (`self_gate.js` — passport-proven uniqueness),
+> not the invite quota. The invite path is acceptable for a trusted
+> friends/family beta precisely because the humans are known; it is **not**
+> an open-launch gate.
+
+> ⚠️ **INVITE CONTESTABILITY (engine-level, documented not fixed —
+> surfaced by `test_selfserve_fixes.js`).** `fold()` resolves two seals for
+> the SAME invite by seal-id (hash) order, not arrival order. So an invite
+> stays contestable even after it was redeemed: a later rival seal that
+> happens to hash-sort first **retroactively displaces the first member** —
+> identically on every node (no fork), but the displaced member loses
+> membership, funds, and history. Practical rule for the beta: treat a
+> leaked invite as fully compromised even after "your" redeem succeeded,
+> and deliver invites strictly one-to-one. The real fix (first-certified
+> wins, or binding an invite to a specific redeemer address) is a
+> `swarm_engine.js` protocol change — logged for a future audited bite.
+
+A node also emits `{type:'warning', code:'possible-fork'}` (observation only,
+no protocol behavior) if the relay archive carries a founder seal that is not
+in its own genesis founder set — the loudest available sign of a stale/wrong
+`genesis.json` or a forked network.
 
 ## Persisted node identity — ⚠️ `identity.json` IS THE WALLET
 

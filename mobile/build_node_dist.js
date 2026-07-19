@@ -97,6 +97,11 @@ function copy(fromAbs, toAbs) {
   for (const f of all.sort()) console.log(`     money-node/${f}`);
   console.log('\n   Leak check: PASS (no server.js / self_gate.js / ledger_chain.js / App.js / tests / .env).');
   console.log('   npm deps: ws + tweetnacl only.\n');
-  console.log('   ⚠️  Before distributing: confirm swarm/genesis.json "founders" holds the REAL');
-  console.log('       testnet founder addresses (the shipped value is a documented placeholder).\n');
+  console.log('   ⚠️  BEFORE ZIPPING — swarm/genesis.json still holds a PLACEHOLDER founder list.');
+  console.log('       Replace it with the addresses of the SEALED testnet founders: the two nodes');
+  console.log('       from the July 9 two-machine smoke test (your Windows desktop node + the');
+  console.log('       Hetzner testnet-box node — the ones that ran {"op":"seal_founder"}).');
+  console.log('       Each address is printed on that node\'s {"type":"ready","address":"M_..."}');
+  console.log('       startup line (or its identity.json). A wrong/stale founder list = every');
+  console.log('       friend\'s node sees members:0 forever and warns "possible-fork".\n');
 })();

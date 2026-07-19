@@ -74,8 +74,14 @@ that's what keeps the network fair.
    ```
    {"op":"redeem","invite":{"inviterAddr":"M_…","inviteId":"…","inviterSig":"…"}}
    ```
-3. You'll see `{"type":"redeemed",…}` and, moments later, a status line showing
-   your **1,000,000**. You're in.
+3. Watch for these lines, in order:
+   - `{"type":"redeem-sent",…}` — your join request went out.
+   - `{"type":"redeemed",…}` — **confirmed**: the network accepted you. A status
+     line with your **1,000,000** follows. You're in. 🎉
+   - If instead you see `{"type":"redeem-failed",…}` (after ~30 seconds), the
+     invite didn't work — it may have been mistyped, already used by someone
+     else, or your internet dropped. Ask your inviter for a fresh invite and
+     try again. Nothing is lost.
 
 > An invite is like a gift card — whoever holds it can use it. Only accept one sent
 > **directly to you** by someone you trust, and don't post it anywhere public.
@@ -99,6 +105,8 @@ that's what keeps the network fair.
 | `Node.js is not installed` | Install it from https://nodejs.org (the **LTS** button), then try again. |
 | `{"type":"connection","state":"disconnected"}` | Lost the network for a moment — it reconnects on its own. |
 | `{"type":"connection","state":"connected"}` | You're connected to the network. |
+| `{"type":"redeem-failed",…}` | Your invite didn't work (mistyped, already used, or no connection). Ask for a fresh one — nothing is lost. |
+| `{"type":"warning","code":"possible-fork",…}` | Your download may be outdated — tell the person who sent you this folder; they'll send you a fresh one. |
 | The number by your address isn't changing | Nothing's happening on the network right now — that's normal. |
 
 Questions? Ask the person who sent you this folder. Have fun — you're running a
