@@ -18,14 +18,43 @@
 //     restarting the process gets back the SAME address/balance instead of a
 //     fresh random one. See identity_store.js + NODE_RUN.md.
 //
+// SELF-SERVE JOIN (this bite): a freshly-DOWNLOADED node needs zero hand-set env
+// vars to make sense of the network. Two additive pieces, no protocol change:
+//   • GENESIS FILE — the founder set (genesis config) + default relay URL travel
+//     WITH the download as genesis.json (beside this script), instead of every
+//     node needing an identical FOUNDERS_JSON env var hand-copied in. This is the
+//     genesis every node must already agree on; shipping it in the folder — NOT
+//     serving it from the relay — means a compromised relay still can't inject a
+//     fake founder set (the relay's no-authority threat model is preserved). The
+//     founder set is a FILE the node reads and logs at boot; it is never mutated
+//     by a remote message.
+//   • INVITE / REDEEM ops — a newcomer becomes a spending MEMBER via the existing,
+//     already-audited seal/invite mechanism in swarm_engine.js (makeInvite + seal),
+//     reachable over stdio. NOTE (honest correction to a common misreading):
+//     membership is INVITE-certified, not committee-quorum-certified — quorum in
+//     swarm_engine only gates spends/channels, never member admission. An existing
+//     member issues a quota-limited (≤5) invite with their own key; the newcomer
+//     redeems it by self-sealing with THEIR key and gossiping that seal. No new
+//     consensus rule is introduced — this only plumbs the existing seal path.
+//
 // Protocol (JSON Lines):
 //   stdin  — one command object per line:
 //     {op:'seal_founder'}                              — announce this identity as a founder
+//     {op:'invite', inviteId?}                          — (member only) issue a signed, quota-limited
+//                                                          invite; emitted to stdout for OUT-OF-BAND
+//                                                          delivery to a newcomer (an invite is a bearer
+//                                                          credential — hand it to ONE person, do NOT
+//                                                          broadcast it)
+//     {op:'redeem', invite:{inviterAddr,inviteId,inviterSig}}  — (newcomer) self-seal with the invite
+//                                                          and gossip the seal → become a member
 //     {op:'pay', to, amount, nonce, epoch}              — submit a signed promise
 //     {op:'status'}                                     — request an immediate status line
 //     {op:'close'}                                       — disconnect and exit
 //   stdout — one event object per line:
 //     {type:'ready', address, pub}                      — connected to the relay
+//     {type:'invite', invite:{...}}                      — a freshly issued invite (deliver out of band)
+//     {type:'redeemed', inviteId}                        — the newcomer's self-seal was announced
+//     {type:'error', op, reason}                         — a stdin op was malformed/rejected (no crash)
 //     {type:'status', address, hash, members, frauds, balances}  — emitted on every
 //       ledger change (autonomous) AND in response to {op:'status'}
 //     {type:'connection', address, state}                — Bite 2: 'connected' |
@@ -45,17 +74,48 @@
 
 const WS = require('ws');
 const fs = require('fs');
+const crypto = require('crypto');
 const readline = require('readline');
 const path = require('path');
 const { NodeClient } = require('./node_client');
-const { founderSeal } = require('./swarm_engine');
+const { founderSeal, makeInvite, seal } = require('./swarm_engine');
 const { mkIdentity } = require('./committee_bridge');
 const identityStore = require('./identity_store');
+const safeStore = require('../safe_store');
 
-const RELAY_URL    = process.env.RELAY_URL;
 const NODE_LABEL   = process.env.NODE_LABEL;
-const FOUNDERS     = JSON.parse(process.env.FOUNDERS_JSON || '[]');   // array of addresses
 const STORE_FILE   = process.env.STORE_FILE || null;                  // optional — persistence across restarts
+
+// ── GENESIS (self-serve join): founder set + default relay travel WITH the download ──
+// GENESIS_FILE (default: genesis.json beside this script) carries { founders:[...],
+// relay:"wss://..." } so a freshly-downloaded node needs NO hand-set env var. Read
+// FAIL-CLOSED via safe_store.loadStrict — a present-but-corrupt genesis is a hard
+// error (never a silent "empty founder set", which would make the node quietly fail
+// to validate the whole network). Absent genesis → falls back to env, so every
+// existing test harness (which sets FOUNDERS_JSON/RELAY_URL and ships no genesis
+// file) is byte-for-byte unchanged.
+const GENESIS_FILE = process.env.GENESIS_FILE || path.join(__dirname, 'genesis.json');
+const GENESIS_MISSING = Symbol('no-genesis-file');
+let genesis = null;
+try {
+  const g = safeStore.loadStrict(GENESIS_FILE, GENESIS_MISSING);
+  if (g !== GENESIS_MISSING) {
+    if (!g || typeof g !== 'object' || Array.isArray(g) || !Array.isArray(g.founders)) {
+      throw new Error('genesis must be a JSON object with a "founders" array (and optional "relay" string)');
+    }
+    genesis = g;
+  }
+} catch (e) {
+  process.stderr.write(`[run_node] genesis file "${GENESIS_FILE}" is present but invalid — refusing to start (fail-closed): ${e.message}\n`);
+  process.exit(1);
+}
+
+// Precedence: an explicit env var ALWAYS wins (keeps every existing test unchanged),
+// otherwise fall back to genesis (the "download and run" path).
+const FOUNDERS   = process.env.FOUNDERS_JSON !== undefined
+  ? JSON.parse(process.env.FOUNDERS_JSON || '[]')
+  : (genesis ? genesis.founders : []);
+const RELAY_URL  = process.env.RELAY_URL || (genesis && genesis.relay) || undefined;
 // Persisted node identity ("download and run"): when NODE_LABEL is unset, the node's
 // keypair is loaded from — or, on first boot, generated and saved to — IDENTITY_FILE
 // (default: identity.json next to this script), so restarting the process reuses the
@@ -76,9 +136,14 @@ const VOTE_RETRY_BACKOFF_MS   = process.env.VOTE_RETRY_BACKOFF_MS   ? Number(pro
 const VOTE_RETRY_ABANDON_MS   = process.env.VOTE_RETRY_ABANDON_MS   ? Number(process.env.VOTE_RETRY_ABANDON_MS)   : undefined;
 
 if (!RELAY_URL) {
-  process.stderr.write('run_node.js requires the RELAY_URL env var\n');
+  process.stderr.write('run_node.js needs a relay URL — set RELAY_URL, or ship a genesis.json with a "relay" field\n');
   process.exit(1);
 }
+// Explicit + logged: the founder set the node is trusting as genesis, and where it
+// came from. Never silently mutated at runtime by any remote message.
+process.stderr.write(`[run_node] genesis: ${FOUNDERS.length} founder(s) from ${
+  process.env.FOUNDERS_JSON !== undefined ? 'FOUNDERS_JSON env' : (genesis ? GENESIS_FILE : 'no source (empty)')
+}; relay ${RELAY_URL}\n`);
 
 // NODE_LABEL set (every existing test harness): unchanged deterministic identity,
 // no file I/O — a test can still precompute a node's address from its label.
@@ -131,6 +196,36 @@ rl.on('line', (line) => {
     case 'pay':          client.pay(cmd.to, cmd.amount, cmd.nonce, cmd.epoch); break;
     case 'status':       emitStatus(); break;
     case 'close':        client.close(); process.exit(0); break;
+
+    // ── SELF-SERVE JOIN ──────────────────────────────────────────────────────
+    // Issue an invite (member only). An invite is a bearer credential signed with
+    // OUR key: whoever holds it can seal THEMSELVES as a member (bound to their own
+    // key, quota ≤5 enforced by the ledger fold). So it is emitted to stdout for
+    // OUT-OF-BAND, point-to-point delivery to ONE newcomer — deliberately NOT
+    // broadcast over the relay (broadcasting a bearer invite = an open Sybil door).
+    case 'invite': {
+      const inviteId = (typeof cmd.inviteId === 'string' && cmd.inviteId) || crypto.randomBytes(8).toString('hex');
+      const invite = makeInvite(id, inviteId);   // swarm_engine — signs INVITE:<us>:<inviteId> with our key
+      process.stderr.write(`[run_node] issued invite ${inviteId} (deliver OUT OF BAND to one person; do not broadcast)\n`);
+      emit({ type: 'invite', invite });
+      break;
+    }
+    // Redeem an invite handed to us out of band → self-seal with OUR key and gossip
+    // it. The seal is bound to our address (SEAL:<us>:<inviteId>), so sending it over
+    // the relay is safe (a compromised relay can neither forge nor reassign it). On
+    // the next fold across the network we become a member with our 1,000,000.
+    case 'redeem': {
+      const inv = cmd.invite;
+      if (!inv || typeof inv !== 'object' || typeof inv.inviterAddr !== 'string'
+          || typeof inv.inviteId !== 'string' || typeof inv.inviterSig !== 'string') {
+        emit({ type: 'error', op: 'redeem', reason: 'invite must be {inviterAddr, inviteId, inviterSig}' });
+        break;
+      }
+      client.announce(seal(id, inv));   // swarm_engine.seal → type:'seal' tx, gossiped via the existing announce path
+      emit({ type: 'redeemed', inviteId: inv.inviteId });
+      emitStatus();
+      break;
+    }
   }
 });
 

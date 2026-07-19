@@ -1,0 +1,6 @@
+# The Linux/Mac launcher MUST stay LF-terminated — a CRLF shebang line breaks it
+# on those systems (and build_node_dist.js copies this file verbatim into the
+# distributable). Pin line endings so autocrlf on a Windows clone can't corrupt it.
+start-node.sh text eol=lf
+# The Windows launcher wants CRLF.
+start-node.bat text eol=crlf
