@@ -256,6 +256,11 @@ const readSelfFile = () => { try { return JSON.parse(fs.readFileSync(SELF_FILE, 
     (code === 0) ? ok('test_brick1.js (→ Phase 0–3) → exit 0: existing behavior unchanged')
                  : bad(`test_brick1.js → exit ${code}`);
   }
+  {
+    const code = await runNode('test_self_gate_failclosed.js');   // fail-closed nullifier store (Cowork CRITICAL finding on d819aa3)
+    (code === 0) ? ok('test_self_gate_failclosed.js → exit 0: nullifier store fails CLOSED on corruption, server survives a broken store')
+                 : bad(`test_self_gate_failclosed.js → exit ${code}`);
+  }
 
   console.log(`\n  ${fails === 0 ? '🎉' : '💥'}  Self gate: ${fails === 0 ? 'ALL PROBES PASS' : fails + ' FAILURE(S)'} — one human, one million, nullifier-sealed; faucet/standing/chain unchanged.\n`);
   process.exit(fails === 0 ? 0 : 1);

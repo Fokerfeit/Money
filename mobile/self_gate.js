@@ -24,15 +24,47 @@ const WALLET_RE   = /^M_[0-9A-Fa-f]{32}$/i;  // the shape App.js seals (toAddres
 
 // ── Nullifier store (persistence-injected) ───────────────────────────────────
 // Records nullifier → wallet. `storage` is a tiny sync KV ({getItem,setItem}),
-// so the server backs it with a file and a test backs it with a plain object.
-// A nullifier, once sealed, can never be re-sealed (the Sybil ledger).
+// so the server backs it with a file (see server.js — routed through
+// safe_store.js's atomic dual-bak write, the same fail-closed pattern used by
+// identity_store.js) and a test backs it with a plain object. A nullifier, once
+// sealed, can never be re-sealed (the Sybil ledger).
+//
+// FAIL-CLOSED (CRITICAL fix — Cowork's first audit of d819aa3): this used to
+// catch ANY load failure — a torn write, truncated file, hand-edited garbage —
+// and silently reset to `map = {}`. That would let an already-sealed nullifier
+// "come back" and mint a SECOND time after the store's own file was corrupted,
+// which is exactly the Sybil hole this whole gate exists to close. A corrupted
+// store must refuse to load, not quietly forget every human who already
+// ignited. `getItem() === null/undefined` is the ONLY case treated as a
+// genuine first boot — everything else that isn't valid, well-shaped JSON
+// THROWS, and the throw propagates out of createNullifierStore() (load() runs
+// at construction) so a broken store can never come up looking healthy.
 function createNullifierStore(storage) {
   const KEY = 'self_nullifiers_v1';
   let map = {};
   function load() {
-    try { const raw = storage.getItem(KEY); map = raw ? JSON.parse(raw) : {}; }
-    catch { map = {}; }
-    if (!map || typeof map !== 'object') map = {};
+    const raw = storage.getItem(KEY);
+    if (raw === null || raw === undefined) { map = {}; return map; }   // no store at all yet = genuine first boot
+    if (raw === '') {
+      throw new Error(
+        `self_gate nullifier store ("${KEY}") is present but EMPTY — a fresh store has no file/entry at all, ` +
+        `so an empty one looks like a torn or interrupted write, not a first boot. Refusing to silently reset ` +
+        `(fail-closed): that could let an already-sealed nullifier re-mint. Restore from a backup, or if you are ` +
+        `certain no nullifier was ever sealed, remove the store and restart.`
+      );
+    }
+    let parsed;
+    try { parsed = JSON.parse(raw); }
+    catch (e) {
+      throw new Error(`self_gate nullifier store ("${KEY}") is not valid JSON — refusing to silently reset (fail-closed): ${e.message}`);
+    }
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error(
+        `self_gate nullifier store ("${KEY}") parsed to ${Array.isArray(parsed) ? 'an array' : parsed === null ? 'null' : typeof parsed} ` +
+        `(expected a plain {nullifier: wallet} object) — refusing to silently reset (fail-closed).`
+      );
+    }
+    map = parsed;
     return map;
   }
   function persist() { storage.setItem(KEY, JSON.stringify(map)); }

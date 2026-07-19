@@ -6,6 +6,7 @@ const nacl      = require('tweetnacl');
 const rateLimit = require('express-rate-limit');
 const ledgerChain = require('./ledger_chain');   // Brick 1: tamper-evident integrity layer (additive, read-only)
 const selfGate    = require('./self_gate');      // Self personhood-ignition gate (pure; @selfxyz loaded lazily only if enabled)
+const safeStore   = require('./safe_store');     // atomic, fail-closed JSON persistence (self-gate nullifier store)
 
 const app = express();
 // SECURITY: default to NOT trusting X-Forwarded-For (0). A directly-exposed or
@@ -704,61 +705,95 @@ ignitionCode = (ignitionCode || '').trim().toUpperCase();
 // ─────────────────────────────────────────────────────────────────────────────
 if (process.env.SELF_GATE === '1') {
   const SELF_FILE = process.env.MONEY_SELF_FILE || path.join(DATA_DIR, 'self_nullifiers.json');
-  // File-backed sync KV for the nullifier ledger (one logical key → one file).
+  // File-backed sync KV for the nullifier ledger, routed through safe_store.js's
+  // atomic dual-bak write / union load — the SAME fail-closed pattern
+  // identity_store.js uses, instead of hand-rolling a second persistence
+  // mechanism (this is literally the use case safe_store.js's own header
+  // comment names: "APPEND-ONLY SETS ... keep the nullifier/codes sets safe").
+  // dualBak: .bak always carries the newest content (never lags), and loadUnion
+  // reads BOTH copies — a single-copy corruption recovers from the other instead
+  // of being fatal; only if BOTH copies are unreadable/invalid does this throw.
   const selfStorage = {
-    getItem: () => { try { return fs.readFileSync(SELF_FILE, 'utf8'); } catch { return null; } },
-    setItem: (_k, v) => { try { fs.writeFileSync(SELF_FILE, v); } catch (e) { console.error('Save error (self_nullifiers):', e.message); } },
+    getItem: () => {
+      const obj = safeStore.loadUnion(SELF_FILE, null);   // null = genuine first boot; THROWS if corrupted with no valid backup
+      return obj === null ? null : JSON.stringify(obj);
+    },
+    setItem: (_k, v) => { safeStore.saveAtomicDual(SELF_FILE, v); },
   };
-  const selfStore = selfGate.createNullifierStore(selfStorage);
 
-  // Verifier: the real SelfBackendVerifier (mock mode) in production; a stub in
-  // tests. The stub is gated behind NODE_ENV=test AND SELF_GATE_STUB=1 so it can
-  // NEVER run in production — the request simply carries the desired verdict.
-  let verify;
-  if (process.env.NODE_ENV === 'test' && process.env.SELF_GATE_STUB === '1') {
-    verify = async (payload) => ({
-      valid:     !!(payload && payload.stub && payload.stub.valid),
-      nullifier: payload && payload.stub ? payload.stub.nullifier : undefined,
-    });
-    console.log('[self-gate] TEST STUB verifier active (NODE_ENV=test, SELF_GATE_STUB=1)');
-  } else {
-    verify = selfGate.realSelfVerifier({
-      scope:    process.env.SELF_SCOPE,
-      endpoint: process.env.SELF_ENDPOINT,
-    }).verify;
+  // createNullifierStore() calls load() once, at construction — so a corrupted
+  // store (both main and .bak unreadable/invalid) throws HERE, at server boot,
+  // not inside a request handler. Catch it here rather than letting it crash the
+  // ENTIRE money server over one flag-gated side feature: every OTHER endpoint
+  // (transfers, balances, the Brick 1 chain) must keep working even if the
+  // self-gate's own store is broken. /ignite/self itself fails closed instead —
+  // see the always-500 route registered below.
+  let selfStore, selfStoreBootError = null;
+  try { selfStore = selfGate.createNullifierStore(selfStorage); }
+  catch (e) {
+    selfStoreBootError = e;
+    console.error('[self-gate] CRITICAL — nullifier store failed to load at boot, refusing to serve /ignite/self:', e.message);
   }
 
-  // The Self mint shares the WRITE-AUTHORITATIVE `ledger` (central), exactly like
-  // the faucet — so isIgnited / standing / the Brick 1 tip all advance identically.
-  const gate = selfGate.createSelfGate({ verify, ledger, store: selfStore });
-
-  // Ignition is irreversible: cap proof submissions per IP (the nullifier is the
-  // real one-per-human gate; this only blunts proof-spam DoS).
-  const selfLimiter = rateLimit({
-    windowMs: 60 * 60 * 1000,
-    max: process.env.NODE_ENV === 'test' ? 100000 : 10,
-    message: { error: 'Too many ignition attempts — try again later.' },
-  });
-
-  app.post('/ignite/self', selfLimiter, async (req, res) => {
-    try {
-      const body   = req.body || {};
-      const wallet = body.wallet || body.to;          // M_ address to ignite
-      const result = await gate.claim(body, wallet);
-      if (!result.ok) {
-        const status = (result.code === 'nullifier-used' || result.code === 'wallet-ignited') ? 409
-                     : (result.code === 'invalid-proof'  || result.code === 'verify-error')   ? 401
-                     : 400;
-        return res.status(status).json({ error: result.reason, code: result.code, ...(result.boundTo ? { boundTo: result.boundTo } : {}) });
-      }
-      console.log(`[self-gate] ignited ${result.wallet} via nullifier ${String(result.nullifier).slice(0, 10)}…`);
-      res.json({ success: true, wallet: result.wallet, amount: result.amount, tx: result.tx });
-    } catch (e) {
-      console.error('[self-gate] error:', e.message);
-      res.status(500).json({ error: 'self ignition failed' });
+  if (selfStoreBootError) {
+    app.post('/ignite/self', (req, res) => {
+      res.status(500).json({ error: 'Ignition system error', code: 'store-unavailable' });
+    });
+    console.log('[self-gate] DISABLED — nullifier store is unavailable (see CRITICAL log above); /ignite/self always returns 500. Rest of the server is unaffected.');
+  } else {
+    // Verifier: the real SelfBackendVerifier (mock mode) in production; a stub in
+    // tests. The stub is gated behind NODE_ENV=test AND SELF_GATE_STUB=1 so it can
+    // NEVER run in production — the request simply carries the desired verdict.
+    let verify;
+    if (process.env.NODE_ENV === 'test' && process.env.SELF_GATE_STUB === '1') {
+      verify = async (payload) => ({
+        valid:     !!(payload && payload.stub && payload.stub.valid),
+        nullifier: payload && payload.stub ? payload.stub.nullifier : undefined,
+      });
+      console.log('[self-gate] TEST STUB verifier active (NODE_ENV=test, SELF_GATE_STUB=1)');
+    } else {
+      verify = selfGate.realSelfVerifier({
+        scope:    process.env.SELF_SCOPE,
+        endpoint: process.env.SELF_ENDPOINT,
+      }).verify;
     }
-  });
-  console.log(`[self-gate] ENABLED — POST /ignite/self (mock mode${process.env.NODE_ENV === 'test' && process.env.SELF_GATE_STUB === '1' ? ', test stub' : ''})`);
+
+    // The Self mint shares the WRITE-AUTHORITATIVE `ledger` (central), exactly like
+    // the faucet — so isIgnited / standing / the Brick 1 tip all advance identically.
+    const gate = selfGate.createSelfGate({ verify, ledger, store: selfStore });
+
+    // Ignition is irreversible: cap proof submissions per IP (the nullifier is the
+    // real one-per-human gate; this only blunts proof-spam DoS).
+    const selfLimiter = rateLimit({
+      windowMs: 60 * 60 * 1000,
+      max: process.env.NODE_ENV === 'test' ? 100000 : 10,
+      message: { error: 'Too many ignition attempts — try again later.' },
+    });
+
+    app.post('/ignite/self', selfLimiter, async (req, res) => {
+      try {
+        const body   = req.body || {};
+        const wallet = body.wallet || body.to;          // M_ address to ignite
+        const result = await gate.claim(body, wallet);
+        if (!result.ok) {
+          const status = (result.code === 'nullifier-used' || result.code === 'wallet-ignited') ? 409
+                       : (result.code === 'invalid-proof'  || result.code === 'verify-error')   ? 401
+                       : 400;
+          return res.status(status).json({ error: result.reason, code: result.code, ...(result.boundTo ? { boundTo: result.boundTo } : {}) });
+        }
+        console.log(`[self-gate] ignited ${result.wallet} via nullifier ${String(result.nullifier).slice(0, 10)}…`);
+        res.json({ success: true, wallet: result.wallet, amount: result.amount, tx: result.tx });
+      } catch (e) {
+        // A store error (e.g. disk corruption occurring WHILE the server is up)
+        // surfacing through gate.claim() lands here — same fail-closed contract
+        // as the boot-time guard above: clear 500, logged, no fallback to any
+        // other ignition path, no retry.
+        console.error('[self-gate] error:', e.message);
+        res.status(500).json({ error: 'Ignition system error', code: 'internal-error' });
+      }
+    });
+    console.log(`[self-gate] ENABLED — POST /ignite/self (mock mode${process.env.NODE_ENV === 'test' && process.env.SELF_GATE_STUB === '1' ? ', test stub' : ''})`);
+  }
 }
 
 // ── Debug endpoint (dev-only — remove or auth-gate before public launch) ──
