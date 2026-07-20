@@ -107,7 +107,7 @@ function createBridge({ founders, epoch = 0, enforceCap = false } = {}) {
   function sealMember(id, opts = {}) {
     register(id);
     if (opts.inviter) {
-      const inv = makeInvite(opts.inviter, opts.inviteId);
+      const inv = makeInvite(opts.inviter, opts.inviteId, id.address);   // bound invites: target = the member being sealed
       ledger.add(seal(id, inv));
     } else {
       ledger.add(founderSeal(id));            // founder membership

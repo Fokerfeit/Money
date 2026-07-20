@@ -18,20 +18,16 @@
 // Runs run_node.js straight from the repo (dist packaging is test_selfserve_join's
 // job) with GENESIS_FILE pointed at per-probe temp files.
 //
-// ⚠️ ENGINE-LEVEL FINDING SURFACED BY THIS SUITE (reported, NOT fixed here —
-// swarm_engine.js is byte-identical-constrained): fold() resolves competing seals
-// for the same invite by sorting on seal id (a hash), NOT by arrival order —
-// deterministic on the message SET, blind to time. Consequence: an invite stays
-// CONTESTABLE even after it was "spent" — if a second seal for the same invite
-// later appears and happens to sort first, it retroactively displaces the first
-// member (identically on every node — no fork, but the first redeemer loses
-// membership, funds, and any history built on it). ~50% odds per contest, decided
-// by hash order. The honest redeem ack (fix 2) faithfully reports whichever way
-// fold decides; it cannot and does not paper over this. Because ed25519 signing is
-// deterministic, this test PINS the winner: it precomputes both candidate seal ids
-// and picks an inviteId where the first redeemer provably sorts first, making the
-// race loser deterministic. The protocol-level fix (e.g. first-certified-wins or
-// invite-bound-to-redeemer) is a swarm_engine change — flagged for Luca/Cowork.
+// CONTESTABILITY STATUS: the engine-level hole this suite originally surfaced
+// (fold() resolving same-invite contests by seal-id hash order → a rival seal
+// could retroactively displace an admitted member) is now CLOSED by the
+// bound-invites protocol change: makeInvite signs over a target address, and
+// fold() verifies the invite signature against the sealer's own address — so
+// only the bound redeemer can EVER produce a verifying seal. Probe (2c-i) below
+// proves rejection in the previously-winning adversarial hash order: the rival
+// seal is PINNED (via deterministic ed25519 seal ids) to sort FIRST, exactly the
+// order that used to steal membership, and fold must still admit only the bound
+// redeemer. Old unbound invites are a clean break — simply invalid.
 
 const { spawn } = require('child_process');
 const fs = require('fs');
@@ -152,22 +148,21 @@ async function expectGenesisRejected(label, body, alsoBak = null) {
   founder.send({ op: 'seal_founder' });
   await waitUntil(founder, () => { const s = founder.lastStatus(); return s && s.members >= 1; });
 
-  // Pin the (2c) race outcome: fold resolves same-invite contests by seal-id hash
-  // order (see the finding note in the header), and ed25519 signing is
-  // deterministic — so precompute both contenders' seal ids and pick an inviteId
-  // where nc1's seal provably sorts FIRST. nc1 then wins regardless of timing.
-  const nc1Id = mkIdentity('fix-nc1'), nc3Id = mkIdentity('fix-nc3');
-  let pinnedInviteId = null;
-  for (let i = 0; i < 500 && !pinnedInviteId; i++) {
-    const cand = `pinned-race-${i}`;
-    const inv = E.makeInvite(founderId, cand);
-    if (E.seal(nc1Id, inv).id < E.seal(nc3Id, inv).id) pinnedInviteId = cand;
-  }
-  if (!pinnedInviteId) { bad('could not pin a race-winning inviteId in 500 tries'); process.exit(1); }
+  const nc1Id = mkIdentity('fix-nc1'), nc3Id = mkIdentity('fix-nc3'), nc4Id = mkIdentity('fix-nc4');
 
-  founder.send({ op: 'invite', inviteId: pinnedInviteId });
+  // (2-pre) an invite WITHOUT a target must be refused with a helpful error.
+  founder.send({ op: 'invite' });
+  const inviteErr = await waitUntil(founder, () => !!founder.find((l) => l.type === 'error' && l.op === 'invite'));
+  (inviteErr && /for:'M_/.test(founder.find((l) => l.type === 'error' && l.op === 'invite').reason))
+    ? ok("(2-pre) {op:'invite'} without 'for' → clear error telling the inviter to get the friend's address")
+    : bad('(2-pre) missing-target invite not refused helpfully');
+
+  founder.send({ op: 'invite', for: nc1Id.address });
   await waitUntil(founder, () => !!founder.find((l) => l.type === 'invite'));
   const invite = founder.find((l) => l.type === 'invite').invite;
+  (invite.target === nc1Id.address)
+    ? ok('(2-pre) issued invite carries its bound target address')
+    : bad(`(2-pre) invite.target wrong: ${JSON.stringify(invite)}`);
 
   // (2a) valid invite: redeem-sent strictly precedes redeemed; member at redeemed time.
   const nc1 = bootNode(env({ NODE_LABEL: 'fix-nc1', RELAY_URL: relayUrl, FOUNDERS_JSON: JSON.stringify([founderId.address]) }));
@@ -202,27 +197,71 @@ async function expectGenesisRejected(label, body, alsoBak = null) {
     ? ok('(2b) redeem-failed carries the plain-language hint')
     : bad('(2b) redeem-failed hint missing');
 
-  // (2c) race loser: redeem the SAME invite nc1 already spent → redeem-failed.
-  const nc3 = bootNode(env({ NODE_LABEL: 'fix-nc3', RELAY_URL: relayUrl, FOUNDERS_JSON: JSON.stringify([founderId.address]), REDEEM_TIMEOUT_MS: '2500' }));
-  await waitUntil(nc3, () => !!nc3.ready());
-  await waitUntil(nc3, () => { const s = nc3.lastStatus(); return s && s.members >= 2; });   // nc3 has already SEEN the invite being spent
-  nc3.send({ op: 'redeem', invite });   // same bearer invite, already consumed by nc1
-  const failed3 = await waitUntil(nc3, () => !!nc3.find((l) => l.type === 'redeem-failed'), 9000);
-  (failed3 && !nc3.find((l) => l.type === 'redeemed'))
-    ? ok('(2c) race loser (already-spent invite) → redeem-failed, never a false redeemed')
-    : bad(`(2c) race loser mishandled: failed=${failed3}, redeemed=${!!nc3.find((l) => l.type === 'redeemed')}`);
+  // (2c-i) ENGINE: rival seal for an already-redeemed BOUND invite, from a
+  // different address, PINNED to the adversarial hash order (rival's seal id
+  // sorts FIRST — exactly the order that used to steal membership). fold must
+  // still admit only the bound redeemer.
   {
-    const s = nc3.lastStatus();
-    (s && s.members === 2)
-      ? ok('(2c) member count stayed 2 — the spent invite admitted nobody twice')
-      : bad(`(2c) unexpected member count: ${JSON.stringify(s)}`);
-    (s && s.balances[nc1Id.address] === 1_000_000)
-      ? ok('(2c) the ORIGINAL redeemer kept membership + funds in the loser\'s own fold (pinned winner held)')
-      : bad(`(2c) original redeemer displaced: ${JSON.stringify(s && s.balances)}`);
+    const F = mkIdentity('engine-founder'), A = mkIdentity('engine-bound-a'), B = mkIdentity('engine-rival-b');
+    let pinnedId = null, pinnedInv = null;
+    for (let i = 0; i < 500 && !pinnedId; i++) {
+      const inv = E.makeInvite(F, `rival-first-${i}`, A.address);   // bound to A
+      if (E.seal(B, inv).id < E.seal(A, inv).id) { pinnedId = `rival-first-${i}`; pinnedInv = inv; }
+    }
+    if (!pinnedInv) bad('(2c-i) could not pin an adversarial hash order in 500 tries');
+    else {
+      const led = new E.Ledger([F.address]);
+      led.add(E.founderSeal(F));
+      led.add(E.seal(B, pinnedInv));   // rival FIRST in both arrival AND hash order
+      led.add(E.seal(A, pinnedInv));   // the bound redeemer second
+      const { members, bal } = led.fold();
+      (members[A.address] && !members[B.address] && bal[A.address] === E.MINT)
+        ? ok('(2c-i) ENGINE: rival seal (sorts FIRST — the old winning order) REJECTED; bound redeemer admitted with 1,000,000')
+        : bad(`(2c-i) engine admitted wrong member: A=${!!members[A.address]} B=${!!members[B.address]}`);
+      // and the same set folded with ONLY the rival present: nobody is admitted
+      const led2 = new E.Ledger([F.address]);
+      led2.add(E.founderSeal(F));
+      led2.add(E.seal(B, pinnedInv));
+      (!led2.fold().members[B.address])
+        ? ok('(2c-i) ENGINE: a thief holding a stolen bound invite is admitted NOWHERE (interception closed)')
+        : bad('(2c-i) thief admitted with a stolen bound invite');
+    }
   }
 
+  // (2c-ii) STDIO: a node redeeming an invite bound to SOMEONE ELSE gets an
+  // immediate, clear error — no announce, no 30s timeout.
+  const nc3 = bootNode(env({ NODE_LABEL: 'fix-nc3', RELAY_URL: relayUrl, FOUNDERS_JSON: JSON.stringify([founderId.address]), REDEEM_TIMEOUT_MS: '2500' }));
+  await waitUntil(nc3, () => !!nc3.ready());
+  await waitUntil(nc3, () => { const s = nc3.lastStatus(); return s && s.members >= 2; });
+  nc3.send({ op: 'redeem', invite });   // nc1's invite — bound to nc1, not nc3
+  const boundErr = await waitUntil(nc3, () => !!nc3.find((l) => l.type === 'error' && l.op === 'redeem' && /bound to/.test(l.reason)));
+  (boundErr && !nc3.find((l) => l.type === 'redeemed') && !nc3.find((l) => l.type === 'redeem-sent'))
+    ? ok('(2c-ii) redeeming someone else\'s bound invite → immediate clear error, nothing announced')
+    : bad(`(2c-ii) bound-mismatch redeem mishandled: ${JSON.stringify(nc3.lines.filter((l) => l.type !== 'status').slice(-4))}`);
+
+  // (2c-iii) the ORIGINAL race scenario, done right: two DIFFERENT bound invites,
+  // two newcomers — both join, no contest possible.
+  founder.send({ op: 'invite', for: nc3Id.address });
+  await waitUntil(founder, () => founder.lines.filter((l) => l.type === 'invite').length >= 2);
+  const invite3 = founder.lines.filter((l) => l.type === 'invite').pop().invite;
+  nc3.send({ op: 'redeem', invite: invite3 });
+  const nc4 = bootNode(env({ NODE_LABEL: 'fix-nc4', RELAY_URL: relayUrl, FOUNDERS_JSON: JSON.stringify([founderId.address]) }));
+  await waitUntil(nc4, () => !!nc4.ready());
+  founder.send({ op: 'invite', for: nc4Id.address });
+  await waitUntil(founder, () => founder.lines.filter((l) => l.type === 'invite').length >= 3);
+  const invite4 = founder.lines.filter((l) => l.type === 'invite').pop().invite;
+  nc4.send({ op: 'redeem', invite: invite4 });
+  const bothJoined = await waitUntil(nc4, () => {
+    const s3 = nc3.lastStatus(), s4 = nc4.lastStatus();
+    return s3 && s4 && s3.members === 4 && s4.members === 4
+      && s4.balances[nc3Id.address] === 1_000_000 && s4.balances[nc4Id.address] === 1_000_000;
+  }, 15000);
+  (bothJoined && nc3.find((l) => l.type === 'redeemed') && nc4.find((l) => l.type === 'redeemed'))
+    ? ok('(2c-iii) two DIFFERENT bound invites → both newcomers join cleanly (members=4, both funded)')
+    : bad(`(2c-iii) two-invite scenario failed: nc3=${JSON.stringify(nc3.lastStatus())} nc4=${JSON.stringify(nc4.lastStatus())}`);
+
   // No fork warnings anywhere on the happy path (same genesis everywhere).
-  ([founder, nc1, nc2, nc3].every((n) => !n.find((l) => l.type === 'warning' && l.code === 'possible-fork')))
+  ([founder, nc1, nc2, nc3, nc4].every((n) => !n.find((l) => l.type === 'warning' && l.code === 'possible-fork')))
     ? ok('(3-pre) NO possible-fork warning on the happy path (no false positives)')
     : bad('(3-pre) spurious possible-fork warning emitted on matching genesis');
 
@@ -257,7 +296,7 @@ async function expectGenesisRejected(label, body, alsoBak = null) {
     await killNode(forkNode);
   }
 
-  await killNode(founder); await killNode(nc1); await killNode(nc2); await killNode(nc3);
+  await killNode(founder); await killNode(nc1); await killNode(nc2); await killNode(nc3); await killNode(nc4);
   await relay.close();
   fs.rmSync(TMP, { recursive: true, force: true });
 

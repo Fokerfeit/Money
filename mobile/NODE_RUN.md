@@ -116,11 +116,16 @@ by a `status` line showing it caught back up to the same tip as Node B.
 
 ## Self-serve join — invites, and what the quota is (and is NOT)
 
-A member issues an invite with `{op:'invite'}` (delivered out of band); a
-newcomer joins with `{op:'redeem', invite:…}`. The redeem ack is **honest**:
-`redeem-sent` on announce → `redeemed` only once the address actually appears
-in the folded member set → `redeem-failed` after `REDEEM_TIMEOUT_MS` if it
-never does (bad/used invite, quota exhausted, or network unreachable).
+A member issues an invite with `{op:'invite', for:'M_…'}` — **`for` is
+required**: invites are BOUND to the named redeemer address (the inviter asks
+the friend for the address printed on their node's `ready` line first). The
+inviter's signature covers the target, so only that address can ever produce a
+seal that verifies in `fold()`. A newcomer joins with `{op:'redeem',
+invite:…}`. The redeem ack is **honest**: `redeem-sent` on announce →
+`redeemed` only once the address actually appears in the folded member set →
+`redeem-failed` after `REDEEM_TIMEOUT_MS` if it never does (bad/used invite,
+quota exhausted, or network unreachable). Redeeming an invite bound to a
+different address errors immediately instead of timing out.
 
 > ⚠️ **QUOTA HONESTY — read before trusting the ≤5 invite limit.** The
 > engine's ≤5-invites quota is **per-ADDRESS rate limiting, NOT per-human
@@ -133,17 +138,21 @@ never does (bad/used invite, quota exhausted, or network unreachable).
 > friends/family beta precisely because the humans are known; it is **not**
 > an open-launch gate.
 
-> ⚠️ **INVITE CONTESTABILITY (engine-level, documented not fixed —
-> surfaced by `test_selfserve_fixes.js`).** `fold()` resolves two seals for
-> the SAME invite by seal-id (hash) order, not arrival order. So an invite
-> stays contestable even after it was redeemed: a later rival seal that
-> happens to hash-sort first **retroactively displaces the first member** —
-> identically on every node (no fork), but the displaced member loses
-> membership, funds, and history. Practical rule for the beta: treat a
-> leaked invite as fully compromised even after "your" redeem succeeded,
-> and deliver invites strictly one-to-one. The real fix (first-certified
-> wins, or binding an invite to a specific redeemer address) is a
-> `swarm_engine.js` protocol change — logged for a future audited bite.
+> ✅ **INVITE CONTESTABILITY — CLOSED (bound invites, protocol change).**
+> History: `test_selfserve_fixes.js` originally surfaced that `fold()`
+> resolves two seals for the SAME invite by seal-id (hash) order, not
+> arrival order — so a later rival seal that hash-sorted first could
+> **retroactively displace the first member** (losing membership, funds,
+> and history, identically on every node). Fixed by the bound-invites
+> change in `swarm_engine.js`: `makeInvite(inviter, inviteId, target)`
+> signs over the target address, and `fold()` verifies the invite
+> signature against the sealer's own address — a seal from anyone but the
+> bound target simply never verifies, regardless of hash order. This also
+> closes interception: a stolen invite is unredeemable by the thief.
+> **Clean break:** old unbound invites (signed without a target) are
+> invalid — acceptable on a testnet with two founders and zero invited
+> members. Proven by probe (2c-i), which pins the rival seal to the
+> previously-winning hash order and shows it rejected.
 
 A node also emits `{type:'warning', code:'possible-fork'}` (observation only,
 no protocol behavior) if the relay archive carries a founder seal that is not

@@ -28,23 +28,26 @@
 //     fake founder set (the relay's no-authority threat model is preserved). The
 //     founder set is a FILE the node reads and logs at boot; it is never mutated
 //     by a remote message.
-//   • INVITE / REDEEM ops — a newcomer becomes a spending MEMBER via the existing,
-//     already-audited seal/invite mechanism in swarm_engine.js (makeInvite + seal),
-//     reachable over stdio. NOTE (honest correction to a common misreading):
-//     membership is INVITE-certified, not committee-quorum-certified — quorum in
-//     swarm_engine only gates spends/channels, never member admission. An existing
-//     member issues a quota-limited (≤5) invite with their own key; the newcomer
-//     redeems it by self-sealing with THEIR key and gossiping that seal. No new
-//     consensus rule is introduced — this only plumbs the existing seal path.
+//   • INVITE / REDEEM ops — a newcomer becomes a spending MEMBER via the
+//     seal/invite mechanism in swarm_engine.js (makeInvite + seal), reachable over
+//     stdio. NOTE (honest correction to a common misreading): membership is
+//     INVITE-certified, not committee-quorum-certified — quorum in swarm_engine
+//     only gates spends/channels, never member admission. An existing member
+//     issues a quota-limited (≤5) invite with their own key, BOUND to the
+//     newcomer's address ({op:'invite', for:'M_...'}); the newcomer redeems it by
+//     self-sealing with THEIR key and gossiping that seal. Since the bound-invites
+//     protocol change (see swarm_engine's makeInvite comment), only the named
+//     address can redeem — a leaked invite is useless to a thief, and a spent
+//     invite cannot be contested by a rival seal.
 //
 // Protocol (JSON Lines):
 //   stdin  — one command object per line:
 //     {op:'seal_founder'}                              — announce this identity as a founder
-//     {op:'invite', inviteId?}                          — (member only) issue a signed, quota-limited
-//                                                          invite; emitted to stdout for OUT-OF-BAND
-//                                                          delivery to a newcomer (an invite is a bearer
-//                                                          credential — hand it to ONE person, do NOT
-//                                                          broadcast it)
+//     {op:'invite', for:'M_...', inviteId?}             — (member only) issue a signed, quota-limited
+//                                                          invite BOUND to the named redeemer address;
+//                                                          emitted to stdout for out-of-band delivery.
+//                                                          'for' is REQUIRED — ask the friend for the
+//                                                          address on their node's 'ready' line first
 //     {op:'redeem', invite:{inviterAddr,inviteId,inviterSig}}  — (newcomer) self-seal with the invite
 //                                                          and gossip the seal → become a member
 //     {op:'pay', to, amount, nonce, epoch}              — submit a signed promise
@@ -287,11 +290,13 @@ rl.on('line', (line) => {
     case 'close':        client.close(); process.exit(0); break;
 
     // ── SELF-SERVE JOIN ──────────────────────────────────────────────────────
-    // Issue an invite (member only). An invite is a bearer credential signed with
-    // OUR key: whoever holds it can seal THEMSELVES as a member (bound to their own
-    // key, quota ≤5 enforced by the ledger fold). So it is emitted to stdout for
-    // OUT-OF-BAND, point-to-point delivery to ONE newcomer — deliberately NOT
-    // broadcast over the relay (broadcasting a bearer invite = an open Sybil door).
+    // Issue an invite (member only), BOUND to one named redeemer address (protocol
+    // change closing the contestability + interception holes — see swarm_engine's
+    // makeInvite comment). The inviter's signature covers the target, so only that
+    // address can ever produce a verifying seal: a stolen or leaked invite is
+    // unredeemable by anyone else, and a rival seal for a spent invite is dead on
+    // arrival regardless of hash order. Still deliver it out of band (it's useless
+    // to others now, but it's also nobody else's business).
     //
     // ⚠️ QUOTA HONESTY (audit note on 413d73a): the ≤5 quota is per-ADDRESS rate
     // limiting, NOT per-human Sybil resistance. Each invited member gets its own
@@ -301,9 +306,14 @@ rl.on('line', (line) => {
     // (self_gate.js — one passport-proven human, one ignition), not the invite
     // quota's. Fine for a trusted friends/family beta; not an open-launch gate.
     case 'invite': {
+      const target = cmd.for;
+      if (typeof target !== 'string' || !ADDR_RE.test(target)) {
+        emit({ type: 'error', op: 'invite', reason: "an invite must name its redeemer: {op:'invite', for:'M_...'} — ask your friend for their address first (their node prints it on the {\"type\":\"ready\"} line)" });
+        break;
+      }
       const inviteId = (typeof cmd.inviteId === 'string' && cmd.inviteId) || crypto.randomBytes(8).toString('hex');
-      const invite = makeInvite(id, inviteId);   // swarm_engine — signs INVITE:<us>:<inviteId> with our key
-      process.stderr.write(`[run_node] issued invite ${inviteId} (deliver OUT OF BAND to one person; do not broadcast)\n`);
+      const invite = makeInvite(id, inviteId, target);   // swarm_engine — signs INVITE:<us>:<inviteId>:<target> with our key
+      process.stderr.write(`[run_node] issued invite ${inviteId} bound to ${target} (deliver out of band; only that address can redeem it)\n`);
       emit({ type: 'invite', invite });
       break;
     }
@@ -324,6 +334,15 @@ rl.on('line', (line) => {
       }
       if (pendingRedeem) {
         emit({ type: 'error', op: 'redeem', reason: `a redeem (invite ${pendingRedeem.inviteId}) is already pending — wait for redeemed/redeem-failed` });
+        break;
+      }
+      // Fast local check (UX only — fold() enforces the same thing cryptographically):
+      // a bound invite naming someone else can never work for this node, so say so
+      // NOW instead of announcing and timing out into redeem-failed. An invite
+      // MISSING its target (old format / hand-built) is still announced — fold will
+      // reject it and the honest redeem-failed path reports that.
+      if (typeof inv.target === 'string' && inv.target !== id.address) {
+        emit({ type: 'error', op: 'redeem', reason: `this invite is bound to ${inv.target}, not this node (${id.address}) — ask your inviter for an invite made for YOUR address` });
         break;
       }
       client.announce(seal(id, inv));   // swarm_engine.seal → type:'seal' tx, gossiped via the existing announce path

@@ -113,7 +113,18 @@ const signHex = (m, sk) => toHex(CF.signRaw(strBytes(m), sk));
 const newId = name => { const k = nacl.sign.keyPair.fromSeed(nacl.randomBytes(32)); const pub = toHex(k.publicKey); return { name, address: addrOf(pub), pub, sk: k.secretKey }; };
 
 const founderSeal = id => { const sig = signHex(`FOUNDER:${id.address}`, id.sk); return { type: 'seal', founder: true, from: id.address, pub: id.pub, sig, id: sha(`F:${id.address}:${sig}`).slice(0, 16) }; };
-const makeInvite  = (inv, inviteId) => ({ inviterAddr: inv.address, inviteId, inviterSig: signHex(`INVITE:${inv.address}:${inviteId}`, inv.sk) });
+// BOUND INVITES (protocol change, 2026-07): an invite names its redeemer and the
+// inviter's signature COVERS that target address, so only the named address can
+// ever produce a seal that verifies in fold() — closing both the retroactive
+// same-invite contest (rival seal displacing an admitted member by hash order)
+// and interception (a stolen invite is unredeemable by the thief). The binding
+// lives entirely in the signature: the seal tx format is unchanged, and fold()
+// verifies the invite signature against the SEALER'S OWN address (tx.from).
+// Old unbound invites (signed without a target) no longer verify — clean break.
+const makeInvite  = (inv, inviteId, target) => {
+  if (typeof target !== 'string' || !/^M_[0-9A-F]{32}$/.test(target)) throw new Error('makeInvite: a target M_ address is required — invites are bound to one redeemer');
+  return { inviterAddr: inv.address, inviteId, target, inviterSig: signHex(`INVITE:${inv.address}:${inviteId}:${target}`, inv.sk) };
+};
 const seal        = (id, invite) => { const sig = signHex(`SEAL:${id.address}:${invite.inviteId}`, id.sk); return { type: 'seal', from: id.address, pub: id.pub, inviteId: invite.inviteId, inviterAddr: invite.inviterAddr, inviterSig: invite.inviterSig, sig, id: sha(`S:${id.address}:${invite.inviteId}:${sig}`).slice(0, 16) }; };
 
 const phashOf       = p => sha(`P:${p.from}:${p.to}:${p.amount}:${p.nonce}:${p.epoch}:${p.sig}`);
@@ -195,7 +206,11 @@ class Ledger {
         if (members[tx.from] || addrOf(tx.pub) !== tx.from) continue;
         const ipub = members[tx.inviterAddr]; if (!ipub) continue;
         if (usedInvite[tx.inviterAddr + ':' + tx.inviteId] || (issued[tx.inviterAddr] || 0) >= QUOTA) continue;
-        if (!verifyMsg(`INVITE:${tx.inviterAddr}:${tx.inviteId}`, tx.inviterSig, ipub)) continue;
+        // Bound invite: the invite signature must cover THIS sealer's address
+        // (tx.from). Any seal from an address other than the invite's bound
+        // target simply fails this check — rival seals for a spent invite and
+        // stolen invites both die here, regardless of seal-id hash order.
+        if (!verifyMsg(`INVITE:${tx.inviterAddr}:${tx.inviteId}:${tx.from}`, tx.inviterSig, ipub)) continue;
         if (!verifyMsg(`SEAL:${tx.from}:${tx.inviteId}`, tx.sig, tx.pub)) continue;
         members[tx.from] = tx.pub; bal[tx.from] = MINT; next[tx.from] = 1; issued[tx.from] = 0; inviterOf[tx.from] = tx.inviterAddr;
         usedInvite[tx.inviterAddr + ':' + tx.inviteId] = true; issued[tx.inviterAddr]++; changed = true;

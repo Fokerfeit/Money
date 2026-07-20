@@ -61,30 +61,38 @@ below.)
 
 To become a spending member you need an **invite** from someone already on the
 network (for the beta, that's usually Luca). Invites are deliberate and limited —
-that's what keeps the network fair.
+that's what keeps the network fair. Each invite is **made for one specific
+address** — yours — so nobody who intercepts it can use it.
 
-1. Ask your inviter for an invite. They'll send you **one line of text** that looks
-   like `{"inviterAddr":"M_…","inviteId":"…","inviterSig":"…"}`.
-2. In the running node window, **type (or paste) this one line** and press Enter —
+1. **First, send your inviter YOUR address** — the `M_…` from your node's
+   `{"type":"ready",…}` line (see above). They need it to make your invite.
+2. They'll send back **one line of text** that looks like
+   `{"inviterAddr":"M_…","inviteId":"…","target":"M_…","inviterSig":"…"}` —
+   the `target` is your address; the invite only works for you.
+3. In the running node window, **type (or paste) this one line** and press Enter —
    put your invite where it says `PASTE_INVITE_HERE`:
    ```
    {"op":"redeem","invite":PASTE_INVITE_HERE}
    ```
    For example:
    ```
-   {"op":"redeem","invite":{"inviterAddr":"M_…","inviteId":"…","inviterSig":"…"}}
+   {"op":"redeem","invite":{"inviterAddr":"M_…","inviteId":"…","target":"M_…","inviterSig":"…"}}
    ```
-3. Watch for these lines, in order:
+4. Watch for these lines, in order:
    - `{"type":"redeem-sent",…}` — your join request went out.
    - `{"type":"redeemed",…}` — **confirmed**: the network accepted you. A status
      line with your **1,000,000** follows. You're in. 🎉
    - If instead you see `{"type":"redeem-failed",…}` (after ~30 seconds), the
-     invite didn't work — it may have been mistyped, already used by someone
-     else, or your internet dropped. Ask your inviter for a fresh invite and
-     try again. Nothing is lost.
+     invite didn't work — it may have been mistyped, already spent, or your
+     internet dropped. Ask your inviter for a fresh invite and try again.
+     Nothing is lost.
+   - If you see an error saying the invite is **"bound to"** a different address,
+     the invite was made for someone else's address (maybe you sent the wrong one,
+     or your inviter mistyped it). Send your inviter the exact `M_…` from YOUR
+     `ready` line and ask for a new invite.
 
-> An invite is like a gift card — whoever holds it can use it. Only accept one sent
-> **directly to you** by someone you trust, and don't post it anywhere public.
+> Your invite only works for **your** address — someone who steals it can't use
+> it. Still, keep it between you and your inviter; it's nobody else's business.
 
 ---
 

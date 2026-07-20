@@ -135,12 +135,14 @@ async function killNode(n) {
 
     // ── PROBE B: INVITE / REDEEM round-trip ─────────────────────────────────────
     console.log('\n  (B) INVITE / REDEEM — founder invites, newcomer redeems over the real relay');
-    founder.send({ op: 'invite' });
+    // Bound invites (protocol change): the inviter must name the redeemer, so the
+    // founder asks for the newcomer's address (its 'ready' line) and binds to it.
+    founder.send({ op: 'invite', for: ncAddr });
     await waitUntil(founder, () => !!founder.find((l) => l.type === 'invite'));
     const inviteEvt = founder.find((l) => l.type === 'invite');
     const invite = inviteEvt && inviteEvt.invite;
-    (invite && invite.inviterAddr === founderId.address && invite.inviteId && invite.inviterSig)
-      ? ok(`founder issued a well-formed invite (id ${invite.inviteId.slice(0, 8)}…, signed by the founder)`)
+    (invite && invite.inviterAddr === founderId.address && invite.inviteId && invite.inviterSig && invite.target === ncAddr)
+      ? ok(`founder issued a well-formed invite (id ${invite.inviteId.slice(0, 8)}…, signed, bound to the newcomer)`)
       : bad(`founder invite malformed: ${JSON.stringify(inviteEvt)}`);
 
     newcomer.send({ op: 'redeem', invite });
