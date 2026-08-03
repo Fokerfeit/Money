@@ -97,11 +97,25 @@ function copy(fromAbs, toAbs) {
   for (const f of all.sort()) console.log(`     money-node/${f}`);
   console.log('\n   Leak check: PASS (no server.js / self_gate.js / ledger_chain.js / App.js / tests / .env).');
   console.log('   npm deps: ws + tweetnacl only.\n');
-  console.log('   ⚠️  BEFORE ZIPPING — swarm/genesis.json still holds a PLACEHOLDER founder list.');
-  console.log('       Replace it with the addresses of the SEALED testnet founders: the two nodes');
-  console.log('       from the July 9 two-machine smoke test (your Windows desktop node + the');
-  console.log('       Hetzner testnet-box node — the ones that ran {"op":"seal_founder"}).');
-  console.log('       Each address is printed on that node\'s {"type":"ready","address":"M_..."}');
-  console.log('       startup line (or its identity.json). A wrong/stale founder list = every');
-  console.log('       friend\'s node sees members:0 forever and warns "possible-fork".\n');
+
+  // Founder-set gate: actually inspects genesis.json instead of always warning.
+  // Fails loudly (non-zero exit) so a bad founder list can't be zipped by accident.
+  const OLD_PLACEHOLDER = 'M_1DE960B21C9893637868A97DFC97F11F';
+  const ADDR_RE = /^M_[0-9A-F]{32}$/;
+  const genesis = JSON.parse(fs.readFileSync(path.join(OUT, 'swarm', 'genesis.json'), 'utf8'));
+  const founders = Array.isArray(genesis.founders) ? genesis.founders : [];
+  const problems = [];
+  if (founders.length === 0) problems.push('founders array is empty');
+  if (founders.includes(OLD_PLACEHOLDER)) problems.push(`still contains the old placeholder founding wallet (${OLD_PLACEHOLDER})`);
+  const malformed = founders.filter((a) => !ADDR_RE.test(a));
+  if (malformed.length) problems.push(`malformed address(es) (need M_ + 32 uppercase hex): ${malformed.join(', ')}`);
+
+  if (problems.length) {
+    console.log('   🛑 GENESIS FOUNDER-SET GATE FAILED — do NOT zip this dist:');
+    for (const p of problems) console.log(`       - ${p}`);
+    console.log('       Fix mobile/swarm/genesis.json and rebuild.\n');
+    process.exitCode = 1;
+    return;
+  }
+  console.log(`   ✅ Genesis founder-set gate: PASS (${founders.length} founder${founders.length === 1 ? '' : 's'} configured, no placeholder, all addresses well-formed).\n`);
 })();
