@@ -26,7 +26,7 @@ echo   [ok] Node.js found (!NODEVER!)
 
 REM 2) Dependencies installed? (node_modules appears after the first run)
 if not exist node_modules (
-  echo   ... first run -- installing the two small libraries MONEY needs (ws, tweetnacl)...
+  echo   ... first run -- installing the two small libraries MONEY needs ^(ws, tweetnacl^)...
   call npm install --omit=dev --no-audit --no-fund
   if errorlevel 1 (
     echo   [X] npm install failed. Please check your internet connection and try again.
