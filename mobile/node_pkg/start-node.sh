@@ -44,9 +44,13 @@ fi
 export IDENTITY_FILE="${IDENTITY_FILE:-$(pwd)/identity.json}"
 unset NODE_LABEL
 
+# 5) Human-readable output. The node picks this automatically on a terminal, but
+#    set it explicitly so it stays readable even when piped to a log file.
+#    Set MONEY_JSON=1 instead for the raw machine-readable event stream.
+if [ -z "${MONEY_JSON:-}" ]; then export MONEY_PRETTY=1; fi
+
 echo ""
-echo "  Starting… your address will appear below on the {\"type\":\"ready\"…} line."
-echo "  Your balance appears on {\"type\":\"status\"…} lines. Press Ctrl-C to stop."
+echo "  Starting… your address and balance will appear below."
 echo "  ---------------------------------------------------------------------------"
 echo ""
 

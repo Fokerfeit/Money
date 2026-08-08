@@ -84,6 +84,17 @@
 //     WALLET — see NODE_RUN.md.
 //   REDEEM_TIMEOUT_MS — how long a pending redeem waits for confirmed membership
 //     before emitting redeem-failed (default 30000).
+//
+// OUTPUT MODE (presentation only — added by the node-UI-polish bite; changes
+// nothing about what is announced, folded, signed or verified):
+//   MONEY_JSON=1    — force the raw JSON-Lines stream documented above
+//   MONEY_PRETTY=1  — force the human-readable rendering (set by the shipped
+//                     start-node launchers so a downloaded node is readable)
+//   (neither)       — pretty when stdout is a TTY, raw JSON when piped. Every
+//                     existing harness pipes stdout, so they are unaffected.
+//   MONEY_VERBOSE=1 — in pretty mode, also show the raw [run_node]/NodeClient
+//                     diagnostic lines that pretty mode folds away
+//   NO_COLOR / MONEY_NO_COLOR — never emit ANSI escapes
 'use strict';
 
 const WS = require('ws');
@@ -101,6 +112,19 @@ const identityStore = require('./identity_store');
 
 const NODE_LABEL   = process.env.NODE_LABEL;
 const STORE_FILE   = process.env.STORE_FILE || null;                  // optional — persistence across restarts
+
+// ── Output mode (presentation only — see the PRESENTATION LAYER block below) ──
+// Declared up here because the boot-time diagnostics further down already need it.
+//   MONEY_JSON=1   → force raw JSON Lines (what every test harness parses)
+//   MONEY_PRETTY=1 → force human-readable (what the shipped launchers set)
+//   neither        → pretty on a TTY, raw JSON when piped (keeps tests unchanged)
+const PRETTY  = process.env.MONEY_JSON === '1' ? false
+              : process.env.MONEY_PRETTY === '1' ? true
+              : Boolean(process.stdout.isTTY);
+const VERBOSE = process.env.MONEY_VERBOSE === '1';
+// Raw diagnostic lines: unchanged in JSON mode; in pretty mode they are folded
+// into the human output instead (MONEY_VERBOSE=1 brings them back).
+const diag = (msg) => { if (!PRETTY || VERBOSE) process.stderr.write(msg); };
 
 // ── GENESIS (self-serve join): founder set + default relay travel WITH the download ──
 // GENESIS_FILE (default: genesis.json beside this script) carries { founders:[...],
@@ -183,7 +207,7 @@ if (!RELAY_URL) {
 }
 // Explicit + logged: the founder set the node is trusting as genesis, and where it
 // came from. Never silently mutated at runtime by any remote message.
-process.stderr.write(`[run_node] genesis: ${FOUNDERS.length} founder(s) from ${
+diag(`[run_node] genesis: ${FOUNDERS.length} founder(s) from ${
   process.env.FOUNDERS_JSON !== undefined ? 'FOUNDERS_JSON env' : (genesis ? GENESIS_FILE : 'no source (empty)')
 }; relay ${RELAY_URL}\n`);
 
@@ -210,7 +234,219 @@ const store = STORE_FILE ? {
   save: (snap) => { try { fs.writeFileSync(STORE_FILE, JSON.stringify(snap)); } catch {} },
 } : null;
 
-const emit = (obj) => process.stdout.write(JSON.stringify(obj) + '\n');
+// ── PRESENTATION LAYER (this bite) ───────────────────────────────────────────
+// PURELY COSMETIC. It observes the SAME events this file has always emitted and
+// renders them for a human instead of dumping JSON. Nothing below changes what is
+// announced, folded, signed or verified — no wire message, no consensus input,
+// no timing that any protocol path depends on. The raw JSON writer (emitJSON) is
+// the original line, untouched.
+//
+// Mode selection:
+//   MONEY_JSON=1    → force raw JSON Lines (what every test harness parses)
+//   MONEY_PRETTY=1  → force human-readable (what the shipped launchers set)
+//   neither         → pretty when stdout is a TTY, raw JSON when piped
+// The TTY default is what keeps existing callers byte-identical: test_brick3 /
+// test_bite2_chaos / test_selfserve_* spawn this process with piped stdio and
+// JSON.parse every stdout line, so they still get exactly the old stream.
+//
+// Extra knobs (all optional, all cosmetic):
+//   MONEY_VERBOSE=1  → also show the raw [run_node]/NodeClient diagnostic lines
+//                      that pretty mode otherwise folds into its own output
+//   NO_COLOR=1 / MONEY_NO_COLOR=1 → never emit ANSI escapes
+// (PRETTY / VERBOSE / diag are declared near the top — the boot diagnostics need them.)
+//
+// Colour only on a real terminal — piped/redirected output stays clean text.
+const COLOR   = Boolean(process.stdout.isTTY) && !process.env.NO_COLOR && !process.env.MONEY_NO_COLOR;
+// cmd.exe's default code page mangles emoji/box-drawing; Windows Terminal (WT_SESSION)
+// and every non-Windows terminal handle them fine. Fall back to ASCII markers that
+// match the ones start-node.bat already prints.
+const UNICODE = process.platform !== 'win32' || Boolean(process.env.WT_SESSION);
+const SYM = UNICODE
+  ? { ok: '✅', bad: '❌', warn: '⚠️ ', wait: '⏳', dot: '•', arrow: '→' }
+  : { ok: '[ok]', bad: '[X]', warn: '[!]', wait: '...', dot: '-', arrow: '->' };
+
+const paint = (code) => (s) => (COLOR ? `\u001b[${code}m${s}\u001b[0m` : String(s));
+const bold = paint('1'), dim = paint('2'), red = paint('31'),
+      green = paint('32'), yellow = paint('33'), cyan = paint('36');
+
+// Comma-group an integer without pulling in ICU/toLocaleString.
+const money = (n) => String(Math.trunc(Number(n) || 0)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+const ordinal = (n) => n + (['th', 'st', 'nd', 'rd'][(n % 100 - 20) % 10] || ['th', 'st', 'nd', 'rd'][n % 100] || 'th');
+const line = (s) => process.stdout.write(s + '\n');
+
+const emitJSON = (obj) => process.stdout.write(JSON.stringify(obj) + '\n');
+
+const P = {
+  shownHeader: false, balance: 0, members: 0, frauds: 0,
+  conn: null, drops: 0, firstDropAt: 0, instabilityWarned: false,
+  forkWarned: false, pending: null,
+};
+
+function printHeader(address) {
+  line('');
+  line(bold('  =========================================================='));
+  line(bold('   MONEY  --  your node is running'));
+  line(bold('  =========================================================='));
+  line('   your address : ' + cyan(address));
+  line('   balance      : ' + green(money(P.balance) + ' MONEY'));
+  line('   network      : ' + bold(P.members + ' member' + (P.members === 1 ? '' : 's')) +
+       dim('  (' + FOUNDERS.length + ' founder' + (FOUNDERS.length === 1 ? '' : 's') + ' in genesis)'));
+  line('   relay        : ' + dim(RELAY_URL));
+  line(bold('  =========================================================='));
+  line('');
+  line(dim('   Type a command and press Enter:'));
+  line('     ' + bold('{"op":"status"}'));
+  line(dim('        show your address, balance and member count'));
+  line('     ' + bold('{"op":"redeem","invite":{ ...paste the invite... }}'));
+  line(dim('        join the network using an invite a member sent you'));
+  line('');
+  line(dim('   Your wallet lives in identity.json in this folder. Ctrl-C to stop.'));
+  line('');
+}
+
+// The known relay-flap issue: say it plainly the first time it is obvious,
+// rather than letting a wall of connect/disconnect lines imply it.
+function maybeWarnInstability() {
+  if (P.instabilityWarned || P.drops < 3) return;
+  const secs = Math.max(1, Math.round((Date.now() - P.firstDropAt) / 1000));
+  P.instabilityWarned = true;
+  line('');
+  line('   ' + yellow(SYM.warn) + yellow(bold(' the connection to the relay keeps dropping')) +
+       dim(' (' + P.drops + ' drops in ' + secs + 's)'));
+  line(dim('      This is a known open issue, not something you did. Your node keeps'));
+  line(dim('      retrying on its own. While it is disconnected, anything you submit'));
+  line(dim('      may not be confirmed until the connection comes back.'));
+  line('');
+}
+
+function stopPendingTicker() {
+  if (P.pending && P.pending.ticker) clearInterval(P.pending.ticker);
+  P.pending = null;
+}
+
+// Honest "still waiting" reporting. A redeem announced during a disconnected
+// window can sit unconfirmed; showing elapsed time + link state makes that
+// visible instead of looking like nothing is wrong. Display only — the real
+// redeem timeout//poll in checkPendingRedeem is untouched, and unref() means
+// this timer can never hold the process open by itself.
+function startPendingTicker(inviteId) {
+  stopPendingTicker();
+  P.pending = { inviteId, since: Date.now(), ticker: null };
+  P.pending.ticker = setInterval(() => {
+    if (!P.pending) return;
+    const secs = Math.round((Date.now() - P.pending.since) / 1000);
+    let msg = '   ' + SYM.wait + ' waiting for the network to confirm -- ' + secs + 's elapsed';
+    if (P.conn !== 'connected') {
+      msg += dim(' (currently DISCONNECTED -- it cannot confirm until the link is back)');
+    } else if (P.drops > 0) {
+      msg += dim(' (connection unstable -- ' + P.drops + ' drop' + (P.drops === 1 ? '' : 's') + ' so far)');
+    }
+    line(msg);
+  }, 5000);
+  if (P.pending.ticker.unref) P.pending.ticker.unref();
+}
+
+function renderPretty(e) {
+  switch (e.type) {
+    case 'ready':
+      // Header waits for the first status so address, balance and member count
+      // can be shown together as one block.
+      break;
+
+    case 'status': {
+      const bal = (e.balances && e.balances[e.address]) || 0;
+      if (!P.shownHeader) {
+        P.balance = bal; P.members = e.members; P.frauds = e.frauds || 0;
+        P.shownHeader = true;
+        printHeader(e.address);
+        break;
+      }
+      const dBal = bal - P.balance;
+      if (dBal !== 0) {
+        line('   ' + (dBal > 0 ? green(SYM.ok) : yellow(SYM.dot)) + ' balance ' +
+             bold((dBal > 0 ? '+' : '') + money(dBal)) + ' ' + SYM.arrow + ' ' +
+             bold(money(bal) + ' MONEY'));
+        P.balance = bal;
+      }
+      if (e.members !== P.members) {
+        const d = e.members - P.members;
+        line('   ' + SYM.dot + ' network now ' + bold(e.members + ' member' + (e.members === 1 ? '' : 's')) +
+             dim(' (' + (d > 0 ? '+' : '') + d + ')'));
+        P.members = e.members;
+      }
+      if ((e.frauds || 0) !== P.frauds) {
+        P.frauds = e.frauds || 0;
+        if (P.frauds > 0) line('   ' + red(SYM.warn) + red(' fraud proofs seen: ' + P.frauds));
+      }
+      break;
+    }
+
+    case 'connection': {
+      if (e.state === P.conn) break;              // only speak on real transitions
+      P.conn = e.state;
+      if (e.state === 'connected') {
+        // The very first connect is implied by the header block that follows it —
+        // announcing it before the header just looks like noise.
+        if (P.drops === 0) { if (P.shownHeader) line('   ' + green(SYM.ok) + ' connected to the relay'); }
+        else line('   ' + green(SYM.ok) + ' reconnected' + dim(' (after ' + P.drops + ' drop' + (P.drops === 1 ? '' : 's') + ')'));
+      } else {
+        P.drops++;
+        if (!P.firstDropAt) P.firstDropAt = Date.now();
+        line('   ' + yellow(SYM.warn) + ' lost connection to the relay' +
+             (P.drops > 1 ? dim(' (' + ordinal(P.drops) + ' time)') : '') +
+             dim(' -- retrying automatically'));
+        maybeWarnInstability();
+      }
+      break;
+    }
+
+    case 'invite':
+      line('');
+      line('   ' + green(SYM.ok) + ' invite created for ' + cyan(e.invite.target || 'your friend'));
+      line(dim('      Send them this line. Only that address can use it:'));
+      line('      ' + bold(JSON.stringify({ op: 'redeem', invite: e.invite })));
+      line(dim('      Then wait for them to redeem it.'));
+      line('');
+      break;
+
+    case 'redeem-sent':
+      line('   ' + SYM.wait + ' invite sent to the network -- waiting for confirmation...');
+      startPendingTicker(e.inviteId);
+      break;
+
+    case 'redeemed':
+      stopPendingTicker();
+      line('   ' + green(SYM.ok) + green(bold(' you are now a member of the network')));
+      break;
+
+    case 'redeem-failed':
+      stopPendingTicker();
+      line('   ' + red(SYM.bad) + red(bold(' could not join with that invite')));
+      line(dim('      ' + (e.hint || '')));
+      line(dim('      What to try: ask your inviter for a NEW invite made for YOUR'));
+      line(dim('      address (' + dim('shown above') + '), and check that this node says "connected".'));
+      break;
+
+    case 'warning':
+      if (e.code === 'possible-fork') {
+        if (P.forkWarned) break;                  // once, not once per unknown founder
+        P.forkWarned = true;
+        line('');
+        line('   ' + yellow(SYM.warn) + yellow(bold(' this node may be on the wrong network')));
+        line(dim('      The relay is carrying founders this node does not recognise,'));
+        line(dim('      which usually means an out-of-date genesis.json. Ask for a'));
+        line(dim('      fresh copy of the download.'));
+        line('');
+      }
+      break;
+
+    case 'error':
+      line('   ' + red(SYM.bad) + ' ' + (e.reason || 'something went wrong'));
+      break;
+  }
+}
+
+const emit = (obj) => { if (PRETTY) renderPretty(obj); else emitJSON(obj); };
 
 // ── FORK VISIBILITY (observation + logging ONLY — no wire messages, no consensus
 // change; audit fix on 413d73a). The ledger stores every gossiped message,
@@ -233,7 +469,7 @@ function scanForForeignFounderSeals() {
       type: 'warning', code: 'possible-fork', unknownFounder: tx.from,
       reason: 'the relay archive contains a founder seal that is NOT in this node\'s genesis founder set — this node may have a stale/wrong genesis.json, or the network has forked',
     });
-    process.stderr.write(`[run_node] ⚠️ POSSIBLE FORK: founder seal from ${tx.from} is not in this node's genesis founder set (${[...client.ledger.founders].join(', ') || 'empty'}) — check genesis.json\n`);
+    diag(`[run_node] ⚠️ POSSIBLE FORK: founder seal from ${tx.from} is not in this node's genesis founder set (${[...client.ledger.founders].join(', ') || 'empty'}) — check genesis.json\n`);
   }
 }
 
@@ -250,12 +486,12 @@ function checkPendingRedeem() {
   if (client.ledger.fold().members[id.address]) {
     clearInterval(p.poll); pendingRedeem = null;
     emit({ type: 'redeemed', inviteId: p.inviteId });
-    process.stderr.write(`[run_node] redeem ${p.inviteId} CONFIRMED — this node is now a member\n`);
+    diag(`[run_node] redeem ${p.inviteId} CONFIRMED — this node is now a member\n`);
     emitStatus();
   } else if (Date.now() >= p.deadline) {
     clearInterval(p.poll); pendingRedeem = null;
     emit({ type: 'redeem-failed', inviteId: p.inviteId, hint: 'invite may be invalid, already used, or network unreachable' });
-    process.stderr.write(`[run_node] redeem ${p.inviteId} FAILED — no membership after ${REDEEM_TIMEOUT_MS}ms (invite invalid/used/quota, or network unreachable)\n`);
+    diag(`[run_node] redeem ${p.inviteId} FAILED — no membership after ${REDEEM_TIMEOUT_MS}ms (invite invalid/used/quota, or network unreachable)\n`);
   }
 }
 
@@ -271,7 +507,11 @@ const client = new NodeClient(id, FOUNDERS, RELAY_URL, {
   reconnectBaseMs: RECONNECT_BASE_MS, reconnectMaxMs: RECONNECT_MAX_MS,
   voteRetryMaxAttempts: VOTE_RETRY_MAX_ATTEMPTS, voteRetryBackoffMs: VOTE_RETRY_BACKOFF_MS, voteRetryAbandonMs: VOTE_RETRY_ABANDON_MS,
   onConnectionState: (state) => emit({ type: 'connection', address: id.address, state }),
-  log: (msg) => process.stderr.write(msg + '\n'),
+  // NodeClient's own chatty reconnect/retry log. In pretty mode the connection
+  // renderer above reports the same transitions in plain language (including the
+  // drop count and the instability warning), so the raw lines are folded away —
+  // MONEY_VERBOSE=1 brings them back for debugging.
+  log: (msg) => diag(msg + '\n'),
 });
 
 client.connect().then(() => {
@@ -281,8 +521,25 @@ client.connect().then(() => {
 
 const rl = readline.createInterface({ input: process.stdin });
 rl.on('line', (line) => {
-  let cmd; try { cmd = JSON.parse(line); } catch { return; }
-  if (!cmd || typeof cmd.op !== 'string') return;
+  // Unparseable/incomplete input has always been silently ignored here. That stays
+  // exactly true on the JSON path (harnesses feed it deliberately malformed lines
+  // and count on no extra events) — but a human typing a typo and getting utter
+  // silence is the "it looks broken" problem this rendering exists to fix, so
+  // pretty mode says something. renderPretty (not emit) on purpose: this must not
+  // introduce a new event into the JSON stream.
+  let cmd;
+  try { cmd = JSON.parse(line); } catch {
+    if (PRETTY && line.trim()) {
+      renderPretty({ type: 'error', reason: 'that is not a complete command — paste the whole {"op": ...} line exactly as you received it' });
+    }
+    return;
+  }
+  if (!cmd || typeof cmd.op !== 'string') {
+    if (PRETTY && line.trim()) {
+      renderPretty({ type: 'error', reason: 'a command needs an "op", for example {"op":"status"}' });
+    }
+    return;
+  }
   switch (cmd.op) {
     case 'seal_founder': client.announce(founderSeal(id)); break;
     case 'pay':          client.pay(cmd.to, cmd.amount, cmd.nonce, cmd.epoch); break;
@@ -313,7 +570,7 @@ rl.on('line', (line) => {
       }
       const inviteId = (typeof cmd.inviteId === 'string' && cmd.inviteId) || crypto.randomBytes(8).toString('hex');
       const invite = makeInvite(id, inviteId, target);   // swarm_engine — signs INVITE:<us>:<inviteId>:<target> with our key
-      process.stderr.write(`[run_node] issued invite ${inviteId} bound to ${target} (deliver out of band; only that address can redeem it)\n`);
+      diag(`[run_node] issued invite ${inviteId} bound to ${target} (deliver out of band; only that address can redeem it)\n`);
       emit({ type: 'invite', invite });
       break;
     }

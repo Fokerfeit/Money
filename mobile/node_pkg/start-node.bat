@@ -53,9 +53,13 @@ REM    NODE_LABEL is deliberately left unset so the node uses that persisted wal
 if not defined IDENTITY_FILE set "IDENTITY_FILE=%cd%\identity.json"
 set "NODE_LABEL="
 
+REM 5) Human-readable output. The node would pick this automatically on a console,
+REM    but set it explicitly so it stays readable even if you pipe it to a log file.
+REM    Set MONEY_JSON=1 instead if you want the raw machine-readable event stream.
+if not defined MONEY_JSON set "MONEY_PRETTY=1"
+
 echo(
-echo   Starting... your address will appear below on the {"type":"ready"...} line.
-echo   Your balance appears on {"type":"status"...} lines. Press Ctrl-C to stop.
+echo   Starting... your address and balance will appear below.
 echo   ---------------------------------------------------------------------------
 echo(
 

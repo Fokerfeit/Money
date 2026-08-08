@@ -23,10 +23,17 @@ That's it. A black window (a "terminal") opens and your node runs.
 
 ## 🔑 Your address and your wallet
 
-When it starts, look for a line like:
+When it starts, you'll see a box like this:
 
 ```
-{"type":"ready","address":"M_ABC123…","pub":"…"}
+  ==========================================================
+   MONEY  --  your node is running
+  ==========================================================
+   your address : M_ABC123…
+   balance      : 0 MONEY
+   network      : 2 members  (2 founders in genesis)
+   relay        : wss://testnet.moneyforeveryone.app/relay
+  ==========================================================
 ```
 
 That **`M_…` address is you** — your identity on the network.
@@ -45,15 +52,22 @@ The very first time you run it, the folder creates a file called **`identity.jso
 
 ## 💰 Checking your balance
 
-Your balance shows up automatically in the window on lines like:
+Your starting balance is in the box above. After that, the window only speaks up
+when something actually **changes**, like:
 
 ```
-{"type":"status","address":"M_ABC123…","balances":{"M_ABC123…":1000000}, …}
+   [ok] balance +1,000,000 -> 1,000,000 MONEY
+   -  network now 3 members (+1)
 ```
 
-The number next to your address is your balance. New status lines appear whenever
-anything changes on the network. (New wallets start at **0** until you join — see
-below.)
+A quiet window means nothing is happening on the network — that's normal, not a
+problem. To ask for your current numbers at any time, type this and press Enter:
+
+```
+{"op":"status"}
+```
+
+(New wallets start at **0** until you join — see below.)
 
 ---
 
@@ -64,8 +78,8 @@ network (for the beta, that's usually Luca). Invites are deliberate and limited 
 that's what keeps the network fair. Each invite is **made for one specific
 address** — yours — so nobody who intercepts it can use it.
 
-1. **First, send your inviter YOUR address** — the `M_…` from your node's
-   `{"type":"ready",…}` line (see above). They need it to make your invite.
+1. **First, send your inviter YOUR address** — the `M_…` shown as *your address*
+   in the box above. They need it to make your invite.
 2. They'll send back **one line of text** that looks like
    `{"inviterAddr":"M_…","inviteId":"…","target":"M_…","inviterSig":"…"}` —
    the `target` is your address; the invite only works for you.
@@ -79,17 +93,23 @@ address** — yours — so nobody who intercepts it can use it.
    {"op":"redeem","invite":{"inviterAddr":"M_…","inviteId":"…","target":"M_…","inviterSig":"…"}}
    ```
 4. Watch for these lines, in order:
-   - `{"type":"redeem-sent",…}` — your join request went out.
-   - `{"type":"redeemed",…}` — **confirmed**: the network accepted you. A status
-     line with your **1,000,000** follows. You're in. 🎉
-   - If instead you see `{"type":"redeem-failed",…}` (after ~30 seconds), the
-     invite didn't work — it may have been mistyped, already spent, or your
-     internet dropped. Ask your inviter for a fresh invite and try again.
-     Nothing is lost.
+   ```
+   ... invite sent to the network -- waiting for confirmation...
+   [ok] you are now a member of the network
+   [ok] balance +1,000,000 -> 1,000,000 MONEY
+   ```
+   That's it — you're in. 🎉
+   - While it waits you may see `waiting for the network to confirm -- 10s
+     elapsed`. That's normal; it's telling you it hasn't given up. If it also says
+     the connection is **unstable** or **disconnected**, the network link is the
+     problem, not your invite.
+   - If you get `could not join with that invite` (after ~30 seconds), the invite
+     didn't work — mistyped, already spent, or your internet dropped. Ask your
+     inviter for a fresh invite and try again. **Nothing is lost.**
    - If you see an error saying the invite is **"bound to"** a different address,
-     the invite was made for someone else's address (maybe you sent the wrong one,
-     or your inviter mistyped it). Send your inviter the exact `M_…` from YOUR
-     `ready` line and ask for a new invite.
+     the invite was made for someone else (maybe you sent the wrong address, or
+     your inviter mistyped it). Send your inviter the exact `M_…` shown as *your
+     address* and ask for a new invite.
 
 > Your invite only works for **your** address — someone who steals it can't use
 > it. Still, keep it between you and your inviter; it's nobody else's business.
@@ -111,11 +131,13 @@ address** — yours — so nobody who intercepts it can use it.
 | Thing you see | What it means |
 |---|---|
 | `Node.js is not installed` | Install it from https://nodejs.org (the **LTS** button), then try again. |
-| `{"type":"connection","state":"disconnected"}` | Lost the network for a moment — it reconnects on its own. |
-| `{"type":"connection","state":"connected"}` | You're connected to the network. |
-| `{"type":"redeem-failed",…}` | Your invite didn't work (mistyped, already used, or no connection). Ask for a fresh one — nothing is lost. |
-| `{"type":"warning","code":"possible-fork",…}` | Your download may be outdated — tell the person who sent you this folder; they'll send you a fresh one. |
-| The number by your address isn't changing | Nothing's happening on the network right now — that's normal. |
+| `lost connection to the relay` | Lost the network for a moment — it reconnects on its own. |
+| `reconnected (after 2 drops)` | It came back by itself. Nothing for you to do. |
+| `the connection to the relay keeps dropping` | A known issue we're working on — your node keeps retrying. Anything you send while it's down may not go through until it's back. |
+| `could not join with that invite` | Your invite didn't work (mistyped, already used, or no connection). Ask for a fresh one — nothing is lost. |
+| `this node may be on the wrong network` | Your download may be outdated — tell the person who sent you this folder; they'll send a fresh one. |
+| `that is not a complete command` | The line you typed got cut off or mistyped. Paste the whole line, from `{` to `}`. |
+| Nothing is happening / window is quiet | Nothing's changing on the network right now — that's normal. Type `{"op":"status"}` to check. |
 
 Questions? Ask the person who sent you this folder. Have fun — you're running a
 piece of a real decentralized network. 🌍
