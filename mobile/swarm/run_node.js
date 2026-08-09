@@ -147,6 +147,13 @@ const diag = (msg) => { if (!PRETTY || VERBOSE) process.stderr.write(msg); };
 // uppercased → /^M_[0-9A-F]{32}$/.
 const GENESIS_FILE = process.env.GENESIS_FILE || path.join(__dirname, 'genesis.json');
 const ADDR_RE = /^M_[0-9A-F]{32}$/;
+// An ed25519 signature is 64 bytes → exactly 128 hex chars (swarm_engine.toHex
+// emits lowercase; uppercase is accepted since hexBytes parses either).
+const SIG_RE  = /^[0-9a-fA-F]{128}$/;
+// Names what is actually wrong with a signature string, or null if it is fine.
+const sigProblem = (sig) => SIG_RE.test(sig) ? null
+  : (sig.length !== 128 ? `expected 128 hex characters, got ${sig.length}`
+                        : 'contains non-hex characters (expected 0-9 and a-f)');
 let genesis = null;
 if (fs.existsSync(GENESIS_FILE)) {
   try {
@@ -589,6 +596,21 @@ rl.on('line', (line) => {
         emit({ type: 'error', op: 'redeem', reason: 'invite must be {inviterAddr, inviteId, inviterSig}' });
         break;
       }
+      // Shape-check the invite signature BEFORE announcing anything. A mangled
+      // signature is indistinguishable from a bad invite once it reaches fold():
+      // hexBytes() silently turns an odd-length string into the wrong 64 bytes,
+      // every node rejects the seal, and the honest-but-three-way redeem-failed
+      // hint ("invalid, already used, or unreachable") hides the real cause.
+      // This is not hypothetical — invite ccc2d12df65af1c0 was transcribed off a
+      // screenshot with one duplicated character (129 chars), got archived by the
+      // relay, and was rejected network-wide; the node waited out the full 30s
+      // timeout and reported the ambiguous hint. Naming the corruption here turns
+      // that into an instant, accurate error, and nothing is gossiped.
+      const inviteSigBad = sigProblem(inv.inviterSig);
+      if (inviteSigBad) {
+        emit({ type: 'error', op: 'redeem', reason: `invite signature is corrupt — ${inviteSigBad}. A signature is always exactly 128 hex characters, so this invite was altered on its way to you (usually a character duplicated or dropped while copying it by hand). Nothing was sent to the network. Ask your inviter to send the invite as a file rather than retyping it.` });
+        break;
+      }
       if (pendingRedeem) {
         emit({ type: 'error', op: 'redeem', reason: `a redeem (invite ${pendingRedeem.inviteId}) is already pending — wait for redeemed/redeem-failed` });
         break;
@@ -602,7 +624,18 @@ rl.on('line', (line) => {
         emit({ type: 'error', op: 'redeem', reason: `this invite is bound to ${inv.target}, not this node (${id.address}) — ask your inviter for an invite made for YOUR address` });
         break;
       }
-      client.announce(seal(id, inv));   // swarm_engine.seal → type:'seal' tx, gossiped via the existing announce path
+      const sealTx = seal(id, inv);   // swarm_engine.seal → type:'seal' tx
+      // Same check on what WE produced. This one can only fail on a local key or
+      // crypto fault, but a malformed seal that reaches the relay is permanent:
+      // the seal id covers (from, inviteId, sealSig) and NOT inviterSig, so the
+      // relay's de-dup keeps the first version of that id forever. Refusing to
+      // gossip a bad seal costs nothing and is not recoverable afterwards.
+      const sealSigBad = sigProblem(sealTx.sig);
+      if (sealSigBad) {
+        emit({ type: 'error', op: 'redeem', reason: `this node produced a malformed seal signature — ${sealSigBad}. Refusing to send it. This is a local key or crypto fault, not a problem with the invite.` });
+        break;
+      }
+      client.announce(sealTx);   // gossiped via the existing announce path
       emit({ type: 'redeem-sent', inviteId: inv.inviteId });
       pendingRedeem = {
         inviteId: inv.inviteId,

@@ -154,6 +154,27 @@ different address errors immediately instead of timing out.
 > members. Proven by probe (2c-i), which pins the rival seal to the
 > previously-winning hash order and shows it rejected.
 
+> 🟡 **SEAL-ID POISONING — OPEN, logged Aug 8 2026, not fixed.** A seal's id is
+> `sha("S:" + from + ":" + inviteId + ":" + sealSig)` — it does **not** cover
+> `inviterSig`. So two seals that differ only in their invite signature share
+> one id, and `relay.js`'s de-dup (`seen.has(m.tx.id)`) keeps whichever arrived
+> **first**, forever. If the first seal for an invite carries a corrupt
+> `inviterSig`, that invite id is permanently unredeemable: the corrected
+> re-seal is silently dropped at the relay and never reaches any node's
+> `fold()`. **Observed for real** on invite `ccc2d12df65af1c0` (seal id
+> `d6f30b806d90128f`), whose `inviterSig` arrived 129 hex chars long after
+> being transcribed off a screenshot — the seal sits in the live archive,
+> verifiably rejected by every node, and cannot be superseded. Impact is a
+> per-invite DoS, not a safety hole: no forged membership, no lost funds, and
+> the inviter can always mint a **fresh invite id** (which is the standing
+> workaround — never retry a poisoned id). A malicious relay client could also
+> pre-empt an invite it has seen. Candidate fix (own bite, `swarm_engine.js` is
+> protected): include `inviterSig` in the seal id hash — note that is a
+> **consensus-visible change** (ids change, so it needs the same audit
+> treatment as bound invites). Mitigated in the meantime by the redeem-time
+> signature shape guard in `run_node.js`, which stops a mangled invite from
+> ever being gossiped.
+
 A node also emits `{type:'warning', code:'possible-fork'}` (observation only,
 no protocol behavior) if the relay archive carries a founder seal that is not
 in its own genesis founder set — the loudest available sign of a stale/wrong
