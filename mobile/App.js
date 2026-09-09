@@ -75,6 +75,7 @@ const authenticator = {
   check: (token, secret) => [-1,0,1].some(d => _totpAt(secret, Math.floor(Date.now()/1000/30)+d) === String(token).padStart(6,'0')),
 };
 import { BACKEND_URL, BASE_PENALTY, DISCONNECT_GRACE_MS, RESERVE_ADDRESS, getNetwork, isTestnet, setNetwork, loadNetwork } from './config';
+import { createContactStore } from './contacts';
 import MoneySymbol from './MoneySymbol';
 import {
   SealMedallion, GoldCoin, IgnitedCoin, ForgeHammerSVG, AnvilSVG, ForgeSparks,
@@ -248,6 +249,9 @@ const isValidSealMark = (addr) => {
 const displayAddr = (addr) =>
   addr === 'FAUCET'         ? 'COMMON TREASURY' :
   addr === RESERVE_ADDRESS  ? 'COMMON RESERVE'  : addr;
+
+// Address book — persisted via AsyncStorage (same mechanism as keypair_v3/biokey_v1).
+const contactStore = createContactStore(AsyncStorage);
 
 // ── Face capture steps ──────────────────────────────────────────────────────
 // icon: 'front' | 'left' | 'right' — rendered as SVG face icon in the scan UI
@@ -463,6 +467,16 @@ function AppInner() {
   const [txs,       setTxs]       = useState([]);
   const [claimed,   setClaimed]   = useState(false);
   const [recipient, setRecipient] = useState('');
+  // ── Address book (contacts) state ───────────────────────────────────────
+  const [contacts,        setContacts]        = useState([]);
+  const [contactsVisible, setContactsVisible] = useState(false);
+  const [saveContactAddr, setSaveContactAddr] = useState(null);   // address pending save/rename (null = modal closed)
+  const [editContactAddr, setEditContactAddr] = useState(null);   // address being renamed (null = new contact)
+  const [contactNick,     setContactNick]     = useState('');
+  const [addNick,         setAddNick]         = useState('');
+  const [addAddr,         setAddAddr]         = useState('');
+  const refreshContacts = async () => { try { setContacts(await contactStore.load()); } catch {} };
+  useEffect(() => { refreshContacts(); }, []);
   const [amount,    setAmount]    = useState('');
 
   // Network toggle — mainnet ⇄ testnet, no rebuild required (config.js).
@@ -1487,11 +1501,37 @@ function AppInner() {
       });
       const data = await res.json();
       if (data.success) {
+        const sentTo = to;
         setRecipient(''); setAmount('');
         Alert.alert('✅ Trade inscribed', `${fmt(amt)} MONEY sent`);
+        // offer to save a NEW recipient as a contact (no prompt if already saved)
+        try { if (!(await contactStore.has(sentTo))) promptSaveContact(sentTo); } catch {}
       }
       else Alert.alert('Trade failed', data.error);
     } catch (e) { Alert.alert('The tablets are unreachable', e.message); }
+  };
+
+  // ── Address book handlers ───────────────────────────────────────────────
+  const pickContact       = (addr) => { setRecipient(addr); setContactsVisible(false); };
+  const promptSaveContact = (addr) => { setContactNick(''); setEditContactAddr(null); setSaveContactAddr(addr); };
+  const startEditContact  = (c)    => { setEditContactAddr(c.address); setContactNick(c.nickname); setSaveContactAddr(c.address); };
+  const submitSaveContact = async () => {
+    try {
+      if (editContactAddr) await contactStore.rename(editContactAddr, contactNick);
+      else                 await contactStore.add(contactNick, saveContactAddr);
+      await refreshContacts();
+      setSaveContactAddr(null); setEditContactAddr(null); setContactNick('');
+    } catch (e) { Alert.alert('Could not save contact', e.message); }
+  };
+  const addManualContact = async () => {
+    try { await contactStore.add(addNick, addAddr); await refreshContacts(); setAddNick(''); setAddAddr(''); }
+    catch (e) { Alert.alert('Could not add contact', e.message); }
+  };
+  const deleteContact = (addr) => {
+    Alert.alert('Delete contact?', 'This only removes the saved nickname — your MONEY and the ledger are untouched.', [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Delete', style: 'destructive', onPress: async () => { try { await contactStore.remove(addr); await refreshContacts(); } catch {} } },
+    ]);
   };
 
   const invite = () => Share.share({
@@ -2516,7 +2556,7 @@ function AppInner() {
         <View style={s.section}>
           <Text style={s.label}>MAKE A TRADE 🔐</Text>
 
-          {/* Recipient row: text input + QR scan button */}
+          {/* Recipient row: text input + contacts + QR scan button */}
           <View style={s.recipientRow}>
             <TextInput
               style={[s.input, { flex: 1, marginBottom: 0 }]}
@@ -2526,10 +2566,30 @@ function AppInner() {
               onChangeText={setRecipient}
               autoCapitalize="none"
             />
+            <TouchableOpacity style={s.qrScanBtn} onPress={() => setContactsVisible(true)}>
+              <Text style={{ fontSize: 20 }}>📇</Text>
+            </TouchableOpacity>
             <AnimatedPress style={s.qrScanBtn} onPress={openRecipientScan}>
               <CameraIrisIcon size={22} color="#D4AF37" />
             </AnimatedPress>
           </View>
+          {/* type-ahead: saved contacts matching what's typed (manual paste + QR still work) */}
+          {(() => {
+            const q = recipient.trim().toUpperCase();
+            const matches = q
+              ? contacts.filter((c) => c.address !== q && (c.nickname.toUpperCase().includes(q) || c.address.includes(q))).slice(0, 4)
+              : [];
+            return matches.length > 0 ? (
+              <View style={s.suggestBox}>
+                {matches.map((c) => (
+                  <TouchableOpacity key={c.address} style={s.suggestRow} onPress={() => setRecipient(c.address)}>
+                    <Text style={s.suggestNick}>{c.nickname}</Text>
+                    <Text style={s.suggestAddr} numberOfLines={1}>{c.address}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+            ) : null;
+          })()}
 
           <TextInput
             style={s.input}
@@ -2543,6 +2603,50 @@ function AppInner() {
             <Text style={s.btnText}>🔐 INSCRIBE TRADE</Text>
           </AnimatedPress>
         </View>
+
+        {/* CONTACTS — list / pick / rename / delete + manual add */}
+        <Modal visible={contactsVisible} animationType="slide" transparent onRequestClose={() => setContactsVisible(false)}>
+          <View style={s.contactsBackdrop}>
+            <View style={s.contactsSheet}>
+              <Text style={s.label}>📇 CONTACTS</Text>
+              <ScrollView style={{ maxHeight: 300 }}>
+                {contacts.length === 0
+                  ? <Text style={s.empty}>No saved contacts yet. Send to an address, then save it — or add one below.</Text>
+                  : contacts.map((c) => (
+                    <View key={c.address} style={s.contactRow}>
+                      <TouchableOpacity style={{ flex: 1 }} onPress={() => pickContact(c.address)}>
+                        <Text style={s.suggestNick}>{c.nickname}</Text>
+                        <Text style={s.suggestAddr} numberOfLines={1}>{c.address}</Text>
+                      </TouchableOpacity>
+                      <TouchableOpacity onPress={() => startEditContact(c)}><Text style={s.contactAction}>✏️</Text></TouchableOpacity>
+                      <TouchableOpacity onPress={() => deleteContact(c.address)}><Text style={s.contactAction}>🗑️</Text></TouchableOpacity>
+                    </View>
+                  ))}
+              </ScrollView>
+              <View style={s.contactAddForm}>
+                <TextInput style={[s.input, { marginBottom: 6 }]} placeholder="Nickname" placeholderTextColor="#5A3D1A" value={addNick} onChangeText={setAddNick} />
+                <TextInput style={[s.input, { marginBottom: 6 }]} placeholder="Seal mark (M_…)" placeholderTextColor="#5A3D1A" value={addAddr} onChangeText={setAddAddr} autoCapitalize="none" />
+                <TouchableOpacity style={s.btnLapis} onPress={addManualContact}><Text style={s.btnText}>＋ ADD CONTACT</Text></TouchableOpacity>
+              </View>
+              <TouchableOpacity style={[s.btnSage, { marginTop: 10 }]} onPress={() => setContactsVisible(false)}><Text style={s.btnText}>CLOSE</Text></TouchableOpacity>
+            </View>
+          </View>
+        </Modal>
+
+        {/* SAVE / RENAME a contact */}
+        <Modal visible={saveContactAddr !== null} animationType="fade" transparent onRequestClose={() => { setSaveContactAddr(null); setEditContactAddr(null); }}>
+          <View style={s.contactsBackdrop}>
+            <View style={s.contactsSheet}>
+              <Text style={s.label}>{editContactAddr ? '✏️ RENAME CONTACT' : '＋ SAVE CONTACT'}</Text>
+              <Text style={[s.suggestAddr, { marginBottom: 10 }]} numberOfLines={1}>{saveContactAddr}</Text>
+              <TextInput style={s.input} placeholder="Nickname" placeholderTextColor="#5A3D1A" value={contactNick} onChangeText={setContactNick} autoFocus />
+              <View style={{ flexDirection: 'row', gap: 12 }}>
+                <TouchableOpacity style={[s.btnSage, { flex: 1 }]} onPress={() => { setSaveContactAddr(null); setEditContactAddr(null); }}><Text style={s.btnText}>SKIP</Text></TouchableOpacity>
+                <TouchableOpacity style={[s.btnLapis, { flex: 1 }]} onPress={submitSaveContact}><Text style={s.btnText}>SAVE</Text></TouchableOpacity>
+              </View>
+            </View>
+          </View>
+        </Modal>
 
         {/* About MONEY link */}
         <TouchableOpacity
@@ -3053,6 +3157,16 @@ const s = StyleSheet.create({
     borderWidth: 1, borderColor: 'rgba(212,175,55,0.35)',
     alignItems: 'center', justifyContent: 'center',
   },
+  // ── Address book (contacts) ──
+  suggestBox:   { backgroundColor: 'rgba(212,175,55,0.06)', borderRadius: 10, borderWidth: 1, borderColor: 'rgba(212,175,55,0.2)', marginBottom: 10, overflow: 'hidden' },
+  suggestRow:   { paddingVertical: 8, paddingHorizontal: 12, borderBottomWidth: 1, borderBottomColor: 'rgba(212,175,55,0.12)' },
+  suggestNick:  { color: '#D4AF37', fontSize: 14, fontWeight: '600' },
+  suggestAddr:  { color: '#9A7B4A', fontSize: 11, letterSpacing: 0.5 },
+  contactsBackdrop: { flex: 1, backgroundColor: 'rgba(0,0,0,0.6)', justifyContent: 'center', padding: 20 },
+  contactsSheet:    { backgroundColor: '#1A120A', borderRadius: 16, borderWidth: 1, borderColor: 'rgba(212,175,55,0.3)', padding: 18 },
+  contactRow:       { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: 'rgba(212,175,55,0.12)' },
+  contactAction:    { fontSize: 18, paddingHorizontal: 4 },
+  contactAddForm:   { marginTop: 12, paddingTop: 12, borderTopWidth: 1, borderTopColor: 'rgba(212,175,55,0.15)' },
   // QR frame overlay on camera
   qrOverlay: {
     flex: 1, alignItems: 'center', justifyContent: 'center',
