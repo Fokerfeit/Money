@@ -502,9 +502,19 @@ function checkPendingRedeem() {
   }
 }
 
+// ── Dashboard read-model: a read-only snapshot of what the node already computed.
+// Captured by the two taps below and read by the 127.0.0.1 HTTP server further down.
+// They never feed back into consensus, and the taps change nothing emit() sends.
+let lastStatus = null;          // the EXACT {type:'status'} object emit() last sent
+let connState  = 'connecting';  // 'connected' | 'disconnected' (from onConnectionState)
+const startedAt = Date.now();   // for uptimeSec
+
 const emitStatus = () => {
   const st = client.status();
-  emit({ type: 'status', address: id.address, hash: st.hash, members: st.members, frauds: st.frauds, balances: st.balances });
+  // Tap 1: capture the SAME object reference we emit — the dashboard and the JSON
+  // stream can never disagree, and the emitted line is byte-for-byte unchanged.
+  lastStatus = { type: 'status', address: id.address, hash: st.hash, members: st.members, frauds: st.frauds, balances: st.balances };
+  emit(lastStatus);
   scanForForeignFounderSeals();
   checkPendingRedeem();
 };
@@ -513,7 +523,7 @@ const client = new NodeClient(id, FOUNDERS, RELAY_URL, {
   ws: WS, store, onChange: emitStatus,
   reconnectBaseMs: RECONNECT_BASE_MS, reconnectMaxMs: RECONNECT_MAX_MS,
   voteRetryMaxAttempts: VOTE_RETRY_MAX_ATTEMPTS, voteRetryBackoffMs: VOTE_RETRY_BACKOFF_MS, voteRetryAbandonMs: VOTE_RETRY_ABANDON_MS,
-  onConnectionState: (state) => emit({ type: 'connection', address: id.address, state }),
+  onConnectionState: (state) => { connState = state; emit({ type: 'connection', address: id.address, state }); },  // Tap 2: capture only; emit is unchanged
   // NodeClient's own chatty reconnect/retry log. In pretty mode the connection
   // renderer above reports the same transitions in plain language (including the
   // drop count and the instability warning), so the raw lines are folded away —
@@ -525,6 +535,94 @@ client.connect().then(() => {
   emit({ type: 'ready', address: id.address, pub: id.pub });
   emitStatus();
 });
+
+// ── DASHBOARD (this bite): a read-only HTTP window onto the node's last status ──
+// Binds 127.0.0.1 ONLY (never 0.0.0.0) and serves GET ONLY. There is deliberately
+// NO route that can seal, invite, redeem or spend — a localhost server that can act
+// is a CSRF surface, and this one cannot act, by construction. It reads the SAME
+// in-memory values the node already computed (lastStatus/connState) — it recomputes
+// nothing and invents nothing. If the port is taken, we log clearly and the node
+// keeps running WITHOUT the dashboard: this is a window onto the node, never a
+// dependency of it.
+const http = require('http');
+const DASH_PORT = process.env.DASH_PORT ? Number(process.env.DASH_PORT) : 7070;
+const DASH_HTML = path.join(__dirname, 'dashboard.html');
+const LOGO_FILE = path.join(__dirname, '..', 'assets', 'logo.png');   // the real app logo
+
+function startDashboard() {
+  let server;
+  try {
+    server = http.createServer((req, res) => {
+      // GET only. Anything that could imply a state change is refused outright — the
+      // node exposes no write path here at all.
+      if (req.method !== 'GET') {
+        res.writeHead(405, { 'Content-Type': 'application/json', 'Allow': 'GET' });
+        res.end(JSON.stringify({ error: 'read-only dashboard — GET only' }));
+        return;
+      }
+      const url = (req.url || '/').split('?')[0];
+      if (url === '/state') {
+        const uptimeSec = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+        // Before the first fold there is no status yet: report an honest not-ready
+        // shape rather than fabricating zeros that would read as real balances.
+        const body = lastStatus
+          ? {
+              ready:      true,
+              address:    lastStatus.address,
+              hash:       lastStatus.hash,
+              members:    lastStatus.members,
+              frauds:     lastStatus.frauds,
+              balances:   lastStatus.balances,
+              connection: connState,
+              relay:      RELAY_URL,
+              uptimeSec,
+            }
+          : {
+              ready:      false,
+              address:    id.address,
+              connection: connState,
+              relay:      RELAY_URL,
+              uptimeSec,
+            };
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(body));
+        return;
+      }
+      if (url === '/' || url === '/index.html') {
+        try {
+          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+          res.end(fs.readFileSync(DASH_HTML));
+        } catch {
+          res.writeHead(500, { 'Content-Type': 'text/plain' });
+          res.end('dashboard.html not found next to run_node.js');
+        }
+        return;
+      }
+      if (url === '/logo.png') {
+        try {
+          res.writeHead(200, { 'Content-Type': 'image/png' });
+          res.end(fs.readFileSync(LOGO_FILE));
+        } catch {
+          res.writeHead(404, { 'Content-Type': 'text/plain' });
+          res.end('logo not found');
+        }
+        return;
+      }
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'not found' }));
+    });
+    // A bind failure (port taken, etc.) must NEVER take the node down. Log and go on.
+    server.on('error', (e) => {
+      process.stderr.write(`[run_node] dashboard NOT started (${e.code || e.message}) — the node is running normally without it; set DASH_PORT to pick another port\n`);
+    });
+    server.listen(DASH_PORT, '127.0.0.1', () => {
+      process.stderr.write(`[run_node] dashboard: http://127.0.0.1:${DASH_PORT}  (read-only, this machine only)\n`);
+    });
+  } catch (e) {
+    process.stderr.write(`[run_node] dashboard failed to start (${e && e.message}) — the node is running normally without it\n`);
+  }
+}
+startDashboard();
 
 const rl = readline.createInterface({ input: process.stdin });
 rl.on('line', (line) => {

@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>MONEY node</title>
+<!--
+  Read-only node dashboard. Fully self-contained: no CDN, no web fonts, no external
+  request of any kind. The only network calls it makes are to its OWN node —
+  GET /state (polled) and GET /logo.png — both served from 127.0.0.1 by run_node.js.
+  It displays state; it never acts. There are no buttons that POST, no invite panel,
+  no drop zone — by design.
+-->
+<style>
+  :root{
+    --bg:#0E0700; --panel:#1A1008; --panel2:#22160B; --line:#3D2008;
+    --ink:#E8D9C0; --dim:#B8956A; --gold:#D9A441; --sage:#7DB87A;
+    --amber:#C4703A; --mono:'Courier New',Courier,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+       -webkit-font-smoothing:antialiased;padding:24px 16px 48px}
+  .wrap{max-width:760px;margin:0 auto}
+  header{display:flex;align-items:center;gap:14px;margin-bottom:6px}
+  header img{width:44px;height:44px;object-fit:contain;border-radius:8px}
+  header h1{font-size:18px;letter-spacing:2px;margin:0;font-weight:700}
+  .sub{color:var(--dim);font-size:12px;letter-spacing:1px;margin:0 0 22px 58px}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  @media (max-width:560px){.grid{grid-template-columns:1fr}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+        padding:16px 18px}
+  .card.span{grid-column:1 / -1}
+  .label{color:var(--dim);font-size:11px;letter-spacing:2px;text-transform:uppercase;margin:0 0 8px}
+  .big{font-size:30px;font-weight:700;color:var(--gold);font-family:var(--mono)}
+  .val{font-family:var(--mono);font-size:14px;word-break:break-all;color:var(--ink)}
+  .muted{color:var(--dim)}
+  .status-row{display:flex;align-items:center;gap:10px}
+  .dot{width:10px;height:10px;border-radius:50%;background:var(--dim);flex:0 0 auto}
+  .dot.ok{background:var(--sage);box-shadow:0 0 8px var(--sage)}
+  .dot.warn{background:var(--amber);box-shadow:0 0 8px var(--amber);animation:pulse 1.2s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+  .reach{background:var(--panel2);border:1px solid var(--line);border-radius:12px;
+         padding:16px 18px;margin-top:18px}
+  .reach h2{font-size:11px;letter-spacing:2px;text-transform:uppercase;color:var(--dim);margin:0 0 10px}
+  .reach ul{margin:0;padding-left:18px;line-height:1.7;font-size:13px}
+  .reach li b{color:var(--ink)}
+  .reach .note{margin-top:10px;color:var(--gold);font-size:12px}
+  footer{margin-top:22px;color:var(--dim);font-size:11px;letter-spacing:1px;text-align:center}
+  .banner{display:none;background:rgba(196,112,58,.14);border:1px solid var(--amber);
+          color:#EBC39B;border-radius:10px;padding:10px 14px;margin-bottom:16px;font-size:13px}
+  .banner.show{display:block}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <img src="/logo.png" alt="MONEY" onerror="this.style.display='none'"/>
+      <h1>MONEY&nbsp;&mdash;&nbsp;YOUR NODE</h1>
+    </header>
+    <p class="sub">Live, read-only. This page shows state — it cannot move money.</p>
+
+    <div id="banner" class="banner">Reconnecting to your node…</div>
+
+    <div class="grid">
+      <div class="card">
+        <p class="label">Your balance</p>
+        <div id="balance" class="big">—</div>
+      </div>
+      <div class="card">
+        <p class="label">People on the network</p>
+        <div id="members" class="big">—</div>
+      </div>
+      <div class="card span">
+        <p class="label">Your address</p>
+        <div id="address" class="val muted">—</div>
+      </div>
+      <div class="card span">
+        <p class="label">Shared ledger fingerprint</p>
+        <div id="hash" class="val muted">—</div>
+      </div>
+      <div class="card">
+        <p class="label">Connection</p>
+        <div class="status-row"><span id="dot" class="dot"></span><span id="conn" class="val">—</span></div>
+        <div id="relay" class="val muted" style="margin-top:8px;font-size:12px">—</div>
+      </div>
+      <div class="card">
+        <p class="label">Uptime</p>
+        <div id="uptime" class="val">—</div>
+      </div>
+    </div>
+
+    <div class="reach">
+      <h2>What this program can reach</h2>
+      <ul>
+        <li>Reads its own folder next to the program.</li>
+        <li>Reads <b>identity.json</b> — your key. It is used to sign locally and is <b>never sent anywhere</b>.</li>
+        <li>Reads and appends <b>ledger.json</b> — the shared record.</li>
+        <li>Opens <b>one outbound connection</b> to the relay it was shipped with.</li>
+        <li>Serves <b>this read-only page</b> on 127.0.0.1 — reachable from this machine only, never the network.</li>
+      </ul>
+      <div class="note">It touches nothing else. No accounts, no files elsewhere, no other servers.</div>
+    </div>
+
+    <footer id="foot">connecting…</footer>
+  </div>
+
+<script>
+(function(){
+  var POLL_MS = 2000;
+  var $ = function(id){ return document.getElementById(id); };
+
+  // Group an integer with thousands separators, without locale surprises.
+  function money(n){
+    n = Math.trunc(Number(n) || 0);
+    return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  }
+  function fmtUptime(s){
+    s = Math.max(0, Math.floor(Number(s)||0));
+    var h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60;
+    if (h) return h+'h '+m+'m';
+    if (m) return m+'m '+sec+'s';
+    return sec+'s';
+  }
+  function shorten(a){
+    if (!a) return '—';
+    return String(a);
+  }
+
+  // LIVE degradation: any failed poll, or a connection that is not 'connected',
+  // shows a clear reconnecting state. We NEVER freeze a stale number as if it were
+  // live, and a JS error is caught so the audience never sees a broken page.
+  function degrade(msg){
+    $('banner').classList.add('show');
+    $('banner').textContent = msg || 'Reconnecting to your node…';
+    $('dot').className = 'dot warn';
+    $('conn').textContent = 'reconnecting…';
+    $('foot').textContent = 'reconnecting…';
+  }
+  function clearBanner(){ $('banner').classList.remove('show'); }
+
+  function render(s){
+    try {
+      if (!s || s.ready === false){
+        // Node is up but has not folded its first status yet — honest "starting".
+        $('balance').textContent = '—';
+        $('members').textContent = '—';
+        $('address').textContent = shorten(s && s.address);
+        $('hash').textContent = 'waiting for first ledger sync…';
+        $('uptime').textContent = s ? fmtUptime(s.uptimeSec) : '—';
+        $('relay').textContent = s && s.relay ? s.relay : '';
+        applyConn(s ? s.connection : 'connecting');
+        $('foot').textContent = 'node starting — no ledger yet';
+        return;
+      }
+      clearBanner();
+      var bal = (s.balances && s.address && s.balances[s.address]) || 0;
+      $('balance').textContent = money(bal);
+      $('members').textContent = money(s.members);
+      $('address').textContent = shorten(s.address);
+      $('hash').textContent = s.hash || '—';
+      $('uptime').textContent = fmtUptime(s.uptimeSec);
+      $('relay').textContent = s.relay || '';
+      applyConn(s.connection);
+      $('foot').textContent = 'live · updates every ' + (POLL_MS/1000) + 's';
+    } catch (e){
+      degrade('Display error — retrying…');
+    }
+  }
+
+  function applyConn(state){
+    var dot = $('dot'), conn = $('conn');
+    if (state === 'connected'){
+      dot.className = 'dot ok'; conn.textContent = 'connected'; clearBanner();
+    } else if (state === 'connecting'){
+      dot.className = 'dot'; conn.textContent = 'connecting…';
+    } else {
+      // The node only ever reports 'connected' or 'disconnected'; NodeClient retries
+      // on its own, so we say so honestly rather than inventing a 'reconnecting' state.
+      dot.className = 'dot warn'; conn.textContent = 'disconnected — retrying';
+      $('banner').classList.add('show');
+      $('banner').textContent = 'Your node lost the relay connection. It is retrying automatically.';
+    }
+  }
+
+  function poll(){
+    var done = false;
+    var timer = setTimeout(function(){ if(!done){ done=true; degrade('Your node is not responding — retrying…'); } }, POLL_MS - 200);
+    fetch('/state', { cache:'no-store' })
+      .then(function(r){ if(!r.ok) throw new Error('bad status'); return r.json(); })
+      .then(function(s){ if(done) return; done=true; clearTimeout(timer); render(s); })
+      .catch(function(){ if(done) return; done=true; clearTimeout(timer); degrade('Your node is not responding — retrying…'); });
+  }
+
+  poll();
+  setInterval(poll, POLL_MS);
+})();
+</script>
+</body>
+</html>
