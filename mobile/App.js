@@ -75,7 +75,7 @@ const authenticator = {
   check: (token, secret) => [-1,0,1].some(d => _totpAt(secret, Math.floor(Date.now()/1000/30)+d) === String(token).padStart(6,'0')),
 };
 import { BACKEND_URL, BASE_PENALTY, DISCONNECT_GRACE_MS, RESERVE_ADDRESS, getNetwork, isTestnet, setNetwork, loadNetwork } from './config';
-import { createContactStore } from './contacts';
+import { createContactStore, normAddress, isValidAddress } from './contacts';
 import MoneySymbol from './MoneySymbol';
 import {
   SealMedallion, GoldCoin, IgnitedCoin, ForgeHammerSVG, AnvilSVG, ForgeSparks,
@@ -246,9 +246,25 @@ const isValidSealMark = (addr) => {
 };
 
 // ── Display helpers ─────────────────────────────────────────────────────────
-const displayAddr = (addr) =>
+// Contacts are stored upper-cased; ledger addresses arrive from the server as-is,
+// so both sides are normalised before comparing.
+const contactNameFor = (addr, contacts) => {
+  if (!addr || !Array.isArray(contacts)) return null;
+  const a = normAddress(addr);
+  const hit = contacts.find((c) => c && normAddress(c.address) === a);
+  return hit ? hit.nickname : null;
+};
+
+// `contacts` is optional: called with one argument this behaves exactly as before.
+const displayAddr = (addr, contacts) =>
   addr === 'FAUCET'         ? 'COMMON TREASURY' :
-  addr === RESERVE_ADDRESS  ? 'COMMON RESERVE'  : addr;
+  addr === RESERVE_ADDRESS  ? 'COMMON RESERVE'  :
+  contactNameFor(addr, contacts) || addr;
+
+// FAUCET and SWARM_RESERVE are book-keeping labels, not M_ seal marks, so
+// isValidAddress already excludes them from being named.
+const canNameAddr = (addr, selfAddr) =>
+  isValidAddress(addr) && normAddress(addr) !== normAddress(selfAddr);
 
 // Address book — persisted via AsyncStorage (same mechanism as keypair_v3/biokey_v1).
 const contactStore = createContactStore(AsyncStorage);
@@ -1515,6 +1531,10 @@ function AppInner() {
   const pickContact       = (addr) => { setRecipient(addr); setContactsVisible(false); };
   const promptSaveContact = (addr) => { setContactNick(''); setEditContactAddr(null); setSaveContactAddr(addr); };
   const startEditContact  = (c)    => { setEditContactAddr(c.address); setContactNick(c.nickname); setSaveContactAddr(c.address); };
+  const nameLedgerAddr    = (addr) => {
+    const hit = contacts.find((c) => c && normAddress(c.address) === normAddress(addr));
+    hit ? startEditContact(hit) : promptSaveContact(addr);
+  };
   const submitSaveContact = async () => {
     try {
       if (editContactAddr) await contactStore.rename(editContactAddr, contactNick);
@@ -2680,11 +2700,19 @@ function AppInner() {
                 </View>
                 <View style={s.tabletRow}>
                   <Text style={s.tabletFromLabel}>FROM</Text>
-                  <Text style={s.tabletAddr} numberOfLines={1}>{displayAddr(tx.from)}</Text>
+                  {canNameAddr(tx.from, address)
+                    ? <TouchableOpacity style={{ flex: 1 }} onPress={() => nameLedgerAddr(tx.from)}>
+                        <Text style={s.tabletAddr} numberOfLines={1}>{displayAddr(tx.from, contacts)}</Text>
+                      </TouchableOpacity>
+                    : <Text style={s.tabletAddr} numberOfLines={1}>{displayAddr(tx.from, contacts)}</Text>}
                 </View>
                 <View style={s.tabletRow}>
                   <Text style={s.tabletFromLabel}>TO  </Text>
-                  <Text style={s.tabletAddr} numberOfLines={1}>{displayAddr(tx.to)}</Text>
+                  {canNameAddr(tx.to, address)
+                    ? <TouchableOpacity style={{ flex: 1 }} onPress={() => nameLedgerAddr(tx.to)}>
+                        <Text style={s.tabletAddr} numberOfLines={1}>{displayAddr(tx.to, contacts)}</Text>
+                      </TouchableOpacity>
+                    : <Text style={s.tabletAddr} numberOfLines={1}>{displayAddr(tx.to, contacts)}</Text>}
                 </View>
                 <View style={s.tabletAmtRow}>
                   {tx.reason === 'disconnect_penalty'
