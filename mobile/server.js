@@ -6,6 +6,7 @@ const nacl      = require('tweetnacl');
 const rateLimit = require('express-rate-limit');
 const ledgerChain = require('./ledger_chain');   // Brick 1: tamper-evident integrity layer (additive, read-only)
 const selfGate    = require('./self_gate');      // Self personhood-ignition gate (pure; @selfxyz loaded lazily only if enabled)
+const safeStore   = require('./safe_store');     // atomic, fail-closed JSON persistence (saveAtomic / loadStrict)
 
 const app = express();
 // SECURITY: default to NOT trusting X-Forwarded-For (0). A directly-exposed or
@@ -26,17 +27,40 @@ const REPLAY_FENCE_FILE    = process.env.MONEY_FENCE_FILE    || path.join(DATA_D
 const USED_CODES_FILE      = process.env.MONEY_CODES_FILE    || path.join(DATA_DIR, 'ignition_codes_used.json');
 
 // ── Persistence helpers ────────────────────────────────────────────────────
+// loadJSON stays fail-OPEN — used only for the committee SHADOW state, which is
+// designed to rebuild from central on a miss (a reset there is safe, not lossy).
 const loadJSON = (file, fallback) => {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
   catch { return fallback; }
 };
+// A persistent save failure (e.g. a read-only/locked file) is swallowed so a transient
+// disk error can't crash the server mid-request — but it is TRACKED so /health can
+// report a degraded persistence state instead of a green light over a dead disk (a
+// silent in-memory/disk divergence is dangerous for a money server).
+let lastSaveError = null;
+const noteSaveError = (file, e) => {
+  lastSaveError = { file: path.basename(file), message: e.message, at: new Date().toISOString() };
+  console.error(`Save error (${path.basename(file)}):`, e.message);
+};
+// saveJSON now writes ATOMICALLY (safe_store): tmp → fsync → rename → dir fsync, keeping
+// a .bak. The main file is never a half-written state; a returned write is durable.
 const saveJSON = (file, data) => {
-  try { fs.writeFileSync(file, JSON.stringify(data, null, 2)); }
-  catch (e) { console.error(`Save error (${path.basename(file)}):`, e.message); }
+  try { safeStore.saveAtomic(file, data); }
+  catch (e) { noteSaveError(file, e); }
 };
 
 // ── Load state ──────────────────────────────────────────────────────────────
-let txs = loadJSON(LEDGER_FILE, []);
+// FAIL-CLOSED: a ledger that EXISTS but is unreadable (and has no recoverable .bak)
+// must REFUSE to boot. A silently-empty ledger would wipe every balance — the single
+// most catastrophic failure. A genuine first boot (no file, no .bak) → [] as before.
+let txs;
+try {
+  txs = safeStore.loadStrict(LEDGER_FILE, []);
+} catch (e) {
+  console.error(`[FATAL] ${e.message}`);
+  console.error('Refusing to boot: a silently-empty ledger would erase every balance. Restore ledger.json (or its .bak) and retry.');
+  process.exit(1);
+}
 
 // ── In-memory indexes for O(1) targeted lookups ──────────────────────────────
 // The scalability fix: instead of every client re-downloading the ENTIRE ledger
@@ -60,7 +84,13 @@ for (let i = txs.length - 1; i >= 0; i--) indexTx(txs[i], true);
 
 // replay_fence.json stores { messageKey: timestampMs } — a persistent replay
 // fence so a signature can never be replayed, even across a server restart.
-let seenSigs = loadJSON(REPLAY_FENCE_FILE, {});
+// The replay fence recovers from .bak if the main file is corrupt; if BOTH are
+// unreadable it self-heals to empty (SAFE: entries are time-gated to a 2-minute
+// window and pruned constantly, so a reset only briefly re-opens replay — never a
+// re-mint). This is the one store where fail-open is the correct trade.
+let seenSigs;
+try { seenSigs = safeStore.loadStrict(REPLAY_FENCE_FILE, {}); }
+catch (e) { console.error(`[replay-fence] unreadable with no backup — resetting (safe: time-gated). ${e.message}`); seenSigs = {}; }
 
 // ── Anti-Sybil: server-issued single-use invite (ignition) codes ────────────
 // IGNITION_CODES (comma-separated) are codes YOU hand out. The server controls
@@ -73,7 +103,17 @@ let seenSigs = loadJSON(REPLAY_FENCE_FILE, {});
 const IGNITION_CODES = new Set(
   (process.env.IGNITION_CODES || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean)
 );
-let usedCodes = loadJSON(USED_CODES_FILE, {});   // code → address (consumed)
+// FAIL-CLOSED: the used-invite-code ledger is a re-mint vector — if it silently reset
+// to {}, every consumed code would look unused and could mint again. Recover from
+// .bak; refuse to boot if both are unreadable. First boot (no file, no .bak) → {}.
+let usedCodes;
+try {
+  usedCodes = safeStore.loadUnion(USED_CODES_FILE, {});   // code → address (consumed) — append-only set, union both copies
+} catch (e) {
+  console.error(`[FATAL] ${e.message}`);
+  console.error('Refusing to boot: a reset invite-code ledger would let already-used codes mint again.');
+  process.exit(1);
+}
 
 // ── Platform recipient allowlist ────────────────────────────────────────────
 // Addresses (comma-separated in MONEY_PLATFORM_ADDRESSES) that may RECEIVE
@@ -121,8 +161,11 @@ const calcReward = (count) => {
   return Math.max(Math.floor(r), 1);
 };
 
+// A self-transfer (from===to) nets to zero — credit and debit cancel — so a historical
+// self-tx already in a ledger can NEVER inflate a balance (defence in depth behind the
+// POST /transaction reject below).
 const getBalance = (addr) =>
-  txs.reduce((b, t) => t.to === addr ? b + t.amount : t.from === addr ? b - t.amount : b, 0);
+  txs.reduce((b, t) => (t.from === t.to ? b : t.to === addr ? b + t.amount : t.from === addr ? b - t.amount : b), 0);
 // -- Standing & movement cap ---------------------------------------------
 // Standing = trust EARNED, not money. Your whole million is always yours;
 // standing decides how much you can MOVE at once. Computed live from the ledger:
@@ -594,6 +637,14 @@ ignitionCode = (ignitionCode || '').trim().toUpperCase();
       return res.status(401).json({ error: 'Invalid signature — transaction rejected' });
   }
 
+  // ── Reject self-transfers (from === to) ────────────────────────────────────
+  // A send to yourself moves no money, but the ledger's credit/debit accounting would
+  // otherwise count only the credit → a balance-inflating money-printer. Rejected AFTER
+  // signature verification (a valid signature does NOT bypass it) and BEFORE any state
+  // change (no replay-fence write, no commit, no tip change).
+  if (from === to)
+    return res.status(400).json({ error: 'Self-transfers are not allowed' });
+
   // ── Replay fence — keyed on the SIGNED MESSAGE, checked AFTER verification ──
   // (1) Keying on the message (from:to:amount:timestamp) instead of the signature
   //     string makes malleability useless: a re-encoded signature of the same
@@ -683,10 +734,12 @@ ignitionCode = (ignitionCode || '').trim().toUpperCase();
   ledger.commit(tx);            // append + index + persist via the single ledger write path
   saveJSON(REPLAY_FENCE_FILE,  seenSigs); // atomically commits the replay fence
 
-  // On a successful ignition, consume the one-time invite code.
+  // On a successful ignition, consume the one-time invite code. Dual-.bak write so a
+  // consumed code (a re-mint vector) is never dropped by a single-copy corruption.
   if (from === 'FAUCET' && ignitionCode && IGNITION_CODES.size > 0) {
     usedCodes[ignitionCode] = to;
-    saveJSON(USED_CODES_FILE, usedCodes);
+    try { safeStore.saveAtomicDual(USED_CODES_FILE, usedCodes); }
+    catch (e) { noteSaveError(USED_CODES_FILE, e); }
     console.log(`[invite-code] consumed code → ${to}`);
   }
 
@@ -704,12 +757,36 @@ ignitionCode = (ignitionCode || '').trim().toUpperCase();
 // ─────────────────────────────────────────────────────────────────────────────
 if (process.env.SELF_GATE === '1') {
   const SELF_FILE = process.env.MONEY_SELF_FILE || path.join(DATA_DIR, 'self_nullifiers.json');
-  // File-backed sync KV for the nullifier ledger (one logical key → one file).
+  // Atomic, fail-CLOSED storage for the nullifier set. The nullifier set is APPEND-ONLY,
+  // so we use dual-.bak writes + union load: a used nullifier present in EITHER copy is
+  // never dropped (closes the ".bak lags by one" re-mint window). A corrupt store must
+  // NEVER silently reset — that would free used nullifiers to mint again.
   const selfStorage = {
-    getItem: () => { try { return fs.readFileSync(SELF_FILE, 'utf8'); } catch { return null; } },
-    setItem: (_k, v) => { try { fs.writeFileSync(SELF_FILE, v); } catch (e) { console.error('Save error (self_nullifiers):', e.message); } },
+    load: () => safeStore.loadUnion(SELF_FILE, {}),
+    save: (map) => safeStore.saveAtomicDual(SELF_FILE, map),
   };
-  const selfStore = selfGate.createNullifierStore(selfStorage);
+  let selfStore;
+  try {
+    selfStore = selfGate.createNullifierStore(selfStorage);
+  } catch (e) {
+    console.error(`[FATAL] self-gate nullifier store: ${e.message}`);
+    console.error('Refusing to enable the Self gate on a corrupt nullifier store — a reset would let a human mint twice.');
+    process.exit(1);
+  }
+  // Crash recovery: claim() SEALS the nullifier before it mints, so a crash between the
+  // two leaves a sealed-but-unminted wallet. Complete any such pending mint here, once
+  // (idempotent — an already-ignited wallet is skipped).
+  const repairedPending = selfGate.repairPending(ledger, selfStore);
+  if (repairedPending) console.log(`[self-gate] crash repair: completed ${repairedPending} pending mint(s)`);
+  // HUMAN-keyed backstop: if any self_ignition-minted wallet has NO backing nullifier
+  // seal (a seal was lost to corruption / stale-.bak recovery), that nullifier is
+  // silently re-mintable → REFUSE to enable the gate rather than allow a second mint.
+  const orphanMints = selfGate.auditSeals(ledger, selfStore);
+  if (orphanMints.length) {
+    console.error(`[FATAL] self-gate: ${orphanMints.length} minted wallet(s) have no nullifier seal — a seal was lost, leaving a nullifier re-mintable.`);
+    console.error('Refusing to enable the Self gate. Restore self_nullifiers.json (or its .bak) so every minted wallet has its binding.');
+    process.exit(1);
+  }
 
   // Verifier: the real SelfBackendVerifier (mock mode) in production; a stub in
   // tests. The stub is gated behind NODE_ENV=test AND SELF_GATE_STUB=1 so it can
@@ -770,6 +847,11 @@ app.get('/stats', (req, res) => {
     faucetGate:       IGNITION_CODES.size > 0 ? 'ignition-code' : 'CLOSED',
     usedCodes:        Object.keys(usedCodes).length,
     replayFenceSize:  Object.keys(seenSigs).length,
+    // degraded when a persistence write has failed and not since succeeded — surfaces a
+    // silent in-memory/disk divergence (e.g. a read-only/locked data file) that would
+    // otherwise leave /health green over a dead disk.
+    persistence:      lastSaveError ? 'degraded' : 'ok',
+    ...(lastSaveError ? { lastSaveError } : {}),
   });
 });
 

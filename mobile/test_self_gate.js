@@ -56,7 +56,7 @@ function signMsg(from, to, amount, ts, sk) { const m = `${from}:${to}:${amount}:
 
 const TMP = path.join(__dirname, '.self_gate_tmp');
 const SELF_FILE = path.join(TMP, 'self_nullifiers.json');
-let portCounter = 39220, BASE = '', child = null, logs = [];
+let portCounter = 39220 + Math.floor(Math.random() * 8000), BASE = '', child = null, logs = [];  // random base avoids TIME_WAIT collisions across nested re-runs
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function boot(reset, extraEnv = {}) {
   if (reset) { fs.rmSync(TMP, { recursive: true, force: true }); fs.mkdirSync(TMP, { recursive: true }); }

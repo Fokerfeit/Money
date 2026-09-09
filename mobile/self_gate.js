@@ -22,33 +22,31 @@
 const MINT_AMOUNT = 1_000_000;               // one human, one million — fixed integer
 const WALLET_RE   = /^M_[0-9A-Fa-f]{32}$/i;  // the shape App.js seals (toAddress)
 
-// ── Nullifier store (persistence-injected) ───────────────────────────────────
-// Records nullifier → wallet. `storage` is a tiny sync KV ({getItem,setItem}),
-// so the server backs it with a file and a test backs it with a plain object.
-// A nullifier, once sealed, can never be re-sealed (the Sybil ledger).
+// ── Nullifier store (persistence-injected, FAIL-CLOSED) ──────────────────────
+// Records nullifier → wallet. `storage` is { load(): map|throws, save(map): void }.
+// The server backs it with safe_store (atomic write, fail-closed load); a test backs
+// it with a plain object. Crucially, storage.load() must THROW on corruption rather
+// than return {} — corruption ≠ first boot — so a damaged store can never silently
+// reset and free a used nullifier to mint again. A THROW propagates to the caller,
+// which refuses to enable the gate. A nullifier, once sealed, can never be re-sealed.
 function createNullifierStore(storage) {
-  const KEY = 'self_nullifiers_v1';
-  let map = {};
-  function load() {
-    try { const raw = storage.getItem(KEY); map = raw ? JSON.parse(raw) : {}; }
-    catch { map = {}; }
-    if (!map || typeof map !== 'object') map = {};
-    return map;
-  }
-  function persist() { storage.setItem(KEY, JSON.stringify(map)); }
-  load();
+  let map = storage.load();                          // may THROW (fail-closed) — do NOT swallow
+  if (!map || typeof map !== 'object') map = {};
+  function persist() { storage.save(map); }
+  const has = (n) => Object.prototype.hasOwnProperty.call(map, n);
   return {
-    has:  (n) => Object.prototype.hasOwnProperty.call(map, n),
-    get:  (n) => (Object.prototype.hasOwnProperty.call(map, n) ? map[n] : null),
+    has,
+    get:  (n) => (has(n) ? map[n] : null),
     size: () => Object.keys(map).length,
     // Seal ONLY if unused — returns false on a repeat so the caller can never
     // overwrite an existing binding (defence in depth behind the gate's own check).
     seal: (n, wallet) => {
-      if (Object.prototype.hasOwnProperty.call(map, n)) return false;
-      map[n] = wallet; persist(); return true;
+      if (has(n)) return false;
+      map[n] = wallet; persist(); return true;       // persist is atomic (safe_store)
     },
-    all:  () => ({ ...map }),
-    load,
+    all:     () => ({ ...map }),
+    entries: () => Object.entries(map),              // for repairPending() crash recovery
+    reload:  () => { const m = storage.load(); map = (m && typeof m === 'object') ? m : {}; return map; },
   };
 }
 
@@ -94,12 +92,26 @@ function createSelfGate({ verify, ledger, store, amount = MINT_AMOUNT, now = () 
     if (typeof ledger.isIgnited === 'function' && ledger.isIgnited(wallet))
       return { ok: false, code: 'wallet-ignited', reason: 'This wallet has already been ignited' };
 
-    // 5) MINT via the SAME FAUCET mechanism: a from:'FAUCET' tx of exactly
-    //    `amount`, committed through the ledger's single write path. Integer money —
-    //    the amount must ALREADY be a whole number (no silent truncation).
     const amt = amount;
     if (!Number.isInteger(amt) || amt <= 0)
       return { ok: false, code: 'bad-amount', reason: 'mint amount must be a positive integer' };
+
+    // 5) SEAL the nullifier FIRST — crash-safe / fail-closed. A durable seal BEFORE
+    //    the mint means a crash between the two leaves the nullifier used but the
+    //    wallet unminted → repairPending() completes the mint once on boot, and NO
+    //    second wallet can ever claim this nullifier. (Seal-AFTER-mint had the
+    //    opposite, dangerous failure: a crash after the mint but before the seal
+    //    freed the nullifier to mint a SECOND time.) The seal write is atomic; if it
+    //    cannot be durably persisted we refuse to mint at all.
+    try {
+      if (!store.seal(nullifier, wallet))
+        return { ok: false, code: 'nullifier-used', reason: 'This person has already ignited a wallet', boundTo: store.get(nullifier) };
+    } catch (e) {
+      return { ok: false, code: 'seal-failed', reason: 'could not durably record the nullifier — mint refused' };
+    }
+
+    // 6) MINT via the SAME FAUCET mechanism: a from:'FAUCET' tx of exactly `amount`,
+    //    committed through the ledger's single write path. Integer money.
     const ts = now();
     const tx = {
       from: 'FAUCET', to: wallet, amount: amt,
@@ -110,15 +122,50 @@ function createSelfGate({ verify, ledger, store, amount = MINT_AMOUNT, now = () 
     };
     ledger.commit(tx);                       // append + index + persist — identical to the faucet path
 
-    // 6) SEAL the nullifier → wallet binding AFTER the mint lands. (central
-    //    commit() never throws — saveJSON swallows disk errors — so the in-memory
-    //    append has already happened by here; sealing now records the human.)
-    store.seal(nullifier, wallet);
-
     return { ok: true, nullifier, wallet, amount: amt, tx };
   }
 
   return { claim };
+}
+
+// ── repairPending: crash recovery for the seal-before-mint order ─────────────
+// A claim seals the nullifier, then mints. A crash between the two leaves a sealed
+// nullifier whose wallet is NOT yet ignited. On boot, complete each such pending
+// mint EXACTLY ONCE. Idempotent: a wallet already ignited is skipped, so running it
+// repeatedly (or after a clean boot) mints nothing — no double-mint, no free re-mint.
+function repairPending(ledger, store, { amount = MINT_AMOUNT, now = () => Date.now() } = {}) {
+  if (!ledger || typeof ledger.commit !== 'function' || typeof ledger.isIgnited !== 'function') return 0;
+  if (!store || typeof store.entries !== 'function') return 0;
+  let repaired = 0;
+  for (const [, wallet] of store.entries()) {
+    if (ledger.isIgnited(wallet)) continue;          // already minted → idempotent skip
+    const ts = now();
+    ledger.commit({
+      from: 'FAUCET', to: wallet, amount,
+      reason: 'self_ignition',                        // indistinguishable from a normal Self mint
+      time: new Date(ts).toLocaleTimeString(), timestamp: ts, sigPrefix: null,
+    });
+    repaired++;
+  }
+  return repaired;
+}
+
+// ── auditSeals: the HUMAN-keyed backstop against a dropped seal ───────────────
+// The per-mint check (ledger.isIgnited) is per-WALLET, so a nullifier whose seal was
+// LOST (corruption, a stale-.bak recovery) could mint AGAIN to a fresh wallet. The
+// durable money record catches it: every self_ignition FAUCET mint MUST have a
+// nullifier binding pointing at it. A minted wallet with NO backing seal means a seal
+// was dropped → that nullifier is silently re-mintable. Returns the orphan wallets;
+// the caller REFUSES to enable the gate rather than proceed (fail-closed, not re-mint).
+function auditSeals(ledger, store) {
+  if (!ledger || typeof ledger.all !== 'function' || !store || typeof store.entries !== 'function') return [];
+  const sealedWallets = new Set(store.entries().map(([, w]) => w));
+  const orphans = [];
+  for (const t of ledger.all()) {
+    if (t && t.from === 'FAUCET' && t.reason === 'self_ignition' && !sealedWallets.has(t.to) && !orphans.includes(t.to))
+      orphans.push(t.to);
+  }
+  return orphans;   // minted-but-unsealed self_ignition wallets → a seal was lost
 }
 
 // ── Production verifier (LAZY — @selfxyz/core loaded only when the gate runs) ──
@@ -161,4 +208,4 @@ function realSelfVerifier(config = {}) {
   };
 }
 
-module.exports = { createSelfGate, createNullifierStore, realSelfVerifier, MINT_AMOUNT, WALLET_RE };
+module.exports = { createSelfGate, createNullifierStore, realSelfVerifier, repairPending, auditSeals, MINT_AMOUNT, WALLET_RE };

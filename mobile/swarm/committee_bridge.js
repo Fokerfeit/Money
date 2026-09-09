@@ -59,11 +59,12 @@ function hashSeed(label) {
 }
 
 // central balance = server.js getBalance's EXACT formula — credits − debits over the
-// committed MONEY tx set. This matches the authoritative central balance FOR THE TXS
-// CENTRAL ACCEPTS; the cap/validation gate that decides WHICH txs commit is a
-// separate brick (see SCOPE), so feed this only txs central would commit.
+// committed MONEY tx set, with a self-tx (from===to) netted to zero (kept byte-identical
+// to central so the mirror can never drift). This matches the authoritative central
+// balance FOR THE TXS CENTRAL ACCEPTS; the cap/validation gate that decides WHICH txs
+// commit is a separate brick (see SCOPE), so feed this only txs central would commit.
 function centralBalanceOf(txs, addr) {
-  return txs.reduce((b, t) => (t.to === addr ? b + t.amount : t.from === addr ? b - t.amount : b), 0);
+  return txs.reduce((b, t) => (t.from === t.to ? b : t.to === addr ? b + t.amount : t.from === addr ? b - t.amount : b), 0);
 }
 
 // ── BRICK 2 (Bite 2): the STANDING movement cap, computed IDENTICALLY to central ──
@@ -127,6 +128,7 @@ function createBridge({ founders, epoch = 0, enforceCap = false } = {}) {
   function promise(fromAddr, toAddr, amount, opts = {}) {
     const fromId = idByAddr.get(fromAddr), toId = idByAddr.get(toAddr);
     if (!fromId || !toId) throw new Error(`promise: unknown identity ${fromAddr}→${toAddr}`);
+    if (fromAddr === toAddr) return { rejected: true, reason: 'self-transfer' };  // never admit a self-send (parity with central)
     const useAuto = opts.nonce === undefined;
     const nonce = useAuto ? (nextNonce.get(fromAddr) || 1) : opts.nonce;
     const p = makePromise(fromId, toAddr, amount, nonce, epoch);
@@ -157,6 +159,9 @@ function createBridge({ founders, epoch = 0, enforceCap = false } = {}) {
   // Bite 1 path (unchanged). Cap is evaluated against the state BEFORE this tx, so a
   // tx's own counterparty is not yet counted (matches central's per-tx evaluation).
   function pay(fromAddr, toAddr, amount) {
+    // Reject self-transfers — parity with central, which 400s them. Not admitted, not
+    // recorded in moneyTxs, so committee fold and central reduction stay equal.
+    if (fromAddr === toAddr) { attempts.push({ from: fromAddr, to: toAddr, amount, admitted: false, reason: 'self-transfer' }); return { ok: false, admitted: false, reason: 'self-transfer' }; }
     if (enforceCap) {
       const bal = fold().bal[fromAddr] || 0;                 // central checks balance first (400)
       if (amount > bal) { attempts.push({ from: fromAddr, to: toAddr, amount, admitted: false, reason: 'balance' }); return { ok: false, admitted: false, reason: 'balance', movable: committeeMovableNow(fromAddr), standing: committeeStandingOf(fromAddr) }; }

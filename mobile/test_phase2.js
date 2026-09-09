@@ -62,7 +62,7 @@ function signMsg(from, to, amount, ts, sk) {
 }
 
 // ── child server lifecycle (fresh port each boot to dodge TIME_WAIT) ──────────
-let portCounter = Number(process.env.PHASE2_PORT || 39140);
+let portCounter = Number(process.env.PHASE2_PORT || (39140 + Math.floor(Math.random() * 8000)));  // random base avoids TIME_WAIT port collisions across nested re-runs
 let BASE = '';
 let serverLogs = [];
 let currentChild = null;

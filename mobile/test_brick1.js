@@ -29,7 +29,7 @@ function wallet(l) { const kp = nacl.sign.keyPair.fromSeed(seed(l)); const pub =
 function signMsg(from, to, amount, ts, sk) { const m = `${from}:${to}:${amount}:${ts}`; return toHex(nacl.sign.detached(Uint8Array.from(Array.from(m).map((c) => c.charCodeAt(0))), sk)); }
 
 const TMP = path.join(__dirname, '.brick1_tmp');
-let portCounter = 39160, BASE = '', child = null, logs = [];
+let portCounter = 39160 + Math.floor(Math.random() * 8000), BASE = '', child = null, logs = [];  // random base avoids TIME_WAIT collisions across nested re-runs
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function boot(reset) {
   if (reset) { fs.rmSync(TMP, { recursive: true, force: true }); fs.mkdirSync(TMP, { recursive: true }); }
