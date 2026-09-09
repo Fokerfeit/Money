@@ -82,6 +82,17 @@ function createSelfGate({ verify, ledger, store, amount = MINT_AMOUNT, now = () 
     if (typeof nullifier !== 'string' || !nullifier)
       return { ok: false, code: 'no-nullifier', reason: 'Verified proof carried no nullifier' };
 
+    // 2b) WALLET BINDING — the proof names the wallet it was issued for (self_qr.js
+    //     put it in userDefinedData, and the circuit hashes it). Without this check a
+    //     genuine proof could be replayed with a swapped `wallet` field, redirecting
+    //     someone else's one-and-only ignition. Checked BEFORE the seal, which is
+    //     irreversible. A verifier that reports no bound wallet is refused, not trusted.
+    const bound = result && result.boundWallet;
+    if (typeof bound !== 'string' || !bound)
+      return { ok: false, code: 'no-bound-wallet', reason: 'Verified proof carried no bound wallet' };
+    if (bound.trim().toUpperCase() !== wallet)
+      return { ok: false, code: 'wallet-mismatch', reason: 'This proof was issued for a different wallet' };
+
     // 3) SYBIL CORE — one nullifier = one ignition. A second proof from the SAME
     //    human (same nullifier) is rejected even if it targets a fresh wallet.
     if (store.has(nullifier))
@@ -189,11 +200,14 @@ function realSelfVerifier(config = {}) {
     allowedIds  = AllIds,                                  // accept all supported document types
     configStore = new DefaultConfigStore({}),              // empty policy: personhood only, no extra disclosure
     userIdType  = 'hex',                                   // M_ wallet identifiers are hex
+    // Default is PRODUCTION (real passports). SELF_MOCK=1 opts into mock mode for
+    // testnet drills (T0-T2); leaving it unset is what lets a real scan verify (T3).
+    mockPassport = process.env.SELF_MOCK === '1',
   } = config;
 
   const verifier = new SelfBackendVerifier(
     scope, endpoint,
-    true,                 // mockPassport = true  → MOCK MODE (staging/testnet)
+    mockPassport,         // env-driven: SELF_MOCK=1 → mock (staging), unset → production
     allowedIds, configStore, userIdType
   );
 
@@ -203,7 +217,15 @@ function realSelfVerifier(config = {}) {
       const r = await verifier.verify(p.attestationId, p.proof, p.publicSignals, p.userContextData);
       const valid     = !!(r && r.isValidDetails && r.isValidDetails.isValid);
       const nullifier = r && r.discloseOutput && r.discloseOutput.nullifier;
-      return { valid, nullifier: nullifier != null ? String(nullifier) : undefined };
+      // boundWallet is the M_ mark self_qr.js baked into userDefinedData. It is a
+      // hashed public signal of the proof, so it cannot be swapped in flight; the
+      // gate compares it to the wallet being ignited and refuses on a mismatch.
+      const boundWallet = r && r.userData && r.userData.userDefinedData;
+      return {
+        valid,
+        nullifier:   nullifier   != null ? String(nullifier)   : undefined,
+        boundWallet: boundWallet != null ? String(boundWallet) : undefined,
+      };
     },
   };
 }

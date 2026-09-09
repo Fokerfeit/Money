@@ -44,8 +44,11 @@ function mockStore() {
   };
 }
 // A stub verifier object — exactly the seam the prompt requires: it returns a
-// chosen {valid, nullifier} with NO real proof.
-const stub = (verdict) => () => Promise.resolve(verdict);
+// chosen {valid, nullifier} with NO real proof. It also echoes the bound wallet the
+// payload carries — mirroring the real verifier, which recovers the wallet from the
+// proof's userContextData (see self_qr.js userDefinedData binding). The gate's
+// wallet-binding guard needs this; a claim's payload passes { boundWallet: <wallet> }.
+const stub = (verdict) => (payload) => Promise.resolve({ ...verdict, boundWallet: payload && payload.boundWallet });
 const A1 = 'M_' + 'A'.repeat(32), B1 = 'M_' + 'B'.repeat(32), C1 = 'M_' + 'C'.repeat(32), D1 = 'M_' + 'D'.repeat(32);
 
 // ── INTEGRATION harness: deterministic wallets + real server child ───────────
@@ -95,8 +98,8 @@ const readSelfFile = () => { try { return JSON.parse(fs.readFileSync(SELF_FILE, 
   {
     const led = mockLedger(), st = mockStore();
     const gate = selfGate.createSelfGate({ verify: stub({ valid: true, nullifier: 'NULL_X' }), ledger: led, store: st });
-    const r1 = await gate.claim({}, A1);
-    const r2 = await gate.claim({}, B1);   // SAME nullifier, DIFFERENT wallet
+    const r1 = await gate.claim({ boundWallet: A1 }, A1);
+    const r2 = await gate.claim({ boundWallet: B1 }, B1);   // SAME nullifier, DIFFERENT wallet
     const oneMint = led._txs.filter((t) => t.from === 'FAUCET').length === 1;
     (r1.ok && r1.amount === 1_000_000 && !r2.ok && r2.code === 'nullifier-used' && r2.boundTo === A1 && oneMint && st.size() === 1)
       ? ok('(1) same nullifier → first wallet mints 1,000,000; second wallet REJECTED, no second mint')
@@ -107,7 +110,7 @@ const readSelfFile = () => { try { return JSON.parse(fs.readFileSync(SELF_FILE, 
   {
     const led = mockLedger(), st = mockStore();
     const gate = selfGate.createSelfGate({ verify: stub({ valid: true, nullifier: 'NULL_Y' }), ledger: led, store: st });
-    const r = await gate.claim({}, A1);
+    const r = await gate.claim({ boundWallet: A1 }, A1);
     const tx = led._txs[0];
     (r.ok && st.get('NULL_Y') === A1 && tx && tx.from === 'FAUCET' && tx.to === A1 && tx.amount === 1_000_000 && tx.reason === 'self_ignition' && led.isIgnited(A1))
       ? ok('(2) nullifier SEALED to wallet; mint is a from:FAUCET tx of 1,000,000 → wallet ignited')
@@ -120,8 +123,8 @@ const readSelfFile = () => { try { return JSON.parse(fs.readFileSync(SELF_FILE, 
     // each human is a distinct verifier verdict → a fresh gate per nullifier
     const g1 = selfGate.createSelfGate({ verify: stub({ valid: true, nullifier: 'NULL_1' }), ledger: led, store: st });
     const g2 = selfGate.createSelfGate({ verify: stub({ valid: true, nullifier: 'NULL_2' }), ledger: led, store: st });
-    const r1 = await g1.claim({}, A1);
-    const r2 = await g2.claim({}, C1);
+    const r1 = await g1.claim({ boundWallet: A1 }, A1);
+    const r2 = await g2.claim({ boundWallet: C1 }, C1);
     (r1.ok && r2.ok && st.size() === 2 && led._txs.filter((t) => t.from === 'FAUCET').length === 2)
       ? ok('(3) two DIFFERENT nullifiers → both ignite, each wallet its own 1,000,000')
       : bad(`(3) distinct-humans failed: ${JSON.stringify({ r1, r2, size: st.size() })}`);
@@ -134,10 +137,10 @@ const readSelfFile = () => { try { return JSON.parse(fs.readFileSync(SELF_FILE, 
   {
     const led1 = mockLedger(), st1 = mockStore();
     const g1 = selfGate.createSelfGate({ verify: stub({ valid: true, nullifier: 'NULL_NG1' }), ledger: led1, store: st1 });
-    const rNone = await g1.claim({}, A1);                                  // no code anywhere
+    const rNone = await g1.claim({ boundWallet: A1 }, A1);                 // no code anywhere
     const led2 = mockLedger(), st2 = mockStore();
     const g2 = selfGate.createSelfGate({ verify: stub({ valid: true, nullifier: 'NULL_NG2' }), ledger: led2, store: st2 });
-    const rBogus = await g2.claim({ ignitionCode: 'FAKE', code: 'FAKE', invite: 'FAKE' }, A1);  // bogus code ignored
+    const rBogus = await g2.claim({ ignitionCode: 'FAKE', code: 'FAKE', invite: 'FAKE', boundWallet: A1 }, A1);  // bogus code ignored
     // comment-stripped scan: the gate's *logic* must not reference the code gate.
     const stripped = fs.readFileSync(path.join(__dirname, 'self_gate.js'), 'utf8')
       .replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
@@ -151,7 +154,7 @@ const readSelfFile = () => { try { return JSON.parse(fs.readFileSync(SELF_FILE, 
   {
     const led = mockLedger(), st = mockStore();
     const gate = selfGate.createSelfGate({ verify: stub({ valid: false, nullifier: 'NULL_BAD' }), ledger: led, store: st });
-    const r = await gate.claim({}, A1);
+    const r = await gate.claim({ boundWallet: A1 }, A1);
     (!r.ok && r.code === 'invalid-proof' && led._txs.length === 0 && st.size() === 0 && !st.has('NULL_BAD'))
       ? ok('(5) invalid proof → no mint, nullifier NOT sealed, ledger untouched')
       : bad(`(5) invalid-proof leak: ${JSON.stringify({ r, txs: led._txs.length, size: st.size() })}`);
@@ -161,11 +164,11 @@ const readSelfFile = () => { try { return JSON.parse(fs.readFileSync(SELF_FILE, 
   {
     const led = mockLedger(), st = mockStore();
     const gate = selfGate.createSelfGate({ verify: stub({ valid: true, nullifier: 'NULL_INT' }), ledger: led, store: st });
-    const r = await gate.claim({}, A1);
+    const r = await gate.claim({ boundWallet: A1 }, A1);
     const intOK = r.ok && r.amount === 1_000_000 && Number.isInteger(r.amount) && Number.isInteger(led._txs[0].amount);
     // defensive: a non-integer configured amount is refused
     const gBad = selfGate.createSelfGate({ verify: stub({ valid: true, nullifier: 'NULL_F' }), ledger: mockLedger(), store: mockStore(), amount: 1_000_000.5 });
-    const rBad = await gBad.claim({}, A1);
+    const rBad = await gBad.claim({ boundWallet: A1 }, A1);
     (intOK && selfGate.MINT_AMOUNT === 1_000_000 && !rBad.ok && rBad.code === 'bad-amount')
       ? ok('(6) minted amount is exactly 1,000,000 (integer); fractional amount refused')
       : bad(`(6) integer-money failed: ${JSON.stringify({ r, rBad })}`);

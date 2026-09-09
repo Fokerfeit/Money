@@ -6,6 +6,7 @@ const nacl      = require('tweetnacl');
 const rateLimit = require('express-rate-limit');
 const ledgerChain = require('./ledger_chain');   // Brick 1: tamper-evident integrity layer (additive, read-only)
 const selfGate    = require('./self_gate');      // Self personhood-ignition gate (pure; @selfxyz loaded lazily only if enabled)
+const selfQr      = require('./self_qr');         // ignition QR builder (offline SVG; wallet bound into the proof)
 const safeStore   = require('./safe_store');     // atomic, fail-closed JSON persistence (saveAtomic / loadStrict)
 
 const app = express();
@@ -794,8 +795,13 @@ if (process.env.SELF_GATE === '1') {
   let verify;
   if (process.env.NODE_ENV === 'test' && process.env.SELF_GATE_STUB === '1') {
     verify = async (payload) => ({
-      valid:     !!(payload && payload.stub && payload.stub.valid),
-      nullifier: payload && payload.stub ? payload.stub.nullifier : undefined,
+      valid:       !!(payload && payload.stub && payload.stub.valid),
+      nullifier:   payload && payload.stub ? payload.stub.nullifier : undefined,
+      // Default the bound wallet to the requested wallet so honest stub claims pass
+      // the binding check; a probe overrides stub.boundWallet to force a mismatch.
+      boundWallet: payload && payload.stub && ('boundWallet' in payload.stub)
+        ? payload.stub.boundWallet
+        : (payload && (payload.wallet || payload.to)),
     });
     console.log('[self-gate] TEST STUB verifier active (NODE_ENV=test, SELF_GATE_STUB=1)');
   } else {
@@ -817,10 +823,29 @@ if (process.env.SELF_GATE === '1') {
     message: { error: 'Too many ignition attempts — try again later.' },
   });
 
+  // GET /ignite?wallet=M_… → the ignition QR as SVG. Read-only: it mints nothing,
+  // it only encodes a wallet-bound SelfApp for the phone to scan.
+  app.get('/ignite', (req, res) => {
+    try {
+      const svg = selfQr.igniteQrSvg(String(req.query.wallet || ''));
+      res.type('image/svg+xml').send(svg);
+    } catch (e) {
+      res.status(400).json({ error: e.message, code: 'bad-wallet' });
+    }
+  });
+
+  // Optional debug capture: with SELF_CAPTURE_DIR set, persist each raw proof body
+  // so a real device round-trip can be replayed offline. Never on by default.
+  const captureDir = process.env.SELF_CAPTURE_DIR || null;
+
   app.post('/ignite/self', selfLimiter, async (req, res) => {
     try {
       const body   = req.body || {};
       const wallet = body.wallet || body.to;          // M_ address to ignite
+      if (captureDir) {
+        try { fs.mkdirSync(captureDir, { recursive: true });
+          fs.writeFileSync(path.join(captureDir, `proof_${Date.now()}.json`), JSON.stringify(body)); } catch {}
+      }
       const result = await gate.claim(body, wallet);
       if (!result.ok) {
         const status = (result.code === 'nullifier-used' || result.code === 'wallet-ignited') ? 409
@@ -835,7 +860,9 @@ if (process.env.SELF_GATE === '1') {
       res.status(500).json({ error: 'self ignition failed' });
     }
   });
-  console.log(`[self-gate] ENABLED — POST /ignite/self (mock mode${process.env.NODE_ENV === 'test' && process.env.SELF_GATE_STUB === '1' ? ', test stub' : ''})`);
+  const modeLabel = (process.env.NODE_ENV === 'test' && process.env.SELF_GATE_STUB === '1') ? 'TEST STUB'
+                  : (process.env.SELF_MOCK === '1') ? 'mock passport' : 'PRODUCTION (real passport)';
+  console.log(`[self-gate] ENABLED — POST /ignite/self, GET /ignite (${modeLabel})`);
 }
 
 // ── Debug endpoint (dev-only — remove or auth-gate before public launch) ──
