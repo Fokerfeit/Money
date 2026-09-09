@@ -15,12 +15,10 @@
 
 import React, { useRef, useEffect } from 'react';
 import { View, Dimensions, Animated, Platform, StyleSheet } from 'react-native';
-import Svg, { Defs, RadialGradient, LinearGradient, Stop, Rect, Circle, Line, Ellipse, G } from 'react-native-svg';
+import Svg, { Defs, RadialGradient, LinearGradient, Stop, Rect, Circle, Line, Ellipse } from 'react-native-svg';
 import { DeviceMotion } from 'expo-sensors';
 
 const { width: W, height: H } = Dimensions.get('window');
-const AG = Animated.createAnimatedComponent(G);
-
 // ── Deterministic starfield ─────────────────────────────────────────────────
 const _rng = (() => { let s = 0x1a2b3c4d; return () => (s = (s * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff; })();
 const STARS = Array.from({ length: 64 }, (_, i) => ({
@@ -105,8 +103,8 @@ export const HoloBackground = ({ tilt }) => {
   useEffect(() => {
     const loops = [];
     const pulse = (v, hi, dur, lo = 0) => Animated.loop(Animated.sequence([
-      Animated.timing(v, { toValue: hi, duration: dur, useNativeDriver: false }),
-      Animated.timing(v, { toValue: lo, duration: dur, useNativeDriver: false }),
+      Animated.timing(v, { toValue: hi, duration: dur, useNativeDriver: true }),
+      Animated.timing(v, { toValue: lo, duration: dur, useNativeDriver: true }),
     ]));
     loops.push(pulse(tw[0], 1, 1500, 0.35), pulse(tw[1], 0.95, 2100, 0.45), pulse(tw[2], 0.9, 2700, 0.25));
     loops.push(pulse(neb1, 1, 9000), pulse(neb2, 1, 7600), pulse(aura, 1, 6200), pulse(planet, 1, 8000));
@@ -125,53 +123,96 @@ export const HoloBackground = ({ tilt }) => {
   const parX = TX ? TX.interpolate({ inputRange: [-1, 1], outputRange: [40, -40] }) : 0;
   const parY = TY ? TY.interpolate({ inputRange: [-1, 1], outputRange: [40, -40] }) : 0;
 
+  const svgLayer = { position: 'absolute', width: W, height: H };
+
   return (
     <View style={[StyleSheet.absoluteFill, { overflow: 'hidden' }]} pointerEvents="none">
-        <Animated.View style={[StyleSheet.absoluteFill, { transform: [{ translateX: parX }, { translateY: parY }, { scale: 1.28 }] }]}>
-          <Svg width={W} height={H} style={{ position: 'absolute' }}>
+      <Animated.View style={[StyleSheet.absoluteFill, { transform: [{ translateX: parX }, { translateY: parY }, { scale: 1.28 }] }]}>
+
+        {/* Static base: space background + constellation lines */}
+        <Svg width={W} height={H} style={svgLayer}>
+          <Defs>
+            <RadialGradient id="space" cx="50%" cy="30%" r="90%">
+              <Stop offset="0%" stopColor="#2A1803" /><Stop offset="45%" stopColor="#130B02" /><Stop offset="100%" stopColor="#040207" />
+            </RadialGradient>
+          </Defs>
+          <Rect x="0" y="0" width={W} height={H} fill="url(#space)" />
+          {LINES.map(([a, b], i) => (
+            <Line key={`l${i}`} x1={STARS[a].x * W} y1={STARS[a].y * H} x2={STARS[b].x * W} y2={STARS[b].y * H} stroke="#D4AF37" strokeWidth="0.5" strokeOpacity="0.14" />
+          ))}
+        </Svg>
+
+        {/* Aurora — native-driver opacity */}
+        <Animated.View style={[svgLayer, { opacity: auraOp }]} pointerEvents="none">
+          <Svg width={W} height={H}>
             <Defs>
-              <RadialGradient id="space" cx="50%" cy="30%" r="90%">
-                <Stop offset="0%" stopColor="#2A1803" /><Stop offset="45%" stopColor="#130B02" /><Stop offset="100%" stopColor="#040207" />
-              </RadialGradient>
-              <RadialGradient id="nebGold"  cx="50%" cy="50%" r="50%"><Stop offset="0%" stopColor="#E8C04A" stopOpacity="0.95" /><Stop offset="100%" stopColor="#E8C04A" stopOpacity="0" /></RadialGradient>
-              <RadialGradient id="nebEmber" cx="50%" cy="50%" r="50%"><Stop offset="0%" stopColor="#9C3F00" stopOpacity="0.95" /><Stop offset="100%" stopColor="#9C3F00" stopOpacity="0" /></RadialGradient>
-              <RadialGradient id="planet" cx="38%" cy="38%" r="65%">
-                <Stop offset="0%" stopColor="#FFE7A8" stopOpacity="0.9" /><Stop offset="35%" stopColor="#C9962E" stopOpacity="0.65" />
-                <Stop offset="70%" stopColor="#5A2E00" stopOpacity="0.35" /><Stop offset="100%" stopColor="#5A2E00" stopOpacity="0" />
-              </RadialGradient>
-              <RadialGradient id="vign" cx="50%" cy="42%" r="75%">
-                <Stop offset="0%" stopColor="#000000" stopOpacity="0" /><Stop offset="72%" stopColor="#000000" stopOpacity="0" /><Stop offset="100%" stopColor="#000000" stopOpacity="0.6" />
-              </RadialGradient>
               <LinearGradient id="aurora" x1="0" y1="1" x2="0" y2="0">
                 <Stop offset="0%" stopColor="#1FB6A8" stopOpacity="0.55" /><Stop offset="60%" stopColor="#2A7DC9" stopOpacity="0.18" /><Stop offset="100%" stopColor="#2A7DC9" stopOpacity="0" />
               </LinearGradient>
             </Defs>
-
-            <Rect x="0" y="0" width={W} height={H} fill="url(#space)" />
-            <AG opacity={auraOp}><Rect x="0" y={H * 0.62} width={W} height={H * 0.38} fill="url(#aurora)" /></AG>
-            <AG opacity={planetOp}>
-              <Circle cx={W * 1.02} cy={H * 0.1} r={W * 0.62} fill="url(#planet)" />
-              <Ellipse cx={W * 1.02} cy={H * 0.1} rx={W * 0.82} ry={W * 0.34} fill="none" stroke="#D4AF37" strokeWidth="0.7" strokeOpacity="0.5" />
-              <Ellipse cx={W * 1.02} cy={H * 0.1} rx={W * 1.05} ry={W * 0.5}  fill="none" stroke="#D4AF37" strokeWidth="0.6" strokeOpacity="0.32" />
-            </AG>
-            <AG opacity={neb1Op}><Ellipse cx={W * 0.2}  cy={H * 0.24} rx={W * 0.6}  ry={W * 0.6}  fill="url(#nebGold)" /></AG>
-            <AG opacity={neb2Op}><Ellipse cx={W * 0.84} cy={H * 0.8}  rx={W * 0.55} ry={W * 0.55} fill="url(#nebEmber)" /></AG>
-            {LINES.map(([a, b], i) => (
-              <Line key={`l${i}`} x1={STARS[a].x * W} y1={STARS[a].y * H} x2={STARS[b].x * W} y2={STARS[b].y * H} stroke="#D4AF37" strokeWidth="0.5" strokeOpacity="0.14" />
-            ))}
-            {[0, 1, 2].map(grp => (
-              <AG key={`g${grp}`} opacity={tw[grp]}>
-                {STARS.filter(s => s.grp === grp).map((s, i) => (
-                  <Circle key={`s${grp}_${i}`} cx={s.x * W} cy={s.y * H} r={s.r} fill={s.gold ? '#FFE39A' : '#FFFFFF'} />
-                ))}
-              </AG>
-            ))}
-            <Rect x="0" y="0" width={W} height={H} fill="url(#vign)" />
+            <Rect x="0" y={H * 0.62} width={W} height={H * 0.38} fill="url(#aurora)" />
           </Svg>
-
-          <ShootingStar delay={1200} x={-80}     y={H * 0.18} dx={W * 0.8}  dy={H * 0.28} len={120} angle={20} gap={6000} />
-          <ShootingStar delay={4800} x={W * 0.5} y={-60}      dx={W * 0.45} dy={H * 0.4}  len={90}  angle={42} gap={8200} />
         </Animated.View>
+
+        {/* Planet — native-driver opacity */}
+        <Animated.View style={[svgLayer, { opacity: planetOp }]} pointerEvents="none">
+          <Svg width={W} height={H}>
+            <Defs>
+              <RadialGradient id="planet" cx="38%" cy="38%" r="65%">
+                <Stop offset="0%" stopColor="#FFE7A8" stopOpacity="0.9" /><Stop offset="35%" stopColor="#C9962E" stopOpacity="0.65" />
+                <Stop offset="70%" stopColor="#5A2E00" stopOpacity="0.35" /><Stop offset="100%" stopColor="#5A2E00" stopOpacity="0" />
+              </RadialGradient>
+            </Defs>
+            <Circle cx={W * 1.02} cy={H * 0.1} r={W * 0.62} fill="url(#planet)" />
+            <Ellipse cx={W * 1.02} cy={H * 0.1} rx={W * 0.82} ry={W * 0.34} fill="none" stroke="#D4AF37" strokeWidth="0.7" strokeOpacity="0.5" />
+            <Ellipse cx={W * 1.02} cy={H * 0.1} rx={W * 1.05} ry={W * 0.5}  fill="none" stroke="#D4AF37" strokeWidth="0.6" strokeOpacity="0.32" />
+          </Svg>
+        </Animated.View>
+
+        {/* Nebula 1 — native-driver opacity */}
+        <Animated.View style={[svgLayer, { opacity: neb1Op }]} pointerEvents="none">
+          <Svg width={W} height={H}>
+            <Defs>
+              <RadialGradient id="nebGold" cx="50%" cy="50%" r="50%"><Stop offset="0%" stopColor="#E8C04A" stopOpacity="0.95" /><Stop offset="100%" stopColor="#E8C04A" stopOpacity="0" /></RadialGradient>
+            </Defs>
+            <Ellipse cx={W * 0.2}  cy={H * 0.24} rx={W * 0.6}  ry={W * 0.6}  fill="url(#nebGold)" />
+          </Svg>
+        </Animated.View>
+
+        {/* Nebula 2 — native-driver opacity */}
+        <Animated.View style={[svgLayer, { opacity: neb2Op }]} pointerEvents="none">
+          <Svg width={W} height={H}>
+            <Defs>
+              <RadialGradient id="nebEmber" cx="50%" cy="50%" r="50%"><Stop offset="0%" stopColor="#9C3F00" stopOpacity="0.95" /><Stop offset="100%" stopColor="#9C3F00" stopOpacity="0" /></RadialGradient>
+            </Defs>
+            <Ellipse cx={W * 0.84} cy={H * 0.8}  rx={W * 0.55} ry={W * 0.55} fill="url(#nebEmber)" />
+          </Svg>
+        </Animated.View>
+
+        {/* Star groups — native-driver opacity */}
+        {[0, 1, 2].map(grp => (
+          <Animated.View key={`sg${grp}`} style={[svgLayer, { opacity: tw[grp] }]} pointerEvents="none">
+            <Svg width={W} height={H}>
+              {STARS.filter(s => s.grp === grp).map((s, i) => (
+                <Circle key={`s${grp}_${i}`} cx={s.x * W} cy={s.y * H} r={s.r} fill={s.gold ? '#FFE39A' : '#FFFFFF'} />
+              ))}
+            </Svg>
+          </Animated.View>
+        ))}
+
+        {/* Vignette on top (static) */}
+        <Svg width={W} height={H} style={svgLayer}>
+          <Defs>
+            <RadialGradient id="vign" cx="50%" cy="42%" r="75%">
+              <Stop offset="0%" stopColor="#000000" stopOpacity="0" /><Stop offset="72%" stopColor="#000000" stopOpacity="0" /><Stop offset="100%" stopColor="#000000" stopOpacity="0.6" />
+            </RadialGradient>
+          </Defs>
+          <Rect x="0" y="0" width={W} height={H} fill="url(#vign)" />
+        </Svg>
+
+        <ShootingStar delay={1200} x={-80}     y={H * 0.18} dx={W * 0.8}  dy={H * 0.28} len={120} angle={20} gap={6000} />
+        <ShootingStar delay={4800} x={W * 0.5} y={-60}      dx={W * 0.45} dy={H * 0.4}  len={90}  angle={42} gap={8200} />
+      </Animated.View>
     </View>
   );
 };
