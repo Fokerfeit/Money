@@ -167,8 +167,8 @@ function makeWalletApi({ SecureStore, AsyncStorage }) {
     const toggleReloadsWallet = /const\s+toggleNetwork\s*=\s*async\s*\(\)\s*=>\s*\{[\s\S]*?setNetwork\([\s\S]*?loadOrCreateWallet\(next\)[\s\S]*?applyWalletToState\([\s\S]*?sync\(\)[\s\S]*?\}/.test(stripped);
     (toggleReloadsWallet) ? ok('toggleNetwork() persists the network, then loads/forges THAT network\'s wallet, then reloads data') : bad('toggleNetwork does not reload the wallet for the new network');
 
-    const restoreUsesNetworkSave = /const\s+applyRestore\s*=\s*async\s*\(\)\s*=>\s*\{[\s\S]*?saveWallet\(network,\s*kp\)/.test(stripped);
-    (restoreUsesNetworkSave) ? ok('applyRestore() saves the restored wallet into the CURRENTLY ACTIVE network\'s slot (saveWallet(network, kp))') : bad('applyRestore does not use the per-network save');
+    const restoreUsesNetworkSave = /const\s+applyRestore\s*=\s*async\s*\(\)\s*=>\s*\{[\s\S]*?saveWallet\(targetNet,\s*kp\)/.test(stripped);
+    (restoreUsesNetworkSave) ? ok('applyRestore() saves the restored wallet into the chosen network\'s slot (saveWallet(targetNet, kp); targetNet defaults to the active network)') : bad('applyRestore does not use the per-network save');
   }
 
   // (7) APP.JS WIRING — ignition code field (structural)
@@ -193,6 +193,104 @@ function makeWalletApi({ SecureStore, AsyncStorage }) {
     (claimSendsCode) ? ok('claim() still sends ignitionCode in the POST /transaction body') : bad('claim() no longer sends ignitionCode');
   }
 
-  console.log(`\n  ${fails === 0 ? '🎉' : '💥'}  Testnet UX: ${fails === 0 ? 'ALL PROBES PASS' : fails + ' FAILURE(S)'} — per-network wallets, ignition code reachable from the main screen.\n`);
+  // (8) ONBOARDING NETWORK PICKER — FIX 1 (structural + executed)
+  console.log('\n  (8) ONBOARDING NETWORK PICKER (Fix 1)');
+  {
+    const src = fs.readFileSync(APP_JS, 'utf8');
+    const stripped = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+
+    // selectNetwork reuses the SAME primitives as toggleNetwork (no parallel scheme)
+    const selectReuses = /const\s+selectNetwork\s*=\s*async\s*\(net\)\s*=>\s*\{[\s\S]*?setNetwork\(net,\s*AsyncStorage\)[\s\S]*?loadOrCreateWallet\(net\)[\s\S]*?applyWalletToState\(/.test(stripped);
+    (selectReuses) ? ok('selectNetwork(net) reuses setNetwork + loadOrCreateWallet + applyWalletToState — no second network mechanism')
+                   : bad('selectNetwork missing or does not reuse the existing switch primitives');
+
+    // the picker records the choice, then switches
+    const choose = /const\s+chooseNetwork\s*=\s*async\s*\(net\)\s*=>\s*\{\s*setNetworkChosen\(true\);\s*await\s+selectNetwork\(net\)/.test(stripped);
+    (choose) ? ok('chooseNetwork(net) marks the choice then calls selectNetwork(net)') : bad('chooseNetwork not wired to selectNetwork');
+
+    // both networks are tappable on the ignition screen
+    (/onPress=\{\(\)\s*=>\s*chooseNetwork\('testnet'\)\}/.test(stripped) && /onPress=\{\(\)\s*=>\s*chooseNetwork\('mainnet'\)\}/.test(stripped))
+      ? ok('both 🧪 TESTNET and 🌐 MAINNET are tappable on the ignition screen') : bad('picker is missing one of the two network buttons');
+
+    // CRITICAL: entering step 4 with no user tap ACTUALLY switches to testnet (not just highlight)
+    const autoSelect = /onboardingStep === 4 && !networkChosen && network !== 'testnet'\)\s*\{\s*selectNetwork\('testnet'\)/.test(stripped);
+    (autoSelect) ? ok('entering step 4 with no prior choice calls selectNetwork(\'testnet\') — the active network, not just a highlight')
+                 : bad('step-4 effect does not force-select testnet when the user has not chosen');
+
+    // the label reads from LIVE network state (updates the instant the user switches)
+    const liveLabel = /Igniting on \$\{network === 'testnet' \? '🧪 TESTNET' : '🌐 MAINNET'\}/.test(stripped);
+    (liveLabel) ? ok('the "Igniting on …" label reads live `network` state') : bad('ignition label is not bound to live network state');
+
+    // RACE GUARD: selectNetwork raises switchingNet at the start and clears it in finally
+    const flagInFinally = /const\s+selectNetwork\s*=\s*async[\s\S]*?setSwitchingNet\(true\)[\s\S]*?finally\s*\{\s*setSwitchingNet\(false\)/.test(stripped);
+    (flagInFinally) ? ok('selectNetwork sets switchingNet=true, then clears it in a finally (never stuck)') : bad('selectNetwork does not guard with switchingNet + finally');
+
+    // IGNITE is frozen while a switch is mid-flight (disabled + onPress guard)
+    const igniteDisabled = /disabled=\{switchingNet\}[\s\S]*?onPress=\{\(\)\s*=>\s*\{\s*if \(switchingNet\) return;\s*completeBioKeySetup\(\)/.test(stripped);
+    (igniteDisabled) ? ok('IGNITE is disabled + guarded while switchingNet (cannot ignite the old address on the new network)') : bad('IGNITE is not frozen during a network switch');
+
+    // both picker buttons AND ignite carry the switchingNet freeze
+    const frozenCount = (stripped.match(/disabled=\{switchingNet\}/g) || []).length;
+    (frozenCount >= 3) ? ok(`both picker buttons and IGNITE are disabled while switching (${frozenCount} guarded controls)`) : bad(`expected ≥3 switchingNet-disabled controls, found ${frozenCount}`);
+
+    // label swaps to "Switching network…" during the switch
+    (/switchingNet \? 'Switching network…'/.test(stripped)) ? ok('label shows "Switching network…" during the switch') : bad('no "Switching network…" state on the label');
+
+    // EXECUTED against the REAL config.js: default is mainnet; the target the step-4
+    // effect uses (\'testnet\') genuinely flips the active network → getNetwork() is
+    // \'testnet\' before any claim POST could fire.
+    const cfg = require('./config');
+    const def = cfg.getNetwork();
+    await cfg.setNetwork('testnet');
+    const afterAuto = cfg.getNetwork();
+    (def === 'mainnet' && afterAuto === 'testnet')
+      ? ok(`config proof: default was '${def}', pre-select flips getNetwork() → '${afterAuto}' (IGNITE posts to the shown network)`)
+      : bad(`pre-select target did not flip the active network: default=${def} afterAuto=${afterAuto}`);
+    await cfg.setNetwork('mainnet');   // restore module default for any later probe
+  }
+
+  // (9) RESTORE GUARD — FIX 2 (structural)
+  console.log('\n  (9) RESTORE GUARD (Fix 2)');
+  {
+    const src = fs.readFileSync(APP_JS, 'utf8');
+    const stripped = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+
+    // both network URLs are imported from config
+    (/import\s*\{[^}]*\bMAINNET_URL\b[^}]*\bTESTNET_URL\b[^}]*\}\s*from\s*'\.\/config'/.test(src))
+      ? ok('MAINNET_URL and TESTNET_URL are imported from ./config') : bad('MAINNET_URL/TESTNET_URL not imported from config');
+
+    const restore = (stripped.match(/const\s+applyRestore\s*=\s*async[\s\S]*?setOnboardingStep\(0\);\s*\};/) || [''])[0];
+
+    // probes BOTH networks' /balance for the derived address
+    (/fetchBalance\(MAINNET_URL,\s*addr\)/.test(restore) && /fetchBalance\(TESTNET_URL,\s*addr\)/.test(restore))
+      ? ok('applyRestore probes /balance on BOTH MAINNET_URL and TESTNET_URL') : bad('applyRestore does not probe both networks');
+
+    // the balance probe happens BEFORE the wallet is saved
+    (restore.indexOf('fetchBalance(') > -1 && restore.indexOf('fetchBalance(') < restore.indexOf('saveWallet(targetNet'))
+      ? ok('the cross-network probe runs BEFORE saveWallet (guard, not after-the-fact)') : bad('balance probe does not precede saveWallet');
+
+    // honest wording: "no funds found on either", never "never ignited"
+    (/No funds found on either network/i.test(restore) && !/never ignited/i.test(stripped))
+      ? ok('wording is honest — "no funds found on either network"; never claims "never ignited"') : bad('restore wording is missing or dishonest');
+
+    // overwrite guard compares NORMALISED (uppercase) addresses + the 24-words warning
+    const addrUpper = /const addr = \(kp\.address \|\| ''\)\.toUpperCase\(\)/.test(restore);
+    const cmpUpper  = /existingAddr\s*&&\s*existingAddr\s*!==\s*addr/.test(restore);
+    const warn24    = /make sure you have its 24 words/.test(restore);
+    (addrUpper && cmpUpper && warn24)
+      ? ok('overwrite guard compares uppercased addresses and warns "make sure you have its 24 words" before replacing')
+      : bad(`overwrite guard incomplete: addrUpper=${addrUpper} cmpUpper=${cmpUpper} warn24=${warn24}`);
+
+    // switching to the other network reuses setNetwork (no second storage scheme)
+    (/if \(targetNet !== network\)\s*\{\s*await setNetwork\(targetNet,\s*AsyncStorage\);\s*setNetworkState\(targetNet\)/.test(restore))
+      ? ok('cross-network restore reuses setNetwork + setNetworkState (no parallel mechanism)') : bad('cross-network switch does not reuse setNetwork');
+
+    // saves into the CHOSEN network's slot, and unreachable networks do not block forever
+    (/saveWallet\(targetNet,\s*kp\)/.test(restore)) ? ok('restored wallet saved into the chosen network slot (saveWallet(targetNet, kp))') : bad('restore does not save into targetNet slot');
+    (/!mainRes\.ok\s*&&\s*!testRes\.ok/.test(restore) && /Restore anyway/.test(restore))
+      ? ok('both-networks-unreachable path asks to restore anyway — never blocks forever') : bad('no graceful path when networks are unreachable');
+  }
+
+  console.log(`\n  ${fails === 0 ? '🎉' : '💥'}  Testnet UX: ${fails === 0 ? 'ALL PROBES PASS' : fails + ' FAILURE(S)'} — per-network wallets, ignition code reachable, onboarding network picker + restore guard.\n`);
   process.exit(fails === 0 ? 0 : 1);
 })();

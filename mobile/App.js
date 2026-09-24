@@ -74,7 +74,7 @@ const authenticator = {
   generate:  (secret) => _totpAt(secret, Math.floor(Date.now()/1000/30)),
   check: (token, secret) => [-1,0,1].some(d => _totpAt(secret, Math.floor(Date.now()/1000/30)+d) === String(token).padStart(6,'0')),
 };
-import { BACKEND_URL, BASE_PENALTY, DISCONNECT_GRACE_MS, RESERVE_ADDRESS, getNetwork, isTestnet, setNetwork, loadNetwork } from './config';
+import { BACKEND_URL, MAINNET_URL, TESTNET_URL, BASE_PENALTY, DISCONNECT_GRACE_MS, RESERVE_ADDRESS, getNetwork, isTestnet, setNetwork, loadNetwork } from './config';
 import { createContactStore, normAddress, isValidAddress } from './contacts';
 import MoneySymbol from './MoneySymbol';
 import {
@@ -497,6 +497,8 @@ function AppInner() {
 
   // Network toggle — mainnet ⇄ testnet, no rebuild required (config.js).
   const [network, setNetworkState] = useState(getNetwork());
+  const [networkChosen, setNetworkChosen] = useState(false);   // has the user tapped a network on the ignition screen yet?
+  const [switchingNet,  setSwitchingNet]  = useState(false);   // a network switch is mid-flight — freeze IGNITE + the picker
 
   // Wallet backup / restore (key recovery)
   const [seedInput,      setSeedInput]      = useState('');   // recovery key typed on Restore screen
@@ -823,6 +825,38 @@ function AppInner() {
     applyWalletToState(kp);
     await sync();
   };
+
+  // Switch to an EXPLICIT network (the onboarding picker). Same primitives as
+  // toggleNetwork — setNetwork + loadOrCreateWallet + applyWalletToState + sync —
+  // just with a named target instead of a flip. No second storage scheme.
+  const selectNetwork = async (net) => {
+    if (net === network) return;
+    // Freeze IGNITE + the picker for the whole switch: setNetwork flips BACKEND_URL
+    // immediately, but the wallet for `net` isn't in state until applyWalletToState
+    // below — a tap in that window would post the OLD address to the NEW network.
+    setSwitchingNet(true);
+    try {
+      await setNetwork(net, AsyncStorage);
+      setNetworkState(net);
+      const kp = await loadOrCreateWallet(net);
+      applyWalletToState(kp);
+      await sync();
+    } finally {
+      setSwitchingNet(false);
+    }
+  };
+  // The user tapped a network on the ignition screen — record the choice, then switch.
+  const chooseNetwork = async (net) => { setNetworkChosen(true); await selectNetwork(net); };
+
+  // TESTNET is the beta default: the moment the ignition screen appears, if the
+  // user hasn't picked yet, ACTUALLY switch to testnet (not just highlight) so the
+  // IGNITE POST always goes to the network shown on screen — getNetwork() ==='testnet'
+  // before any claim can fire.
+  useEffect(() => {
+    if (onboardingStep === 4 && !networkChosen && network !== 'testnet') {
+      selectNetwork('testnet');
+    }
+  }, [onboardingStep]);
 
   useEffect(() => {
     if (!address) return;
@@ -2073,6 +2107,39 @@ function AppInner() {
             <Text style={s.onboardBody}>{'\n'}Enter your invite code, then press IGNITE to claim your founding share.</Text>
           </View>
 
+          {/* Network picker (beta): TESTNET pre-selected on entry (see the step-4
+              effect). Tapping actually switches the active network, so the IGNITE
+              POST below always goes to the network named in the label. */}
+          <View style={{ width: '100%', marginBottom: 14, paddingHorizontal: 24 }}>
+            <Text style={{ color: '#9A7B4A', fontSize: 11, letterSpacing: 3, textAlign: 'center', marginBottom: 8 }}>
+              ✦ NETWORK
+            </Text>
+            <View style={{ flexDirection: 'row', gap: 10, opacity: switchingNet ? 0.5 : 1 }}>
+              <TouchableOpacity
+                disabled={switchingNet}
+                onPress={() => chooseNetwork('testnet')}
+                style={{ flex: 1, paddingVertical: 12, borderRadius: 12, borderWidth: 1,
+                  borderColor: network === 'testnet' ? '#C4703A' : 'rgba(212,175,55,0.25)',
+                  backgroundColor: network === 'testnet' ? 'rgba(196,112,58,0.18)' : 'rgba(28,17,4,0.5)' }}>
+                <Text style={{ textAlign: 'center', fontSize: 14, fontWeight: 'bold',
+                  color: network === 'testnet' ? '#EBC39B' : '#7A5C3A' }}>🧪 TESTNET</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                disabled={switchingNet}
+                onPress={() => chooseNetwork('mainnet')}
+                style={{ flex: 1, paddingVertical: 12, borderRadius: 12, borderWidth: 1,
+                  borderColor: network === 'mainnet' ? '#7DB87A' : 'rgba(212,175,55,0.25)',
+                  backgroundColor: network === 'mainnet' ? 'rgba(125,184,122,0.18)' : 'rgba(28,17,4,0.5)' }}>
+                <Text style={{ textAlign: 'center', fontSize: 14, fontWeight: 'bold',
+                  color: network === 'mainnet' ? '#CDE9CB' : '#7A5C3A' }}>🌐 MAINNET</Text>
+              </TouchableOpacity>
+            </View>
+            <Text style={{ textAlign: 'center', marginTop: 10, fontSize: 13, fontWeight: 'bold',
+              color: switchingNet ? '#9A7B4A' : (network === 'testnet' ? '#C4703A' : '#7DB87A') }}>
+              {switchingNet ? 'Switching network…' : `Igniting on ${network === 'testnet' ? '🧪 TESTNET' : '🌐 MAINNET'}`}
+            </Text>
+          </View>
+
           {/* Invite (ignition) code — the server's one-per-human faucet gate */}
           <View style={{ width: '100%', marginBottom: 14, paddingHorizontal: 24 }}>
             <Text style={{ color: '#9A7B4A', fontSize: 11, letterSpacing: 3, textAlign: 'center', marginBottom: 8 }}>
@@ -2093,7 +2160,10 @@ function AppInner() {
             />
           </View>
 
-          <AnimatedPress style={[s.btnGold, glassButton]} onPress={completeBioKeySetup}>
+          <AnimatedPress
+            disabled={switchingNet}
+            style={[s.btnGold, glassButton, switchingNet && { opacity: 0.5 }]}
+            onPress={() => { if (switchingNet) return; completeBioKeySetup(); }}>
             <View style={{ flexDirection:'row', alignItems:'center', justifyContent:'center', gap: 6 }}>
               <FlameIcon size={18} color="#1A0A00" />
               <Text style={s.btnText}>IGNITE — CLAIM </Text>
@@ -2201,11 +2271,89 @@ function AppInner() {
     }
   };
 
-  // Confirm + apply: overwrite this device's wallet with the restored one.
+  // ── Restore-guard helpers ────────────────────────────────────────────────
+  const netLabel = (n) => (n === 'testnet' ? '🧪 TESTNET' : '🌐 MAINNET');
+  // Ask a yes/no and resolve to the answer (Alert is callback-based).
+  const confirmAsync = (title, message, confirmText = 'Continue') => new Promise((resolve) => {
+    Alert.alert(title, message, [
+      { text: 'Cancel', style: 'cancel', onPress: () => resolve(false) },
+      { text: confirmText, onPress: () => resolve(true) },
+    ], { cancelable: false });
+  });
+  // GET /balance/<addr> from a specific network URL. { ok:false } means unreachable
+  // (never treated as "no funds"). balance is a number; >0 means the wallet HAS FUNDS
+  // on that network. NOTE: a fully-spent wallet also reads 0 — so 0 means "no funds
+  // found", never "never ignited".
+  const fetchBalance = async (url, addr) => {
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 8000);
+      const r = await fetch(`${url}/balance/${addr}`, { signal: ctrl.signal });
+      clearTimeout(timer);
+      const j = await r.json();
+      return { ok: true, balance: Math.max(0, Number(j.balance) || 0) };
+    } catch { return { ok: false, balance: 0 }; }
+  };
+
+  // Confirm + apply: overwrite this device's wallet with the restored one — but
+  // FIRST guard against (a) funds sitting on the other network and (b) silently
+  // replacing a different wallet already in this network's slot.
   const applyRestore = async () => {
     if (!restorePreview) return;
     const kp = restorePreview;
-    await saveWallet(network, kp);   // restores into the CURRENTLY ACTIVE network's slot only
+    const addr = (kp.address || '').toUpperCase();
+    let targetNet = network;
+    const otherNet = network === 'mainnet' ? 'testnet' : 'mainnet';
+
+    // (1) Probe BOTH networks for this address (honest: balance>0 = has funds).
+    const [mainRes, testRes] = await Promise.all([
+      fetchBalance(MAINNET_URL, addr),
+      fetchBalance(TESTNET_URL, addr),
+    ]);
+    const byNet   = { mainnet: mainRes, testnet: testRes };
+    const fundsHere  = byNet[network].ok  && byNet[network].balance  > 0;
+    const fundsOther = byNet[otherNet].ok && byNet[otherNet].balance > 0;
+
+    if (!mainRes.ok && !testRes.ok) {
+      // Neither network reachable — say so, don't block restore forever.
+      const go = await confirmAsync('Couldn’t reach the network',
+        `Couldn’t reach either network to check this wallet’s balance. Restore on ${netLabel(network)} anyway?`, 'Restore anyway');
+      if (!go) return;
+    } else if (fundsOther && !fundsHere) {
+      // Funds live on the OTHER network — offer to switch and restore there.
+      const go = await confirmAsync('Funds are on the other network',
+        `This wallet has funds on ${netLabel(otherNet)}, not on ${netLabel(network)}. Switch to ${netLabel(otherNet)} and restore there?`,
+        `Switch to ${otherNet === 'testnet' ? 'testnet' : 'mainnet'}`);
+      if (!go) return;                       // user declined restoring on the wrong network
+      targetNet = otherNet;
+    } else if (!fundsHere && !fundsOther) {
+      // Honest wording: no funds found on either (new OR fully spent) — never "never ignited".
+      const go = await confirmAsync('No funds found',
+        `No funds found on either network for this wallet. It may be new or fully spent. Restore on ${netLabel(network)}?`, 'Restore');
+      if (!go) return;
+    }
+
+    // (2) Overwrite guard — read the target slot BEFORE switching, so we compare
+    // against the REAL stored wallet (not one auto-forged by a network switch).
+    const existingRaw = await SecureStore.getItemAsync(walletKey(targetNet)).catch(() => null);
+    if (existingRaw) {
+      let existingAddr = '';
+      try { existingAddr = (JSON.parse(existingRaw).address || '').toUpperCase(); } catch {}
+      if (existingAddr && existingAddr !== addr) {
+        const go = await confirmAsync('Replace this network’s wallet?',
+          `This replaces the wallet ${existingAddr} on ${netLabel(targetNet)} on this phone — make sure you have its 24 words.`, 'Replace');
+        if (!go) return;
+      }
+    }
+
+    // (3) If we're restoring onto the other network, flip the active network with
+    // the SAME primitives the toggle uses (setNetwork + state) — no forge, no
+    // second storage scheme — then save the restored wallet into that slot.
+    if (targetNet !== network) {
+      await setNetwork(targetNet, AsyncStorage);
+      setNetworkState(targetNet);
+    }
+    await saveWallet(targetNet, kp);   // restores into the chosen network's slot
     applyWalletToState(kp);
     // A restored wallet already exists on the ledger — mark this device sealed +
     // ignited so the user lands in the wallet now AND stays there on future
@@ -2215,7 +2363,8 @@ function AppInner() {
     setBioKeyActive(true);
     isIgnitedRef.current = true;
     setSeedInput(''); setRestorePreview(null);
-    Alert.alert('Wallet restored ✅', `This device now controls:\n\n${kp.address}\n\nYour balance will sync from the Clay Tablets.`);
+    Alert.alert('Wallet restored ✅', `This device now controls:\n\n${kp.address}\n\non ${netLabel(targetNet)}.\n\nYour balance will sync from the Clay Tablets.`);
+    await sync();
     setOnboardingStep(0);
   };
 
