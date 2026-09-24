@@ -144,6 +144,38 @@ const committeeFor = (sender, epoch, pool) => {
 const quorumOf = n => n - Math.floor((n - 1) / 3);   // 7 -> 5
 const byId = (a, b) => a.id < b.id ? -1 : 1;
 
+// ── WELL-FORMEDNESS GATE (structure only — never throws, never looks at state) ──
+// Every field fold() touches is used as a map key, sliced, compared or spliced
+// into a signed-message template BEFORE its signature can be checked (the pub
+// needed to verify comes from the tx itself). Without a type gate, ONE frame such
+// as {type:'promise', from:<member>, id:'x'} (no pub → addrOf(undefined)) or a
+// field set to {"toString":0} made fold() throw on every call, forever, on every
+// node — and a fresh node inherited it on its first sync.
+//
+// Strings must be strings, integers must be integers, id must be a string. This
+// also rejects RE-TYPED copies of valid signed content (e.g. to:[addr], a numeric
+// id) that fold() used to count because template coercion made them equivalent;
+// no MONEY code emits them, the original string form stays valid, and they made
+// fold() insertion-order-dependent (a re-wrapped chan_open could lock a channel
+// on some nodes and not others). Signature checks are unchanged and still happen
+// exactly where they did. Unknown types stay inert (stored, ignored), as before.
+const isStr = x => typeof x === 'string' && x.length > 0;
+const isInt = Number.isInteger;
+const SHAPE = {
+  seal:       t => [t.from, t.pub, t.sig].every(isStr) && (!!t.founder || [t.inviterAddr, t.inviteId, t.inviterSig].every(isStr)),
+  promise:    t => [t.from, t.to, t.pub, t.sig].every(isStr) && [t.amount, t.nonce, t.epoch].every(isInt),
+  accept:     t => [t.ref, t.from, t.pub, t.sig].every(isStr),
+  vote:       t => [t.ref, t.from, t.pub, t.sig].every(isStr),
+  chan_open:  t => [t.cid, t.A, t.B, t.pubA, t.pubB, t.sigA, t.sigB].every(isStr) && [t.depositA, t.depositB, t.nonceA, t.nonceB, t.epoch].every(isInt),
+  chan_close: t => [t.cid, t.A, t.B, t.sigA, t.sigB].every(isStr) && [t.finalBalA, t.finalBalB, t.version, t.epoch].every(isInt),
+};
+const wellFormed = t => {
+  try {
+    return !!t && typeof t === 'object' && !Array.isArray(t) && isStr(t.id) &&
+      (!Object.prototype.hasOwnProperty.call(SHAPE, t.type) || SHAPE[t.type](t));
+  } catch { return false; }   // belt and braces: a gate must never be the thing that throws
+};
+
 // ── CHANNEL BRIDGE (Layer 1 ↔ Layer 2) ──────────────────────────────────────
 // A channel is OPENED and CLOSED by committee-certified events; in between the
 // two parties stream signed states off-chain (channels.js). The committee is
@@ -186,14 +218,16 @@ class Ledger {
     this.founders = new Set(founders); this.txs = new Map();
     this._v = 0; this._foldV = -1; this._fold = null;   // fold memo
   }
-  add(tx) { if (tx && tx.id && !this.txs.has(tx.id)) { this.txs.set(tx.id, tx); this._v++; return true; } return false; }
+  // Malformed frames are refused at the door (see wellFormed): they never enter
+  // the ledger, so _react(), persistence and restore() never see them either.
+  add(tx) { if (wellFormed(tx) && !this.txs.has(tx.id)) { this.txs.set(tx.id, tx); this._v++; return true; } return false; }
   has(id) { return this.txs.has(id); }
   all() { return [...this.txs.values()]; }
 
   fold() {
     if (this._foldV === this._v) return this._fold;     // nothing new → cached result
     const bal = {}, next = {}, members = {}, inviterOf = {}, usedInvite = {}, issued = {};
-    const all = this.all();
+    const all = this.all().filter(wellFormed);   // defence in depth: add() already gates, fold never trusts that
     for (const tx of all.filter(t => t.type === 'seal' && t.founder).sort(byId)) {
       if (!this.founders.has(tx.from) || addrOf(tx.pub) !== tx.from || members[tx.from]) continue;
       if (!verifyMsg(`FOUNDER:${tx.from}`, tx.sig, tx.pub)) continue;
