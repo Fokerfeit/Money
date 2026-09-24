@@ -51,14 +51,20 @@ class NodeClient {
     // re-generate it. Left alone, this stalls the sender's nonce forever, even
     // though everyone stays in agreement (no split-brain — just stuck).
     //
-    // _myEmitted tracks every vote/accept I've ever generated, keyed by id:
-    // { tx, nonce, kind }. On every 'sync' (i.e. every connect/reconnect — the
+    // _myEmitted tracks every frame I originate, keyed by id: the votes and
+    // accepts from _react(), AND (finding (c), Aug 7) the seals from announce()
+    // and the promises from pay(). Those last two were missing, so a seal or
+    // payment sent while the socket was down/half-open was lost permanently:
+    // announce() won't re-send a tx already in the local ledger, and pay()'s
+    // reflex never re-fires either, so nothing ever re-drove them. Now every
+    // originated frame is reconciled on the next sync, exactly like a vote.
+    // Entries are { tx, nonce, kind }. On every 'sync' (i.e. every connect/reconnect — the
     // one moment I learn the relay's authoritative view), RECONCILE: anything
     // in _myEmitted that the synced archive confirms it received is pruned
     // (done, never checked again); anything NOT found is queued for retry.
     // This is deliberately NOT tied to acks — there are none — only to what a
     // resync reveals, matching the relay's own no-authority design.
-    this._myEmitted = new Map();     // id -> { tx, nonce, kind: 'vote'|'accept' }
+    this._myEmitted = new Map();     // id -> { tx, nonce, kind: 'vote'|'accept'|'seal'|'promise' }
     this._retryQueue = new Map();    // id -> { attempts, firstQueuedAt, nextAttemptAt }
     this._retryDrainTimer = null;
     this._voteRetryMaxAttempts = Number.isFinite(opts.voteRetryMaxAttempts) ? opts.voteRetryMaxAttempts : 3;
@@ -147,11 +153,23 @@ class NodeClient {
 
   _send(tx) { if (this.ws && this.ws.readyState === 1) this.ws.send(JSON.stringify({ t: 'gossip', tx })); }
 
-  announce(sealTx) { if (this.ledger.add(sealTx)) this._send(sealTx); this._react(); this._persist(); }
+  announce(sealTx) {
+    if (this.ledger.add(sealTx)) {
+      // Track BEFORE _send: if the frame is lost on the uplink (or the socket
+      // is down, making _send a silent no-op), the next sync's _reconcile()
+      // finds it missing from the archive and re-drives it. A seal has no
+      // nonce — it is identified by its own id.
+      this._myEmitted.set(sealTx.id, { tx: sealTx, nonce: null, kind: 'seal' });
+      this._send(sealTx);
+    }
+    this._react(); this._persist();
+  }
 
   pay(toAddr, amount, nonce, epoch) {
     const p = E.makePromise(this.id, toAddr, amount, nonce, epoch);
-    this.ledger.add(p); this._send(p); this._react(); this._persist(); return p;
+    this.ledger.add(p);
+    this._myEmitted.set(p.id, { tx: p, nonce, kind: 'promise' });   // track BEFORE _send — see announce()
+    this._send(p); this._react(); this._persist(); return p;
   }
 
   // The reflex: every time my view changes, do my duties.
@@ -218,7 +236,7 @@ class NodeClient {
     const now = this._now();
     for (const [id, entry] of this._myEmitted) {
       if (syncedIds.has(id)) {
-        if (this._retryQueue.has(id)) this._log(`[retry] ${entry.kind} for nonce ${entry.nonce} succeeded`);
+        if (this._retryQueue.has(id)) this._log(`[retry] ${this._retryDesc(entry)} succeeded`);
         this._myEmitted.delete(id); this._retryQueue.delete(id);
         continue;
       }
@@ -227,6 +245,11 @@ class NodeClient {
     }
     this._scheduleRetryDrain();
   }
+
+  // Describes a tracked frame for the retry logs. Votes/accepts/promises keep
+  // their exact historical wording ("<kind> for nonce <n>"); a seal has no
+  // nonce, so it is named by its id instead of printing "for nonce null".
+  _retryDesc({ kind, nonce, tx }) { return nonce == null ? `${kind} ${tx.id}` : `${kind} for nonce ${nonce}`; }
 
   _now() { return Date.now(); }
 
@@ -249,23 +272,23 @@ class NodeClient {
     for (const [id, q] of this._retryQueue) {
       const entry = this._myEmitted.get(id);
       if (!entry) { this._retryQueue.delete(id); continue; }   // reconciled already this tick — nothing to do
-      const { tx, nonce, kind, firstMissingAt } = entry;
+      const { tx, firstMissingAt } = entry;   // kind/nonce are rendered by _retryDesc(entry)
 
       if (now - firstMissingAt >= this._voteRetryAbandonMs) {
-        this._log(`[retry] ${kind} for nonce ${nonce} abandoned after ${this._voteRetryAbandonMs}ms`);
+        this._log(`[retry] ${this._retryDesc(entry)} abandoned after ${this._voteRetryAbandonMs}ms`);
         this._retryQueue.delete(id); this._myEmitted.delete(id);
         continue;
       }
       if (now < q.nextAttemptAt) continue;   // backoff window not elapsed yet
       if (q.attempts >= this._voteRetryMaxAttempts) {
-        this._log(`[retry] ${kind} for nonce ${nonce} abandoned after ${q.attempts} attempts`);
+        this._log(`[retry] ${this._retryDesc(entry)} abandoned after ${q.attempts} attempts`);
         this._retryQueue.delete(id); this._myEmitted.delete(id);
         continue;
       }
       if (!this.ws || this.ws.readyState !== 1) continue;   // not connected right now — wait for the next tick or a fresh sync
 
       q.attempts++;
-      this._log(`[retry] ${kind} for nonce ${nonce} attempt ${q.attempts}/${this._voteRetryMaxAttempts}`);
+      this._log(`[retry] ${this._retryDesc(entry)} attempt ${q.attempts}/${this._voteRetryMaxAttempts}`);
       this._send(tx);
       q.nextAttemptAt = now + this._voteRetryBackoffMs * Math.pow(2, q.attempts - 1);   // 500, 1000, 2000, ...
     }
