@@ -816,7 +816,10 @@ export function ClayIsItSafe({ size = 130 }) {
   );
 }
 
-// 4. "What if someone builds it better?" — A torch being held up (the idea passed on)
+// 4. "What if someone builds it better?" — A torch (the idea passed on).
+// Redrawn Oct 2026 (tester batch, item 4): the old art — a rounded shaft standing on
+// two thick round skin-coloured "hands" — read as phallic. Now a classic torch only:
+// flame in a wide gold cup, a SHORT cone that narrows DOWNWARD, flat gold tip, no hand.
 export function ClayBuildItBetter({ size = 130 }) {
   return (
     <Svg width={size} height={size} viewBox="0 0 130 130">
@@ -827,52 +830,45 @@ export function ClayBuildItBetter({ size = 130 }) {
           <Stop offset="60%"  stopColor="#FF8C00" />
           <Stop offset="100%" stopColor="#CC2200" stopOpacity="0.6" />
         </RadialGradient>
-        <RadialGradient id="cbbTorch" cx="35%" cy="28%" r="70%">
-          <Stop offset="0%"   stopColor="#8A6A3A" />
-          <Stop offset="55%"  stopColor="#5A3A18" />
+        <LinearGradient id="cbbCone" x1="0" y1="0" x2="1" y2="0">
+          <Stop offset="0%"   stopColor="#3A2008" />
+          <Stop offset="35%"  stopColor="#B8956A" />
+          <Stop offset="60%"  stopColor="#8A6A3A" />
           <Stop offset="100%" stopColor="#2A1408" />
-        </RadialGradient>
-        <RadialGradient id="cbbHand" cx="38%" cy="28%" r="68%">
-          <Stop offset="0%"   stopColor="#F2C890" />
-          <Stop offset="55%"  stopColor="#C88050" />
-          <Stop offset="100%" stopColor="#7A4020" />
-        </RadialGradient>
+        </LinearGradient>
+        <LinearGradient id="cbbCup" x1="0" y1="0" x2="1" y2="0">
+          <Stop offset="0%"   stopColor="#5A3A18" />
+          <Stop offset="45%"  stopColor="#D4AF37" />
+          <Stop offset="100%" stopColor="#5A3A18" />
+        </LinearGradient>
         <RadialGradient id="cbbGlow" cx="50%" cy="30%" r="50%">
           <Stop offset="0%"   stopColor="#FF8C00" stopOpacity="0.35" />
           <Stop offset="100%" stopColor="#FF8C00" stopOpacity="0" />
         </RadialGradient>
       </Defs>
-      {/* Flame glow behind */}
-      <Ellipse cx="65" cy="32" rx="38" ry="30" fill="url(#cbbGlow)" />
-      {/* Flame — outermost */}
-      <Path d="M65 8 Q80 20 78 38 Q76 52 65 56 Q54 52 52 38 Q50 20 65 8 Z" fill="#FF8C00" opacity="0.4" />
-      {/* Flame — middle */}
-      <Path d="M65 14 Q76 24 74 40 Q72 50 65 53 Q58 50 56 40 Q54 24 65 14 Z" fill="url(#cbbFlame)" />
-      {/* Flame — inner bright core */}
-      <Path d="M65 22 Q71 30 70 40 Q69 47 65 49 Q61 47 60 40 Q59 30 65 22 Z" fill="#FFF8D0" opacity="0.7" />
-      {/* Sparks */}
-      <Circle cx="52" cy="24" r="2" fill="#FF8C00" opacity="0.7" />
-      <Circle cx="48" cy="18" r="1.5" fill="#FFF0A0" opacity="0.6" />
-      <Circle cx="80" cy="20" r="2" fill="#FF8C00" opacity="0.65" />
-      <Circle cx="84" cy="14" r="1.5" fill="#FFF0A0" opacity="0.55" />
-      <Circle cx="56" cy="12" r="1.2" fill="#FFF0A0" opacity="0.5" />
-      {/* Torch handle — clay wood */}
-      <Rect x="58" y="50" width="14" height="50" rx="7" ry="7" fill="url(#cbbTorch)" />
-      <Rect x="58" y="50" width="14" height="50" rx="7" ry="7" fill="none" stroke="#8A6A3A" strokeWidth="1" opacity="0.4" />
-      {/* Torch grip band */}
-      <Rect x="58" y="82" width="14" height="6" rx="3" ry="3" fill="#3A2008" opacity="0.6" />
-      <Ellipse cx="62" cy="57" rx="4" ry="2.5" fill="#C8A060" opacity="0.25" />
-      {/* Torch head / cup */}
-      <Ellipse cx="65" cy="52" rx="12" ry="6" fill="url(#cbbTorch)" />
-      <Ellipse cx="65" cy="52" rx="12" ry="6" fill="none" stroke="#8A6A3A" strokeWidth="1" opacity="0.5" />
-      {/* Hand holding torch from below */}
-      <Path d="M45 118 Q54 100 60 95" stroke="url(#cbbHand)" strokeWidth="18" strokeLinecap="round" fill="none" />
-      <Path d="M85 118 Q76 100 70 95" stroke="url(#cbbHand)" strokeWidth="18" strokeLinecap="round" fill="none" />
-      {/* Hand highlight */}
-      <Ellipse cx="52" cy="104" rx="5" ry="3" fill="#F2C890" opacity="0.25" />
-      <Ellipse cx="78" cy="104" rx="5" ry="3" fill="#F2C890" opacity="0.25" />
-      {/* Shadow */}
-      <Ellipse cx="65" cy="124" rx="28" ry="5" fill="#000" opacity="0.2" />
+      <G transform="translate(-1,12)">
+        {/* Flame glow behind */}
+        <Ellipse cx="66" cy="28" rx="36" ry="27" fill="url(#cbbGlow)" />
+        {/* Flame — outer, middle, bright core */}
+        <Path d="M66 5 Q81 17 79 33 Q77 45 66 48 Q55 45 53 33 Q51 17 66 5 Z" fill="#FF8C00" opacity="0.4" />
+        <Path d="M66 11 Q77 21 75 35 Q73 44 66 46 Q59 44 57 35 Q55 21 66 11 Z" fill="url(#cbbFlame)" />
+        <Path d="M66 19 Q72 27 71 36 Q70 42 66 43 Q62 42 61 36 Q60 27 66 19 Z" fill="#FFF8D0" opacity="0.7" />
+        {/* Sparks */}
+        <Circle cx="52" cy="20" r="1.8" fill="#FF8C00" opacity="0.7" />
+        <Circle cx="82" cy="17" r="1.8" fill="#FF8C00" opacity="0.65" />
+        <Circle cx="57" cy="9" r="1.2" fill="#FFF0A0" opacity="0.5" />
+        {/* Cup — wide gold rim the flame sits in */}
+        <Path d="M48 46 L84 46 L80 54 L52 54 Z" fill="url(#cbbCup)" />
+        <Ellipse cx="66" cy="46" rx="18" ry="3.6" fill="#E8C873" />
+        <Ellipse cx="66" cy="46" rx="18" ry="3.6" fill="none" stroke="#5A3A18" strokeWidth="0.8" opacity="0.6" />
+        {/* Body — a short cone narrowing downward, flat-ended */}
+        <Path d="M53 54 L79 54 L70 92 L62 92 Z" fill="url(#cbbCone)" />
+        <Path d="M53 54 L79 54 L70 92 L62 92 Z" fill="none" stroke="#8A6A3A" strokeWidth="0.8" opacity="0.5" />
+        <Path d="M55.5 63 L76.5 63" stroke="#D4AF37" strokeWidth="1.6" opacity="0.75" />
+        <Rect x="61" y="91" width="10" height="3" rx="1" ry="1" fill="#D4AF37" opacity="0.8" />
+        {/* Shadow */}
+        <Ellipse cx="66" cy="101" rx="14" ry="2.6" fill="#000" opacity="0.22" />
+      </G>
     </Svg>
   );
 }

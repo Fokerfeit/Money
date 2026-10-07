@@ -1,9 +1,14 @@
 import React, { useState, useEffect, useRef } from 'react';
 import {
   View, Text, TextInput, Alert, StyleSheet, ScrollView,
-  TouchableOpacity, Pressable, Share, Image, AppState, SafeAreaView,
-  Dimensions, Modal, Animated, Platform,
+  TouchableOpacity, Pressable, Share, Image, AppState,
+  Dimensions, Modal, Animated, Platform, KeyboardAvoidingView, RefreshControl,
 } from 'react-native';
+// Real safe-area insets on Android too (tester batch, item 8). react-native's own
+// SafeAreaView only pads on iOS; with edgeToEdgeEnabled the app draws under the
+// Android navigation bar, so bottom buttons sat on top of the system buttons.
+// This drop-in SafeAreaView pads every screen by the actual system-bar insets.
+import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as SecureStore from 'expo-secure-store';
 import nacl from 'tweetnacl';
@@ -16,7 +21,19 @@ import { wordlist as bip39Words } from '@scure/bip39/wordlists/english.js';
 import * as ExpoCrypto from 'expo-crypto';
 import * as LocalAuthentication from 'expo-local-authentication';
 import { CameraView, useCameraPermissions } from 'expo-camera';
-import { Audio, Video as ExpoVideo, ResizeMode } from 'expo-av';
+import { Audio } from 'expo-av';   // sound only — the intro VIDEO now uses expo-video (tester batch, item 3)
+import { useVideoPlayer, VideoView } from 'expo-video';
+import * as Application from 'expo-application';
+import Constants from 'expo-constants';
+
+// ── Which build is running (shown small in the header + main-screen footer) ──
+// Version + build number come from the INSTALLED binary (Android versionName /
+// versionCode), never hardcoded — so a tester's screenshot always says exactly
+// which APK they have. The git commit is baked into the app config at build time
+// (extra.gitCommit, from EAS_BUILD_GIT_COMMIT_HASH); anything missing reads "dev".
+const APP_VERSION = Application.nativeApplicationVersion || 'dev';
+const APP_BUILD   = Application.nativeBuildVersion || 'dev';
+const GIT_COMMIT  = String((Constants.expoConfig && Constants.expoConfig.extra && Constants.expoConfig.extra.gitCommit) || 'dev').slice(0, 7);
 // Sovereignty model: identity is the user's on-device ed25519 keypair.
 // No third-party identity provider (no Google, no Firebase phone auth) — those
 // are centralized choke points that can be banned or pressured, which would
@@ -311,7 +328,7 @@ const ScreenWrapper = ({ children, style }) => {
       {/* Domain bar — floats above all screens on native (web is handled by HoloFX CSS) */}
       {Platform.OS !== 'web' && (
         <View style={{ position: 'absolute', top: 0, left: 0, right: 0 }} pointerEvents="none">
-          <SafeAreaView style={{ backgroundColor: 'transparent' }}>
+          <SafeAreaView edges={['top']} style={{ backgroundColor: 'transparent' }}>
             <Text style={{
               textAlign: 'center',
               color: 'rgba(212,175,55,0.55)',
@@ -331,6 +348,26 @@ const ScreenWrapper = ({ children, style }) => {
     </Animated.View>
   );
 };
+
+// ── KeyboardSafe — THE one shared wrapper for every screen with a text input ──
+// (tester batch, items 6 + 8). With Android edge-to-edge the window no longer
+// shrinks for the keyboard, so inputs low on the screen were hidden behind it.
+// KeyboardAvoidingView lifts the content by the keyboard's height; the ScrollView
+// lets the focused field be scrolled into view (taps on buttons still work while
+// the keyboard is up). Bottom insets come from the safe-area SafeAreaView that
+// wraps each screen. `scroll={false}` is for modals that lay out their own content.
+const KeyboardSafe = ({ children, scroll = true, contentContainerStyle, refreshControl }) => (
+  <KeyboardAvoidingView style={{ flex: 1 }} behavior="padding">
+    {scroll ? (
+      <ScrollView
+        contentContainerStyle={contentContainerStyle}
+        keyboardShouldPersistTaps="handled"
+        refreshControl={refreshControl}>
+        {children}
+      </ScrollView>
+    ) : children}
+  </KeyboardAvoidingView>
+);
 
 // ── Ambient floating glow orbs — purely decorative depth layer ───────────
 const GlowOrbs = () => {
@@ -628,11 +665,25 @@ function AppInner() {
   const voiceTimeoutRef      = useRef(null);  // fires after 15s to show tap fallback
 
   // ── Intro video ───────────────────────────────────────────────────────
-  const introVideoRef = useRef(null);
+  // Tester batch, item 3: on Samsung the intro stayed black. It used expo-av's
+  // deprecated Video with no error/timeout/background handling, so ANY player
+  // failure meant a silent black screen. Now: expo-video (already a dependency +
+  // config plugin), and the intro can never trap the user — it is skipped on a
+  // player error, if playback hasn't started within ~2.5 s (watchdog), and when
+  // the app goes to the background (no black surface on reopen).
+  const INTRO_WATCHDOG_MS = 2500;
+  const introPlayer = useVideoPlayer(require('./assets/intro.mp4'), (p) => {
+    p.loop = false;
+    p.muted = false;
+    p.volume = 1.0;
+  });
+  const introEndedRef = useRef(false);   // handleIntroEnd may be raised by several sources — act once
 
-  // End intro — called on playback finish or skip tap
+  // End intro — called on playback finish, skip tap, error, watchdog, or backgrounding
   const handleIntroEnd = async () => {
-    try { await introVideoRef.current?.pauseAsync(); } catch {}
+    if (introEndedRef.current) return;
+    introEndedRef.current = true;
+    try { introPlayer.pause(); } catch {}
     const firstTime = introFirstTime;
     await AsyncStorage.setItem('intro_seen_v1', '1').catch(() => {});
     setShowIntroVideo(false);
@@ -655,6 +706,22 @@ function AppInner() {
     // Set audio mode so video plays even on silent switch (iOS)
     Audio.setAudioModeAsync({ playsInSilentModeIOS: true, allowsRecordingIOS: false }).catch(() => {});
   }, []);
+
+  // Drive the intro: play, finish → end; error → skip; not playing after
+  // INTRO_WATCHDOG_MS → skip; app backgrounded → pause + skip.
+  useEffect(() => {
+    if (!showIntroVideo || IS_WEB) return;
+    let started = false;
+    const subs = [
+      introPlayer.addListener('statusChange', ({ status }) => { if (status === 'error') handleIntroEnd(); }),
+      introPlayer.addListener('playingChange', ({ isPlaying }) => { if (isPlaying) started = true; }),
+      introPlayer.addListener('playToEnd', () => { handleIntroEnd(); }),
+    ];
+    try { introPlayer.play(); } catch { handleIntroEnd(); }
+    const watchdog = setTimeout(() => { if (!started) handleIntroEnd(); }, INTRO_WATCHDOG_MS);
+    const appSub = AppState.addEventListener('change', (next) => { if (next !== 'active') handleIntroEnd(); });
+    return () => { clearTimeout(watchdog); subs.forEach((sub) => sub.remove()); appSub.remove(); };
+  }, [showIntroVideo]);
 
   // ── Generate TOTP secret when step 36 is entered ─────────────────────
   useEffect(() => {
@@ -791,7 +858,19 @@ function AppInner() {
       const bal = ledger.reduce((b, t) =>
         t.to === addr ? b + t.amount : t.from === addr ? b - t.amount : b, 0);
       setBalance(Math.max(0, parseFloat(bal.toFixed(2))));
-    } catch {}
+      return true;
+    } catch { return false; }
+  };
+
+  // Pull-to-refresh on the main screen (tester batch, item 9). The 60 s poll stays;
+  // this just lets the user ask now. A failed pull says so instead of silently
+  // leaving old numbers on screen.
+  const [refreshing, setRefreshing] = useState(false);
+  const onRefresh = async () => {
+    setRefreshing(true);
+    let ok = false;
+    try { ok = await sync(); } finally { setRefreshing(false); }
+    if (ok === false) Alert.alert('Couldn\'t refresh', `Couldn't reach ${getNetwork() === 'testnet' ? 'TESTNET' : 'MAINNET'} — pull down to try again.`);
   };
 
   // ── Network + wallet — resolve the active network FIRST, then load (or
@@ -817,13 +896,52 @@ function AppInner() {
   // existing fetch call site reads it live), load (or forge) THAT network's
   // own wallet — never carrying the old network's identity across — then
   // reload data from the new URL.
+  //
+  // Tester batch (items 5/1/9): the main-screen badge used to switch on ONE tap with
+  // no freeze — a CLAIM tapped mid-switch could post the old wallet to the new
+  // network, and the invite code typed for one network stayed pre-filled on the
+  // other. Now the switch is frozen (switchingNet, same flag as the onboarding
+  // picker), the invite code is cleared, and the old network's balance/ledger is
+  // wiped from the screen BEFORE the new network's data is loaded — so nothing
+  // from network A is ever shown under network B's label.
   const toggleNetwork = async () => {
+    if (switchingNet) return;
     const next = network === 'mainnet' ? 'testnet' : 'mainnet';
-    await setNetwork(next, AsyncStorage);
-    setNetworkState(next);
-    const kp = await loadOrCreateWallet(next);
-    applyWalletToState(kp);
-    await sync();
+    setSwitchingNet(true);
+    try {
+      await setNetwork(next, AsyncStorage);
+      setNetworkState(next);
+      resetNetworkView();
+      const kp = await loadOrCreateWallet(next);
+      applyWalletToState(kp);
+      await sync();
+    } finally {
+      setSwitchingNet(false);
+    }
+  };
+
+  // The badge never switches silently: going TO mainnet asks first (real money).
+  const requestNetworkToggle = () => {
+    if (switchingNet) return;
+    if (network === 'testnet') {
+      Alert.alert(
+        'Switch to MAINNET — real money?',
+        'MAINNET is the real network. Anything you claim or send there is real MONEY.\n\nStay on TESTNET if you are testing.',
+        [
+          { text: 'Stay on TESTNET', style: 'cancel' },
+          { text: 'Switch to MAINNET', style: 'destructive', onPress: () => { toggleNetwork(); } },
+        ],
+      );
+    } else {
+      toggleNetwork();
+    }
+  };
+
+  // Forget everything that belongs to the network we are leaving: the invite code
+  // (it was typed for that network) and the displayed ledger/balance/claim state.
+  const resetNetworkView = () => {
+    setIgnitionCode('');
+    setTxs([]); setBalance(0); setUserCount(0); setClaimed(false);
   };
 
   // Switch to an EXPLICIT network (the onboarding picker). Same primitives as
@@ -838,6 +956,7 @@ function AppInner() {
     try {
       await setNetwork(net, AsyncStorage);
       setNetworkState(net);
+      resetNetworkView();   // invite code + old network's numbers never carry over (tester batch, items 5/9)
       const kp = await loadOrCreateWallet(net);
       applyWalletToState(kp);
       await sync();
@@ -1085,10 +1204,15 @@ function AppInner() {
     }
     setReAuthError(null);
     try {
-      // Check if any credential is available at all
-      const enrolled = await LocalAuthentication.isEnrolledAsync();
-      if (!enrolled) {
-        setReAuthError('No fingerprint or PIN set up on this device. Please set one in your device settings.');
+      // Check that ANY device credential exists — a screen-lock PIN/pattern/password
+      // counts, not just biometrics. (Tester batch, item 7: isEnrolledAsync() is TRUE
+      // only when a fingerprint/face is enrolled — on Android it checks
+      // BIOMETRIC_WEAK — so a PIN-only phone was told "no PIN set up" on every
+      // relaunch and could never open its wallet, although authenticateAsync below
+      // accepts the device PIN.) getEnrolledLevelAsync() >= SECRET = some lock exists.
+      const level = await LocalAuthentication.getEnrolledLevelAsync().catch(() => null);
+      if (level === LocalAuthentication.SecurityLevel.NONE) {
+        setReAuthError('This phone has no screen lock. Set a PIN, pattern or fingerprint in your device settings, then tap UNLOCK.');
         setReAuthPhase('biometric');
         return;
       }
@@ -1119,6 +1243,9 @@ function AppInner() {
         setReAuthPhase('biometric');
       } else if (result.error === 'userCancel' || result.error === 'systemCancel') {
         // User dismissed — just show TRY AGAIN with no error
+        setReAuthPhase('biometric');
+      } else if (result.error === 'not_enrolled' || result.error === 'passcode_not_set') {
+        setReAuthError('This phone has no screen lock. Set a PIN, pattern or fingerprint in your device settings, then tap UNLOCK.');
         setReAuthPhase('biometric');
       } else {
         setReAuthError(result.error ? `Auth failed: ${result.error}` : null);
@@ -1230,7 +1357,56 @@ function AppInner() {
   };
 
   const [ignitionCode, setIgnitionCode] = useState('');
+
+  // ── Ignition / claim plumbing (tester batch, items 5 + 1) ──────────────
+  const netName = (n) => (n === 'testnet' ? 'TESTNET' : 'MAINNET');
+
+  // POST a faucet claim and classify the answer HONESTLY:
+  //   'ok'          — the server accepted it
+  //   'rejected'    — the server answered with a reason (bad/used code, throttled, …)
+  //   'unreachable' — no answer we can read: offline, timeout, or a non-JSON page
+  //                   (e.g. a Cloudflare/nginx error page) — the server never told us yes.
+  const postIgnition = async (body) => {
+    const controller = new AbortController();
+    const timeoutId  = setTimeout(() => controller.abort(), 10_000);   // never hang on a slow connection
+    try {
+      const res = await fetch(`${BACKEND_URL}/transaction`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal, body: JSON.stringify(body),
+      });
+      let data;
+      try { data = await res.json(); } catch { return { kind: 'unreachable' }; }   // non-JSON = not an answer
+      if (data && data.success) return { kind: 'ok' };
+      return { kind: 'rejected', error: (data && data.error) || `HTTP ${res.status}` };
+    } catch {
+      return { kind: 'unreachable' };
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  };
+
+  // After an 'unreachable', the request MAY still have landed (only the reply was lost).
+  // Check the ledger before telling the user anything: true = landed, false = not
+  // there, null = could not check either.
+  const ignitedOnServer = async (addr) => {
+    try {
+      const ctrl = new AbortController(); const t = setTimeout(() => ctrl.abort(), 8000);
+      const res = await fetch(`${BACKEND_URL}/ledger`, { signal: ctrl.signal });
+      clearTimeout(t);
+      const ledger = await res.json();
+      return Array.isArray(ledger) ? ledger.some((tx) => tx.from === 'FAUCET' && tx.to === addr) : null;
+    } catch { return null; }
+  };
+
+  // (claim() reuses the restore guard's confirmAsync(title, message, confirmText) below.)
+
   const triggerIgnition = async () => {
+    // The network the screen shows MUST be the network we post to.
+    const net = getNetwork();
+    if (switchingNet || net !== network) {
+      Alert.alert('One moment', 'The network is still switching — press IGNITE again in a second.');
+      return;
+    }
     const reward = calcReward(userCount);
     const ts  = Date.now();
     const sig = signTx('FAUCET', addrRef.current, reward, ts, secKeyRef.current);
@@ -1248,8 +1424,9 @@ function AppInner() {
     // because hashing a raw photo can never match two captures of the same face,
     // so it gave the illusion of face-dedup without the substance.
 
-    // Ignite locally — only called on success or genuine network failure.
-    // An explicit server rejection (duplicate seal, fraud flag, etc.) does NOT ignite.
+    // Ignite locally — ONLY when the server said yes (or the ledger proves it landed).
+    // (Tester batch: a timeout or a non-JSON error page used to "ignite" an empty
+    // wallet locally, with nothing credited anywhere — no longer.)
     const igniteLocally = async () => {
       await SecureStore.setItemAsync('formation_ignited', '1').catch(() => {});
       isIgnitedRef.current = true;
@@ -1258,40 +1435,25 @@ function AppInner() {
       setOnboardingStep(6);
     };
 
-    try {
-      // 10-second timeout so the app never hangs on a slow connection
-      const controller = new AbortController();
-      const timeoutId  = setTimeout(() => controller.abort(), 10_000);
-
-      const res  = await fetch(`${BACKEND_URL}/transaction`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        signal: controller.signal,
-        body: JSON.stringify({
-          from: 'FAUCET', to: addrRef.current, amount: reward,
-          signature: sig, publicKey: pubKeyRef.current, timestamp: ts,
-          // Invite (ignition) code — the server's one-per-human faucet gate.
-          ignitionCode: ignitionCode ? ignitionCode.trim().toUpperCase() : undefined,
-          deviceId,
-        }),
-      });
-      clearTimeout(timeoutId);
-
-      const data = await res.json();
-      if (data.success) {
-        // Server accepted — ignite
-        await igniteLocally();
-      } else {
-        // Server explicitly rejected (duplicate seal, fraud flag, etc.) — do NOT ignite locally.
-        // This is the Sybil firewall: a second device for the same person gets stopped here.
-        Alert.alert(
-          '⛔ Ignition Rejected',
-          data.error || 'The Swarm rejected this seal. Each human may only ignite once.',
-        );
-      }
-    } catch (e) {
-      // Network unreachable or timeout (AbortError) — ignite locally, reconcile on next sync.
-      // We cannot penalise the user for a bad connection.
+    const r = await postIgnition({
+      from: 'FAUCET', to: addrRef.current, amount: reward,
+      signature: sig, publicKey: pubKeyRef.current, timestamp: ts,
+      // Invite (ignition) code — the server's one-per-human faucet gate.
+      ignitionCode: ignitionCode ? ignitionCode.trim().toUpperCase() : undefined,
+      deviceId,
+    });
+    if (r.kind === 'ok') {
       await igniteLocally();
+    } else if (r.kind === 'rejected') {
+      // Server explicitly rejected (bad/used code, throttle, duplicate seal…) — do NOT
+      // ignite. The message names the network that said no.
+      Alert.alert('⛔ Ignition Rejected', `Rejected by ${netName(net)}: ${r.error}`);
+    } else if (await ignitedOnServer(addrRef.current) === true) {
+      // The reply was lost but the ledger shows the claim landed — that IS a success.
+      await igniteLocally();
+    } else {
+      Alert.alert('Couldn\'t reach the network',
+        `Couldn't reach the network — your code was not used.\n\nCheck your connection and press IGNITE again (${netName(net)}).`);
     }
   };
 
@@ -1483,31 +1645,45 @@ function AppInner() {
   };
 
   // ── Claim & Send ──────────────────────────────────────────────────────
+  // Tester batch (items 5/1): the main-screen claim shows AND checks the active
+  // network — it names the network in a confirm step, refuses while a switch is in
+  // flight or if the screen and the active network disagree, and re-checks right
+  // before posting (the network or wallet could have changed during the seal prompt).
   const claim = async () => {
     if (!address) return Alert.alert('One moment', 'Your seal is still loading…');
     if (claimed) return;
+    if (switchingNet) return Alert.alert('One moment', 'The network is still switching — try again in a second.');
+    const net = getNetwork();
+    if (net !== network) return Alert.alert('Network not ready', 'The screen and the active network disagree — nothing was sent. Try again in a second.');
+    const go = await confirmAsync(
+      `Claim on ${net === 'testnet' ? '🧪 TESTNET' : '🌐 MAINNET'}?`,
+      `Your founding share will be claimed on ${netName(net)}${net === 'mainnet' ? ' — the REAL network' : ' (test money)'}.\n\nWallet: ${address}`,
+      `Claim on ${netName(net)}`,
+    );
+    if (!go) return;
     const auth = await authenticateBioKey('Confirm seal to receive your founding share');
     if (!auth) return Alert.alert('Seal Required', 'Authentication cancelled.');
+    if (getNetwork() !== net || addrRef.current !== address) {
+      return Alert.alert('Network changed', 'The network changed while you were confirming — nothing was sent.');
+    }
     const reward = calcReward(userCount);
     const ts  = Date.now();
     const sig = signTx('FAUCET', address, reward, ts, secKeyRef.current);
-    try {
-      const res  = await fetch(`${BACKEND_URL}/transaction`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          from: 'FAUCET', to: address, amount: reward,
-          signature: sig, publicKey: pubKeyRef.current, timestamp: ts,
-          // Invite (ignition) code — the server's one-per-human faucet gate.
-          ignitionCode: ignitionCode ? ignitionCode.trim().toUpperCase() : undefined,
-        }),
-      });
-      const data = await res.json();
-      if (data.success) {
-        setClaimed(true);
-        Alert.alert('🎉 WELCOME, FOUNDING MEMBER!', `${fmt(reward)} MONEY\nYour entry is inscribed on the tablets.\nWelcome to the Swarm.`);
-      }
-      else Alert.alert('Claim failed', data.error || 'Unknown error');
-    } catch (e) { Alert.alert('The tablets are unreachable', e.message); }
+    const r = await postIgnition({
+      from: 'FAUCET', to: address, amount: reward,
+      signature: sig, publicKey: pubKeyRef.current, timestamp: ts,
+      // Invite (ignition) code — the server's one-per-human faucet gate.
+      ignitionCode: ignitionCode ? ignitionCode.trim().toUpperCase() : undefined,
+    });
+    if (r.kind === 'ok' || (r.kind === 'unreachable' && await ignitedOnServer(address) === true)) {
+      setClaimed(true);
+      Alert.alert('🎉 WELCOME, FOUNDING MEMBER!', `${fmt(reward)} MONEY on ${netName(net)}\nYour entry is inscribed on the tablets.\nWelcome to the Swarm.`);
+      sync();
+    } else if (r.kind === 'rejected') {
+      Alert.alert('Claim failed', `Rejected by ${netName(net)}: ${r.error}`);
+    } else {
+      Alert.alert('Couldn\'t reach the network', `Couldn't reach the network — your code was not used.\n\nCheck your connection and try again (${netName(net)}).`);
+    }
   };
 
   const send = async () => {
@@ -1614,18 +1790,11 @@ function AppInner() {
   if (showIntroVideo && !IS_WEB) {
     return (
       <View style={{ flex: 1, backgroundColor: '#000' }}>
-        <ExpoVideo
-          ref={introVideoRef}
-          source={require('./assets/intro.mp4')}
+        <VideoView
+          player={introPlayer}
           style={StyleSheet.absoluteFill}
-          resizeMode={ResizeMode.CONTAIN}
-          shouldPlay={true}
-          isLooping={false}
-          volume={1.0}
-          isMuted={false}
-          onPlaybackStatusUpdate={(status) => {
-            if (status.didJustFinish) handleIntroEnd();
-          }}
+          contentFit="contain"
+          nativeControls={false}
         />
         {/* Skip button — appears after 3s on subsequent launches only */}
         {showSkipBtn && (
@@ -1810,7 +1979,7 @@ function AppInner() {
     // ── Phase: TOTP (2FA — second factor) ───────────────────────────
     return (
       <SafeAreaView style={s.root}>
-        <ScrollView contentContainerStyle={[s.onboardScroll, { flexGrow: 1, justifyContent: 'center' }]} keyboardShouldPersistTaps="handled">
+        <KeyboardSafe contentContainerStyle={[s.onboardScroll, { flexGrow: 1, justifyContent: 'center' }]}>
           <View style={s.onboardCenter}>
             <View style={{ alignItems: 'center', marginBottom: 24 }}>
               <PulseRing size={80} color="#D4AF37" delay={0} />
@@ -1845,7 +2014,7 @@ function AppInner() {
               </Text>
             </TouchableOpacity>
           </View>
-        </ScrollView>
+        </KeyboardSafe>
       </SafeAreaView>
     );
   }
@@ -2012,7 +2181,7 @@ function AppInner() {
     return (
       <ScreenWrapper>
       <SafeAreaView style={s.root}>
-        <ScrollView contentContainerStyle={s.onboardScroll} keyboardShouldPersistTaps="handled">
+        <KeyboardSafe contentContainerStyle={s.onboardScroll}>
           <View style={s.onboardCenter}>
 
             <View style={{ marginBottom: 16, alignItems:'center', justifyContent:'center' }}>
@@ -2079,7 +2248,7 @@ function AppInner() {
             </TouchableOpacity>
 
           </View>
-        </ScrollView>
+        </KeyboardSafe>
       </SafeAreaView>
       </ScreenWrapper>
     );
@@ -2090,6 +2259,9 @@ function AppInner() {
     return (
       <ScreenWrapper>
       <SafeAreaView style={s.root}>
+        {/* KeyboardSafe (items 6 + 8): this screen was a fixed, NON-scrollable View — on a
+            small phone the IGNITE button sat under the nav bar and the keyboard hid the code. */}
+        <KeyboardSafe contentContainerStyle={{ flexGrow: 1 }}>
         <View style={s.fullCenter}>
           <View style={{ marginBottom: 16, alignItems:'center', justifyContent:'center' }}>
             <PulseRing size={80} color="#7DB87A" delay={0} />
@@ -2172,6 +2344,7 @@ function AppInner() {
             </View>
           </AnimatedPress>
         </View>
+        </KeyboardSafe>
       </SafeAreaView>
       </ScreenWrapper>
     );
@@ -2446,7 +2619,7 @@ function AppInner() {
     return (
       <ScreenWrapper>
       <SafeAreaView style={s.root}>
-        <ScrollView contentContainerStyle={s.onboardScroll} keyboardShouldPersistTaps="handled">
+        <KeyboardSafe contentContainerStyle={s.onboardScroll}>
           <View style={s.onboardCenter}>
             <Text style={s.onboardTitle}>Restore Your Wallet</Text>
             <Text style={s.onboardSub}>Enter your 24-word recovery phrase (or your raw recovery key).</Text>
@@ -2487,7 +2660,7 @@ function AppInner() {
               <Text style={{ color: '#888', textAlign: 'center' }}>← Cancel</Text>
             </TouchableOpacity>
           </View>
-        </ScrollView>
+        </KeyboardSafe>
       </SafeAreaView>
       </ScreenWrapper>
     );
@@ -2582,7 +2755,10 @@ function AppInner() {
         </SafeAreaView>
       </Modal>
 
-      <ScrollView contentContainerStyle={s.scroll}>
+      {/* KeyboardSafe (items 6 + 8) + pull-to-refresh (item 9) */}
+      <KeyboardSafe
+        contentContainerStyle={s.scroll}
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor="#D4AF37" colors={['#D4AF37']} progressBackgroundColor="#1A0E04" />}>
         {/* TESTNET BANNER — unmistakable, only rendered on testnet, nothing shown on mainnet */}
         {network === 'testnet' && (
           <View style={s.testnetBanner}>
@@ -2614,15 +2790,19 @@ function AppInner() {
             <View style={s.sealBadge}><Text style={s.sealBadgeText}>🔐 SEAL ACTIVE</Text></View>
           )}
           {/* Network toggle — tap to switch mainnet ⇄ testnet, no rebuild required */}
+          <View style={s.badgeRow}>
           <TouchableOpacity
-            style={[s.networkBadge, network === 'testnet' && s.networkBadgeTestnet]}
-            onPress={toggleNetwork}
+            style={[s.networkBadge, network === 'testnet' && s.networkBadgeTestnet, switchingNet && { opacity: 0.5 }]}
+            onPress={requestNetworkToggle}
+            disabled={switchingNet}
             activeOpacity={0.7}
           >
             <Text style={s.networkBadgeText}>
-              {network === 'testnet' ? '🧪 TESTNET · tap for Mainnet' : '🌐 MAINNET · tap for Testnet'}
+              {switchingNet ? 'Switching network…' : network === 'testnet' ? '🧪 TESTNET · tap for Mainnet' : '🌐 MAINNET · tap for Testnet'}
             </Text>
           </TouchableOpacity>
+          <Text style={s.versionInline}>v{APP_VERSION} ({APP_BUILD})</Text>
+          </View>
           {userCount === 0 ? (
             <View style={{ flexDirection:'row', flexWrap:'wrap', alignItems:'center', justifyContent:'center', paddingHorizontal: 8 }}>
               <Text style={s.stat}>Be the first — claim your founding share of </Text>
@@ -2775,7 +2955,7 @@ function AppInner() {
 
         {/* CONTACTS — list / pick / rename / delete + manual add */}
         <Modal visible={contactsVisible} animationType="slide" transparent onRequestClose={() => setContactsVisible(false)}>
-          <View style={s.contactsBackdrop}>
+          <KeyboardSafe scroll={false}><SafeAreaView edges={['bottom']} style={s.contactsBackdrop}>
             <View style={s.contactsSheet}>
               <Text style={s.label}>📇 CONTACTS</Text>
               <ScrollView style={{ maxHeight: 300 }}>
@@ -2799,12 +2979,12 @@ function AppInner() {
               </View>
               <TouchableOpacity style={[s.btnSage, { marginTop: 10 }]} onPress={() => setContactsVisible(false)}><Text style={s.btnText}>CLOSE</Text></TouchableOpacity>
             </View>
-          </View>
+          </SafeAreaView></KeyboardSafe>
         </Modal>
 
         {/* SAVE / RENAME a contact */}
         <Modal visible={saveContactAddr !== null} animationType="fade" transparent onRequestClose={() => { setSaveContactAddr(null); setEditContactAddr(null); }}>
-          <View style={s.contactsBackdrop}>
+          <KeyboardSafe scroll={false}><SafeAreaView edges={['bottom']} style={s.contactsBackdrop}>
             <View style={s.contactsSheet}>
               <Text style={s.label}>{editContactAddr ? '✏️ RENAME CONTACT' : '＋ SAVE CONTACT'}</Text>
               <Text style={[s.suggestAddr, { marginBottom: 10 }]} numberOfLines={1}>{saveContactAddr}</Text>
@@ -2814,7 +2994,7 @@ function AppInner() {
                 <TouchableOpacity style={[s.btnLapis, { flex: 1 }]} onPress={submitSaveContact}><Text style={s.btnText}>SAVE</Text></TouchableOpacity>
               </View>
             </View>
-          </View>
+          </SafeAreaView></KeyboardSafe>
         </Modal>
 
         {/* About MONEY link */}
@@ -2872,7 +3052,9 @@ function AppInner() {
               </View>
             ))}
         </View>
-      </ScrollView>
+        {/* Build footer — which binary + commit is running (tester screenshots) */}
+        <Text style={s.versionFooter}>MONEY v{APP_VERSION} · build {APP_BUILD} · {GIT_COMMIT}</Text>
+      </KeyboardSafe>
     </SafeAreaView>
     </ScreenWrapper>
   );
@@ -2883,11 +3065,13 @@ function AppInner() {
 export default function App() {
   const tilt = useTilt();
   return (
-    <View style={{ flex: 1, backgroundColor: IS_WEB ? 'transparent' : '#0E0700' }}>
-      {Platform.OS !== 'web' && <HoloBackground tilt={tilt} />}
-      {Platform.OS !== 'web' && <DepthFrame />}
-      <AppInner />
-    </View>
+    <SafeAreaProvider>
+      <View style={{ flex: 1, backgroundColor: IS_WEB ? 'transparent' : '#0E0700' }}>
+        {Platform.OS !== 'web' && <HoloBackground tilt={tilt} />}
+        {Platform.OS !== 'web' && <DepthFrame />}
+        <AppInner />
+      </View>
+    </SafeAreaProvider>
   );
 }
 
@@ -2926,6 +3110,10 @@ const s = StyleSheet.create({
   },
   networkBadgeTestnet: { borderColor: 'rgba(230,160,40,0.7)', backgroundColor: 'rgba(60,38,4,0.85)' },
   networkBadgeText:    { color: '#7DB87A', fontSize: 11, fontWeight: 'bold', letterSpacing: 1 },
+  // Build/version display — small, grey, unobtrusive
+  badgeRow:       { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8 },
+  versionInline:  { color: '#6B5A44', fontSize: 10, letterSpacing: 0.5, marginBottom: 10 },
+  versionFooter:  { color: '#5A4A36', fontSize: 10, letterSpacing: 0.5, textAlign: 'center', marginTop: 18, marginBottom: 8 },
   // Unmistakable — high-contrast, full-width, always the first thing visible on testnet.
   testnetBanner: {
     backgroundColor: '#E6A028', paddingVertical: 8, paddingHorizontal: 12,
