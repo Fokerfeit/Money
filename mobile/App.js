@@ -8,7 +8,7 @@ import {
 // SafeAreaView only pads on iOS; with edgeToEdgeEnabled the app draws under the
 // Android navigation bar, so bottom buttons sat on top of the system buttons.
 // This drop-in SafeAreaView pads every screen by the actual system-bar insets.
-import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
+import { SafeAreaProvider, SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as SecureStore from 'expo-secure-store';
 import nacl from 'tweetnacl';
@@ -34,6 +34,44 @@ import Constants from 'expo-constants';
 const APP_VERSION = Application.nativeApplicationVersion || 'dev';
 const APP_BUILD   = Application.nativeBuildVersion || 'dev';
 const GIT_COMMIT  = String((Constants.expoConfig && Constants.expoConfig.extra && Constants.expoConfig.extra.gitCommit) || 'dev').slice(0, 7);
+
+// "Use phone PIN / pattern instead" — native, credential-only (modules/device-credential).
+import { confirmDeviceCredential, isDeviceCredentialAvailable } from './modules/device-credential';
+// Optional app passcode — a GATE only (passcode.js: scrypt + salt + lockout, recovery = 24 words).
+import { createPasscodeStore } from './passcode';
+
+// ── Ledger time (Oct 2026 device test, item 5) ──────────────────────────────
+// tx.time is a time-only string written by the SERVER in ITS time zone (UTC), so a
+// 6:40 PM Toronto send read "10:40:29 PM". Show tx.timestamp instead, in the PHONE's
+// time zone and language, with the date: "7 Oct 2026 · 6:40 p.m." / "Oct 7, 2026 ·
+// 6:40 PM" / "7 oct. 2026 · 18 h 40". `locale`/`timeZone` default to the phone's own —
+// they exist only so a test can pin them. Falls back to tx.time if there is no usable
+// timestamp (old entries) or the engine can't format dates.
+const formatTxTime = (tx, locale, timeZone) => {
+  const ts = tx ? Number(tx.timestamp) : NaN;
+  if (!Number.isFinite(ts) || ts <= 0) return (tx && tx.time) || '';
+  try {
+    const d = new Date(ts);
+    const zone = timeZone ? { timeZone } : {};
+    const date = d.toLocaleDateString(locale, { ...zone, day: 'numeric', month: 'short', year: 'numeric' });
+    const time = d.toLocaleTimeString(locale, { ...zone, hour: 'numeric', minute: '2-digit' });
+    return `${date} · ${time}`;
+  } catch {
+    return (tx && tx.time) || '';
+  }
+};
+
+// ── Restore "return-to" (item 3): the Restore screen's Back returns to whichever
+// screen opened it; with no opener it falls back to the wallet (ignited) or the Oath.
+const restoreBackTarget = (openedFrom, isIgnited) =>
+  (openedFrom === null || openedFrom === undefined) ? (isIgnited ? 0 : 12) : openedFrom;
+
+// The app passcode store, on the phone's hardware-backed SecureStore.
+const passcodeStore = createPasscodeStore({
+  storage: SecureStore,
+  randomBytes: (n) => ExpoCrypto.getRandomBytes(n),
+});
+const fmtWait = (ms) => (ms >= 60_000 ? `${Math.ceil(ms / 60_000)} min` : `${Math.ceil(ms / 1000)} s`);
 // Sovereignty model: identity is the user's on-device ed25519 keypair.
 // No third-party identity provider (no Google, no Firebase phone auth) — those
 // are centralized choke points that can be banned or pressured, which would
@@ -369,6 +407,35 @@ const KeyboardSafe = ({ children, scroll = true, contentContainerStyle, refreshC
   </KeyboardAvoidingView>
 );
 
+// ── BuildTag — which build is running, on EVERY screen (Oct device test, item 4) ──
+// Drawn once at the app root (every screen) and inside each Modal (modals open in
+// their own window). Tiny, grey, top-right on the domain-bar row, below the status
+// bar; it ignores touches so it can never block a button.
+const BuildTag = () => {
+  const insets = useSafeAreaInsets();
+  return (
+    <View pointerEvents="none" style={{ position: 'absolute', top: insets.top + 6, right: 10, zIndex: 999 }}>
+      <Text style={{ color: 'rgba(160,135,100,0.6)', fontSize: 9, letterSpacing: 0.5 }}>v{APP_VERSION} ({APP_BUILD})</Text>
+    </View>
+  );
+};
+
+// ── NavRow — the way out of an onboarding screen (Oct device test, item 3) ───
+const NavRow = ({ onBack, onRestore }) => (
+  <View style={{ alignItems: 'center', marginTop: 18, gap: 10 }}>
+    {onRestore ? (
+      <TouchableOpacity onPress={onRestore} style={{ paddingVertical: 6 }}>
+        <Text style={{ color: '#9A7B4A', fontSize: 13, letterSpacing: 0.5, textAlign: 'center' }}>♻️ Restore an existing wallet (24 words)</Text>
+      </TouchableOpacity>
+    ) : null}
+    {onBack ? (
+      <TouchableOpacity onPress={onBack} style={{ paddingVertical: 6 }}>
+        <Text style={{ color: '#7A5C3A', fontSize: 13, letterSpacing: 1 }}>← Back</Text>
+      </TouchableOpacity>
+    ) : null}
+  </View>
+);
+
 // ── Ambient floating glow orbs — purely decorative depth layer ───────────
 const GlowOrbs = () => {
   const o1 = useRef(new Animated.Value(0)).current;
@@ -658,6 +725,19 @@ function AppInner() {
   // Stable refs for the hidden PIN TextInputs — must live at component scope, not
   // be recreated inside render blocks (a fresh {current:null} each render breaks focus).
   const pinEntryRef          = useRef(null);   // step 99 re-auth PIN entry
+  // Oct device test — items 2 + 3
+  const [unlockMode, setUnlockMode] = useState('device');   // 'device' | 'passcode' | 'either' (passcode.js)
+  const unlockModeRef        = useRef('device');            // read by the step-99 effect before state settles
+  const [passcodeInput, setPasscodeInput] = useState('');
+  const [passcodeMsg,   setPasscodeMsg]   = useState('');
+  const [hasAppPasscode, setHasAppPasscode] = useState(false);
+  const [unlockSettingsVisible, setUnlockSettingsVisible] = useState(false);
+  const [settingsAuthed, setSettingsAuthed] = useState(false);   // current method confirmed in this session of the sheet
+  const [newPass1, setNewPass1] = useState('');
+  const [newPass2, setNewPass2] = useState('');
+  const [settingsMsg, setSettingsMsg] = useState('');
+  const sealFromRef          = useRef(null);   // which seal screen (3 / 35) led to step 4 — its Back goes there
+  const restoreReturnTo      = useRef(null);   // which screen opened Restore (51) — its Back goes there
   const pinSetupRef1         = useRef(null);   // step 36 create PIN
   const pinSetupRef2         = useRef(null);   // step 36 confirm PIN
   const livenessActive       = useRef(false);
@@ -774,6 +854,12 @@ function AppInner() {
         }
 
         // About screen shown after intro video on first launch (handled in handleIntroEnd)
+
+        // Unlock method (phone lock / app passcode / either) must be known BEFORE the
+        // lock screen auto-fires anything (Oct device test, item 2).
+        const mode = await passcodeStore.getMode().catch(() => 'device');
+        unlockModeRef.current = mode; setUnlockMode(mode);
+        setHasAppPasscode(await passcodeStore.hasPasscode().catch(() => false));
 
         if (biokey === '1') {
           isIgnitedRef.current = ignited === '1';
@@ -1188,11 +1274,101 @@ function AppInner() {
 
   useEffect(() => {
     if (onboardingStep === 99) {
-      // Auto-fire immediately on entry — TRY AGAIN button handles retries
-      runBiometricReAuth();
+      // Auto-fire the phone-lock prompt on entry — TRY AGAIN handles retries. Not in
+      // 'passcode' mode: there the app passcode is the only way in.
+      setPasscodeInput(''); setPasscodeMsg('');
+      if (unlockModeRef.current !== 'passcode') runBiometricReAuth();
     }
     return () => clearReAuthTimer();
   }, [onboardingStep]); // intentionally only onboardingStep — retry uses TRY AGAIN button
+
+  // ── Shared unlock helpers (Oct device test, items 1 + 2) ────────────────
+  // "Use phone PIN / pattern instead": Android's own credential screen (native
+  // modules/device-credential) — works even where the fingerprint prompt shows no PIN button.
+  const usePhoneCredential = async (title) => {
+    const r = await confirmDeviceCredential(title, 'Use your phone PIN, pattern or password');
+    if (r.success) return true;
+    if (r.error === 'not_enrolled') Alert.alert('No screen lock', 'This phone has no PIN, pattern or password. Set one in your device settings first.');
+    else if (r.error === 'not_available') Alert.alert('Not available', 'This version of the app cannot open your phone PIN screen. Use your fingerprint, or update the app.');
+    return false;
+  };
+
+  // After the PHONE lock (or the app passcode) said yes on the lock screen: the
+  // legacy authenticator step if one is linked, otherwise straight in.
+  const afterPhoneUnlock = async () => {
+    const totpExists = await hasTotpSetup();
+    if (totpExists) {
+      setTotpEntryCode('');
+      setTotpEntryError('');
+      setReAuthPhase('pin'); // 'pin' phase renders TOTP entry
+    } else {
+      setReAuthPhase('done');
+      setOnboardingStep(destinationAfterAuth.current);
+    }
+  };
+
+  const reAuthWithPhoneCredential = async () => {
+    if (await usePhoneCredential('Unlock MONEY')) await afterPhoneUnlock();
+  };
+
+  // App passcode check (step 99 + seal-confirm modal). Feedback never says which digit was wrong.
+  const tryPasscode = async (onOk) => {
+    const code = passcodeInput;
+    setPasscodeInput('');
+    const r = await passcodeStore.verify(code);
+    if (r.ok) { setPasscodeMsg(''); await onOk(); return; }
+    if (r.reason === 'locked') setPasscodeMsg(`Too many wrong tries — try again in ${fmtWait(r.waitMs)}.`);
+    else if (r.reason === 'none') setPasscodeMsg('No app passcode is set on this phone — use your phone lock.');
+    else setPasscodeMsg(r.waitMs ? `Wrong passcode. Wait ${fmtWait(r.waitMs)} before the next try.`
+      : `Wrong passcode. ${r.triesLeft} ${r.triesLeft === 1 ? 'try' : 'tries'} left before a wait.`);
+  };
+
+  // ── Unlock-method settings (item 2) ─────────────────────────────────────
+  // Changing anything first requires the CURRENT method (phone lock and/or passcode).
+  const openUnlockSettings = () => {
+    setSettingsAuthed(false); setSettingsMsg(''); setPasscodeInput(''); setPasscodeMsg('');
+    setNewPass1(''); setNewPass2('');
+    setUnlockSettingsVisible(true);
+  };
+  const closeUnlockSettings = () => {
+    setUnlockSettingsVisible(false); setSettingsAuthed(false);
+    setNewPass1(''); setNewPass2(''); setPasscodeInput('');
+  };
+  const settingsAuthWithPhone = async () => {
+    try {
+      const r = await LocalAuthentication.authenticateAsync({
+        promptMessage: 'Confirm it\'s you to change how MONEY unlocks',
+        cancelLabel: 'Cancel', disableDeviceFallback: false,
+      });
+      if (r.success || await usePhoneCredential('Confirm it\'s you to change how MONEY unlocks')) setSettingsAuthed(true);
+    } catch {}
+  };
+  const chooseUnlockMode = async (mode) => {
+    if (!settingsAuthed) return;
+    try {
+      await passcodeStore.setMode(mode);   // enforces: passcode exists; "passcode only" needs the 24-word backup
+      unlockModeRef.current = mode; setUnlockMode(mode);
+      setSettingsMsg(mode === 'device' ? 'Unlocking with your phone lock only.' : mode === 'passcode' ? 'Unlocking with your app passcode only.' : 'Unlocking with your phone lock OR your app passcode.');
+    } catch (e) { setSettingsMsg(e.message); }
+  };
+  const saveAppPasscode = async () => {
+    if (!settingsAuthed) return;
+    if (!passcodeStore.isValidPasscode(newPass1)) { setSettingsMsg(`Use ${passcodeStore.MIN_LEN}–${passcodeStore.MAX_LEN} digits.`); return; }
+    if (newPass1 !== newPass2) { setSettingsMsg('The two passcodes don\'t match.'); setNewPass2(''); return; }
+    setSettingsMsg('Saving…');
+    try {
+      await passcodeStore.setPasscode(newPass1);
+      setHasAppPasscode(true); setNewPass1(''); setNewPass2('');
+      setSettingsMsg('App passcode saved. Choose below when it is used.');
+    } catch (e) { setSettingsMsg(e.message); }
+  };
+
+  // Open Restore (51) remembering where we came from (item 3).
+  const openRestore = (from) => {
+    restoreReturnTo.current = from;
+    setSeedInput(''); setRestorePreview(null);
+    setOnboardingStep(51);
+  };
 
   const runBiometricReAuth = async () => {
     // On web biometrics don't exist — pass through automatically
@@ -1225,21 +1401,10 @@ function AppInner() {
       });
 
       if (result.success) {
-        // Biometric passed — check if TOTP 2FA is set up
-        const totpExists = await hasTotpSetup();
-        if (totpExists) {
-          setTotpEntryCode('');
-          setTotpEntryError('');
-          setReAuthPhase('pin'); // 'pin' phase now renders TOTP entry
-        } else {
-          // No PIN set up yet (old install or PIN cleared) — proceed directly
-          setReAuthPhase('done');
-          const dest = destinationAfterAuth.current;
-          setOnboardingStep(dest);
-        }
+        await afterPhoneUnlock();
       } else if (result.error === 'lockout' || result.error === 'lockoutPermanent') {
-        // Too many failed biometric attempts — device requires credential to reset
-        setReAuthError('Too many failed attempts. Lock your screen and unlock it with your PIN first, then tap TRY AGAIN.');
+        // Too many failed biometric attempts — the phone PIN still works
+        setReAuthError('Too many failed fingerprint tries. Tap "Use phone PIN / pattern instead" below.');
         setReAuthPhase('biometric');
       } else if (result.error === 'userCancel' || result.error === 'systemCancel') {
         // User dismissed — just show TRY AGAIN with no error
@@ -1294,13 +1459,14 @@ function AppInner() {
   const startTotpReset = async () => {
     if (!IS_WEB) {
       try {
-        const enrolled = await LocalAuthentication.isEnrolledAsync();
-        if (!enrolled) { setTotpEntryError('Set up a fingerprint or device PIN first, then reset.'); return; }
+        // Any screen lock counts (Oct device test, item 1b — isEnrolledAsync is biometrics-only).
+        const level = await LocalAuthentication.getEnrolledLevelAsync().catch(() => null);
+        if (level === LocalAuthentication.SecurityLevel.NONE) { setTotpEntryError('Set a PIN, pattern or fingerprint on this phone first, then reset.'); return; }
         const r = await LocalAuthentication.authenticateAsync({
           promptMessage: 'Confirm it\'s you to re-link your authenticator',
-          cancelLabel: 'Cancel', disableDeviceFallback: false, fallbackLabel: 'Use PIN',
+          cancelLabel: 'Cancel', disableDeviceFallback: false,
         });
-        if (!r.success) return;
+        if (!r.success && !(await usePhoneCredential('Confirm it\'s you to re-link your authenticator'))) return;
       } catch { return; }
     }
     await SecureStore.deleteItemAsync('totp_secret_v1').catch(() => {});
@@ -1519,35 +1685,50 @@ function AppInner() {
   // plus the body seal (fingerprint/PIN) remain as the liveness signal.
 
   // ── Fingerprint onboarding ────────────────────────────────────────────
+  // Body seal confirmed → invite-code + ignite screen. Remembers which seal screen
+  // we came from so step 4's Back returns there (Oct device test, item 3).
+  const sealConfirmed = (fromStep) => {
+    setPinSetup1(''); setPinSetup2(''); setPinSetupStep(1); setPinSetupError('');
+    sealFromRef.current = fromStep;
+    setOnboardingStep(4);
+  };
+  // Honest failure text (item 1c): never promise a "Use PIN" button the phone may not draw.
+  const sealFailed = (r) => Alert.alert('Seal not confirmed',
+    `Couldn't verify (${r.error || 'unknown'}). Try again, or tap "Use phone PIN / pattern instead" below.`);
+
   const testLeftThumb = async () => {
     if (IS_WEB) { setOnboardingStep(4); return; }
     const r = await LocalAuthentication.authenticateAsync({
-      promptMessage: 'First seal — use your fingerprint or device PIN',
+      promptMessage: 'Seal with your phone lock',
+      promptDescription: 'Fingerprint, face, PIN, pattern or password',
       cancelLabel: 'Cancel', disableDeviceFallback: false, fallbackLabel: 'Use PIN',
     });
-    // Body seal confirmed → invite-code + ignite screen (2FA step removed).
-    if (r.success) { setPinSetup1(''); setPinSetup2(''); setPinSetupStep(1); setPinSetupError(''); setOnboardingStep(4); }
-    else Alert.alert('Seal not confirmed', `Couldn't verify (reason: ${r.error || 'unknown'}). Tap "Use PIN" on the prompt to seal with your device PIN instead.`);
+    if (r.success) sealConfirmed(3); else sealFailed(r);
   };
 
   const testRightThumb = async () => {
     if (IS_WEB) { setOnboardingStep(4); return; }
     const r = await LocalAuthentication.authenticateAsync({
       promptMessage: 'Second seal — confirm again to lock it in',
+      promptDescription: 'Fingerprint, face, PIN, pattern or password',
       cancelLabel: 'Cancel', disableDeviceFallback: false, fallbackLabel: 'Use PIN',
     });
-    if (r.success) { setPinSetup1(''); setPinSetup2(''); setPinSetupStep(1); setPinSetupError(''); setOnboardingStep(4); }
-    else Alert.alert('Second seal not confirmed', `Couldn't verify (reason: ${r.error || 'unknown'}). Tap "Use PIN" on the prompt and enter your device PIN, or use any enrolled fingerprint.`);
+    if (r.success) sealConfirmed(3); else sealFailed(r);
   };
 
   const testPin = async () => {
     if (IS_WEB) { setOnboardingStep(4); return; }
     const r = await LocalAuthentication.authenticateAsync({
-      promptMessage: 'Enter your device PIN to seal your identity',
+      promptMessage: 'Seal with your phone lock',
+      promptDescription: 'Fingerprint, face, PIN, pattern or password',
       cancelLabel: 'Cancel', disableDeviceFallback: false, fallbackLabel: 'Use PIN',
     });
-    if (r.success) { setPinSetup1(''); setPinSetup2(''); setPinSetupStep(1); setPinSetupError(''); setOnboardingStep(4); }
-    else Alert.alert('Try again', 'PIN confirmation failed.');
+    if (r.success) sealConfirmed(35); else sealFailed(r);
+  };
+
+  // "Use phone PIN / pattern instead" on a seal screen
+  const sealWithPhoneCredential = async (fromStep) => {
+    if (await usePhoneCredential('Seal with your phone PIN or pattern')) sealConfirmed(fromStep);
   };
 
   // ── Complete Seal Setup → faucet ignition ─────────────────────────────
@@ -1579,14 +1760,20 @@ function AppInner() {
         promptMessage: txModalLabel || 'Confirm your seal',
         cancelLabel: 'Cancel', disableDeviceFallback: false, fallbackLabel: 'Use PIN',
       });
-      if (r.success) {
-        setTxModalVisible(false);
-        if (txModalResolve.current) { txModalResolve.current(true); txModalResolve.current = null; }
-      }
-      // On failure: stay on biometric — TRY AGAIN button is visible
+      if (r.success) txConfirmed();
+      // On failure: stay on biometric — TRY AGAIN + "Use phone PIN / pattern instead" are visible
     } catch {
       // Keep buttons visible
     }
+  };
+
+  // The claim/send seal step said yes — by phone lock, phone PIN or app passcode.
+  const txConfirmed = () => {
+    setTxModalVisible(false);
+    if (txModalResolve.current) { txModalResolve.current(true); txModalResolve.current = null; }
+  };
+  const txWithPhoneCredential = async () => {
+    if (await usePhoneCredential(txModalLabel || 'Confirm your seal')) txConfirmed();
   };
 
   useEffect(() => {
@@ -1603,9 +1790,11 @@ function AppInner() {
       // Camera/face step removed — the face frame was never verified, it just
       // added a tap. Go straight to the real factor: device biometric / PIN.
       setTxModalPhase('biometric');
+      setPasscodeInput(''); setPasscodeMsg('');
       setTxModalVisible(true);
-      // Auto-fire the native auth dialog so confirming a trade is one action.
-      setTimeout(() => runTxBiometric(), 350);
+      // Auto-fire the native auth dialog so confirming a trade is one action —
+      // except in 'passcode' mode, where the app passcode is the way to confirm.
+      if (unlockModeRef.current !== 'passcode') setTimeout(() => runTxBiometric(), 350);
     });
   };
 
@@ -1772,10 +1961,11 @@ function AppInner() {
   // ── SCREENS ───────────────────────────────────────────────────────────
   // ─────────────────────────────────────────────────────────────────────
 
-  // Adaptive auth labels — matches whatever actually unlocks this device
-  const authLabel = authMethod === 'fingerprint' ? 'FINGERPRINT'
-    : authMethod === 'face'        ? 'FACE ID'
-    : 'DEVICE PIN';
+  // Auth label (Oct device test, item 1c): WHATEVER unlocks the phone unlocks the app —
+  // fingerprint, face, PIN, pattern or password — so the wording names the phone lock,
+  // not one sensor. (The icon still hints at the main sensor.)
+  const authLabel = 'PHONE LOCK';
+  const authHint  = 'Fingerprint, face, PIN, pattern or password — whatever unlocks your phone.';
   const AuthIcon = ({ size, color }) =>
     authMethod === 'fingerprint' ? <ThumbprintIcon size={size} color={color} />
     : authMethod === 'face'      ? <EyeIcon        size={size} color={color} />
@@ -1948,30 +2138,71 @@ function AppInner() {
   if (onboardingStep === 99) {
     // ── Phase: biometric ─────────────────────────────────────────────
     if (reAuthPhase !== 'pin') {
+      // Unlock method (item 2): 'device' = phone lock only (default), 'passcode' = app
+      // passcode only, 'either' = both offered. No "Back" here on purpose: there is
+      // nothing behind a lock screen — the ways out are the unlock methods and Restore.
+      const showPhone = unlockMode !== 'passcode';
+      const showPass  = unlockMode !== 'device';
       return (
         <SafeAreaView style={s.root}>
+          <KeyboardSafe contentContainerStyle={{ flexGrow: 1 }}>
           <View style={s.fullCenter}>
             <View style={{ alignItems: 'center', marginBottom: 32 }}>
               <PulseRing size={110} color="#D4AF37" delay={0} />
               <PulseRing size={110} color="#D4AF37" delay={900} />
               <View style={{ width: 110, height: 110, borderRadius: 55, backgroundColor: 'rgba(30,14,4,0.9)', borderWidth: 1.5, borderColor: 'rgba(212,175,55,0.5)', alignItems: 'center', justifyContent: 'center' }}>
-                <AuthIcon size={52} color="#D4AF37" />
+                {showPhone ? <AuthIcon size={52} color="#D4AF37" /> : <LockIcon size={52} color="#D4AF37" />}
               </View>
             </View>
             <Text style={s.reAuthTitle}>SEAL LOCK</Text>
-            <Text style={[s.reAuthSub, { marginBottom: 32 }]}>Step 1 of 2 — {authLabel}</Text>
+            <Text style={[s.reAuthSub, { marginBottom: showPhone ? 6 : 24 }]}>{showPhone ? `Unlock with your ${authLabel.toLowerCase()}` : 'Unlock with your app passcode'}</Text>
+            {showPhone ? <Text style={[s.reAuthSub, { fontSize: 12, marginBottom: 26, paddingHorizontal: 28 }]}>{authHint}</Text> : null}
             {reAuthError ? (
               <View style={{ backgroundColor: 'rgba(239,68,68,0.12)', borderRadius: 10, padding: 14, marginHorizontal: 32, marginBottom: 20, borderWidth: 1, borderColor: 'rgba(239,68,68,0.3)' }}>
                 <Text style={{ color: '#ef4444', fontSize: 13, textAlign: 'center', lineHeight: 18 }}>{reAuthError}</Text>
               </View>
             ) : null}
-            <TouchableOpacity style={[s.btnGold, glassButton, { paddingHorizontal: 40 }]} onPress={runBiometricReAuth}>
-              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
-                <AuthIcon size={20} color="#160B00" />
-                <Text style={s.btnText}>UNLOCK WITH {authLabel}</Text>
+            {showPhone ? (
+              <>
+                <TouchableOpacity style={[s.btnGold, glassButton, { paddingHorizontal: 40 }]} onPress={runBiometricReAuth}>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+                    <AuthIcon size={20} color="#160B00" />
+                    <Text style={s.btnText}>UNLOCK WITH {authLabel}</Text>
+                  </View>
+                </TouchableOpacity>
+                {isDeviceCredentialAvailable ? (
+                  <TouchableOpacity style={{ marginTop: 14, paddingVertical: 6 }} onPress={reAuthWithPhoneCredential}>
+                    <Text style={s.altAuthLink}>Use phone PIN / pattern instead</Text>
+                  </TouchableOpacity>
+                ) : null}
+              </>
+            ) : null}
+            {showPass ? (
+              <View style={{ width: '100%', paddingHorizontal: 32, marginTop: showPhone ? 24 : 0 }}>
+                {showPhone ? <Text style={[s.reAuthSub, { fontSize: 12, marginBottom: 8 }]}>— or your app passcode —</Text> : null}
+                <TextInput
+                  value={passcodeInput}
+                  onChangeText={(t) => setPasscodeInput(t.replace(/[^0-9]/g, ''))}
+                  placeholder="App passcode"
+                  placeholderTextColor="#5A3D1A"
+                  keyboardType="number-pad"
+                  secureTextEntry
+                  maxLength={12}
+                  style={s.passcodeInput}
+                />
+                {passcodeMsg ? <Text style={s.passcodeMsg}>{passcodeMsg}</Text> : null}
+                <TouchableOpacity
+                  disabled={passcodeInput.length < 6}
+                  style={[s.btnGold, glassButton, { marginTop: 12, opacity: passcodeInput.length < 6 ? 0.5 : 1 }]}
+                  onPress={() => tryPasscode(afterPhoneUnlock)}>
+                  <Text style={s.btnText}>UNLOCK WITH APP PASSCODE</Text>
+                </TouchableOpacity>
+                <Text style={[s.reAuthSub, { fontSize: 12, marginTop: 14 }]}>Forgot your passcode? Your 24 words are the only way back in.</Text>
               </View>
-            </TouchableOpacity>
+            ) : null}
+            <NavRow onRestore={() => openRestore(99)} />
           </View>
+          </KeyboardSafe>
         </SafeAreaView>
       );
     }
@@ -2013,6 +2244,8 @@ function AppInner() {
                 Lost access to your authenticator app?
               </Text>
             </TouchableOpacity>
+            {/* Back returns to the first lock step — it never skips a lock (item 3) */}
+            <NavRow onBack={() => setReAuthPhase('biometric')} onRestore={() => openRestore(99)} />
           </View>
         </KeyboardSafe>
       </SafeAreaView>
@@ -2098,7 +2331,7 @@ function AppInner() {
             {/* Lost-phone recovery: restore an existing wallet from its recovery key */}
             <TouchableOpacity
               style={{ marginTop: 18, paddingVertical: 8 }}
-              onPress={() => { setSeedInput(''); setRestorePreview(null); setOnboardingStep(51); }}
+              onPress={() => openRestore(12)}
             >
               <Text style={{ color: '#9A7B4A', fontSize: 13, textAlign: 'center', letterSpacing: 0.5 }}>
                 Already have a wallet? Restore it →
@@ -2129,7 +2362,7 @@ function AppInner() {
             <Text style={s.onboardSub}>Seal your identity with your {authLabel.toLowerCase()}.</Text>
             <View style={[s.onboardCard, glassOnboardCard]}>
               <Text style={s.onboardCardTitle}>BODY SEAL</Text>
-              <Text style={s.onboardBody}>Confirm with your {authLabel.toLowerCase()} to bind your seal.</Text>
+              <Text style={s.onboardBody}>Confirm with your {authLabel.toLowerCase()} to bind your seal.{'\n\n'}{authHint}</Text>
             </View>
             <View style={{ marginVertical: 20 }}><AuthIcon size={52} color="#D4AF37" /></View>
             <TouchableOpacity style={[s.btnGold, glassButton]} onPress={testLeftThumb}>
@@ -2138,6 +2371,12 @@ function AppInner() {
                 <Text style={s.btnText}>SEAL WITH {authLabel}</Text>
               </View>
             </TouchableOpacity>
+            {isDeviceCredentialAvailable ? (
+              <TouchableOpacity style={{ marginTop: 14, paddingVertical: 6 }} onPress={() => sealWithPhoneCredential(3)}>
+                <Text style={s.altAuthLink}>Use phone PIN / pattern instead</Text>
+              </TouchableOpacity>
+            ) : null}
+            <NavRow onBack={() => setOnboardingStep(12)} onRestore={() => openRestore(3)} />
           </View>
         </ScrollView>
       </SafeAreaView>
@@ -2157,7 +2396,7 @@ function AppInner() {
             <Text style={s.onboardSub}>Confirm your identity with your {authLabel.toLowerCase()}.</Text>
             <View style={[s.onboardCard, glassOnboardCard]}>
               <Text style={s.onboardCardTitle}>{authLabel} SEAL</Text>
-              <Text style={s.onboardBody}>Your {authLabel.toLowerCase()} is your body seal — it binds your face to your wallet.</Text>
+              <Text style={s.onboardBody}>Your {authLabel.toLowerCase()} is your body seal — it binds your face to your wallet.{'\n\n'}{authHint}</Text>
             </View>
             <TouchableOpacity style={[s.btnGold, glassButton]} onPress={testPin}>
               <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
@@ -2165,6 +2404,12 @@ function AppInner() {
                 <Text style={s.btnText}>SEAL WITH {authLabel}</Text>
               </View>
             </TouchableOpacity>
+            {isDeviceCredentialAvailable ? (
+              <TouchableOpacity style={{ marginTop: 14, paddingVertical: 6 }} onPress={() => sealWithPhoneCredential(35)}>
+                <Text style={s.altAuthLink}>Use phone PIN / pattern instead</Text>
+              </TouchableOpacity>
+            ) : null}
+            <NavRow onBack={() => setOnboardingStep(12)} onRestore={() => openRestore(35)} />
           </View>
         </ScrollView>
       </SafeAreaView>
@@ -2246,6 +2491,7 @@ function AppInner() {
             >
               <Text style={{ color: '#5A3D1A', fontSize: 13, textAlign: 'center' }}>↺ Generate new QR code</Text>
             </TouchableOpacity>
+            <NavRow onBack={() => { const back = pinSetupReturnTo.current !== null ? 99 : 12; pinSetupReturnTo.current = null; setOnboardingStep(back); }} />
 
           </View>
         </KeyboardSafe>
@@ -2268,7 +2514,7 @@ function AppInner() {
             <CheckSeal size={80} />
           </View>
           <Text style={s.onboardTitle}>Seal Forged</Text>
-          <Text style={s.onboardSub}>Face ✅  {hasFingerprint ? 'Fingerprint ✅  ✅' : `${authLabel} ✅`}</Text>
+          <Text style={s.onboardSub}>Face ✅  Phone lock ✅</Text>
           <View style={[s.onboardCard, glassOnboardCard]}>
             <Text style={s.onboardCardTitle}>YOUR STAR IS READY</Text>
             <Text style={s.onboardBody}>Your seal is forged.{'\n\n'}</Text>
@@ -2343,6 +2589,8 @@ function AppInner() {
               <Text style={s.btnText}> 1,000,000</Text>
             </View>
           </AnimatedPress>
+          {/* Ways out (item 3): nothing sealed is lost — the wallet stays, IGNITE has not run */}
+          <NavRow onBack={() => setOnboardingStep(sealFromRef.current ?? (hasFingerprint ? 3 : 35))} onRestore={() => openRestore(4)} />
         </View>
         </KeyboardSafe>
       </SafeAreaView>
@@ -2536,6 +2784,9 @@ function AppInner() {
     setBioKeyActive(true);
     isIgnitedRef.current = true;
     setSeedInput(''); setRestorePreview(null);
+    await passcodeStore.resetForRestore();                      // forgotten app passcode → cleared, back to the phone lock
+    unlockModeRef.current = 'device'; setUnlockMode('device');
+    restoreReturnTo.current = null;
     Alert.alert('Wallet restored ✅', `This device now controls:\n\n${kp.address}\n\non ${netLabel(targetNet)}.\n\nYour balance will sync from the Clay Tablets.`);
     await sync();
     setOnboardingStep(0);
@@ -2604,8 +2855,8 @@ function AppInner() {
               <Text style={s.btnText}>SAVE / EXPORT</Text>
             </AnimatedPress>
 
-            <TouchableOpacity style={{ marginTop: 16, paddingVertical: 10 }} onPress={() => setOnboardingStep(0)}>
-              <Text style={{ color: '#888', textAlign: 'center' }}>← Done — back to wallet</Text>
+            <TouchableOpacity style={{ marginTop: 16, paddingVertical: 10 }} onPress={async () => { await passcodeStore.markBackupConfirmed().catch(() => {}); setOnboardingStep(0); }}>
+              <Text style={{ color: '#888', textAlign: 'center' }}>✓ I have written down my 24 words — done</Text>
             </TouchableOpacity>
           </View>
         </ScrollView>
@@ -2656,7 +2907,7 @@ function AppInner() {
               </View>
             )}
 
-            <TouchableOpacity style={{ marginTop: 16, paddingVertical: 10 }} onPress={() => { setSeedInput(''); setRestorePreview(null); setOnboardingStep(isIgnitedRef.current ? 0 : 12); }}>
+            <TouchableOpacity style={{ marginTop: 16, paddingVertical: 10 }} onPress={() => { setSeedInput(''); setRestorePreview(null); const back = restoreBackTarget(restoreReturnTo.current, isIgnitedRef.current); restoreReturnTo.current = null; setOnboardingStep(back); }}>
               <Text style={{ color: '#888', textAlign: 'center' }}>← Cancel</Text>
             </TouchableOpacity>
           </View>
@@ -2679,7 +2930,9 @@ function AppInner() {
 
       {/* Transaction Seal Verification Modal — single real factor: biometric / PIN */}
       <Modal visible={txModalVisible} animationType="slide" statusBarTranslucent onRequestClose={cancelTxModal}>
+        <BuildTag />
         <SafeAreaView style={[s.root, { backgroundColor: '#0a0500' }]}>
+          <KeyboardSafe contentContainerStyle={{ flexGrow: 1 }}>
           <View style={s.fullCenter}>
 
             {/* Header */}
@@ -2696,22 +2949,43 @@ function AppInner() {
               </View>
             </View>
 
-            <TouchableOpacity style={[s.btnGold, glassButton, { paddingHorizontal: 36 }]} onPress={runTxBiometric}>
-              <View style={{ flexDirection:'row', alignItems:'center', gap: 8 }}>
-                <AuthIcon size={18} color="#160B00" />
-                <Text style={s.btnText}>CONFIRM WITH {authLabel}</Text>
+            {unlockMode !== 'passcode' ? (
+              <>
+                <TouchableOpacity style={[s.btnGold, glassButton, { paddingHorizontal: 36 }]} onPress={runTxBiometric}>
+                  <View style={{ flexDirection:'row', alignItems:'center', gap: 8 }}>
+                    <AuthIcon size={18} color="#160B00" />
+                    <Text style={s.btnText}>CONFIRM WITH {authLabel}</Text>
+                  </View>
+                </TouchableOpacity>
+                {isDeviceCredentialAvailable ? (
+                  <TouchableOpacity style={{ marginTop: 14, paddingVertical: 6 }} onPress={txWithPhoneCredential}>
+                    <Text style={s.altAuthLink}>Use phone PIN / pattern instead</Text>
+                  </TouchableOpacity>
+                ) : null}
+              </>
+            ) : null}
+            {unlockMode !== 'device' ? (
+              <View style={{ width: '100%', paddingHorizontal: 32, marginTop: unlockMode === 'either' ? 22 : 0 }}>
+                {unlockMode === 'either' ? <Text style={[s.reAuthSub, { fontSize: 12, marginBottom: 8 }]}>— or your app passcode —</Text> : null}
+                <TextInput value={passcodeInput} onChangeText={(t) => setPasscodeInput(t.replace(/[^0-9]/g, ''))} placeholder="App passcode" placeholderTextColor="#5A3D1A" keyboardType="number-pad" secureTextEntry maxLength={12} style={s.passcodeInput} />
+                {passcodeMsg ? <Text style={s.passcodeMsg}>{passcodeMsg}</Text> : null}
+                <TouchableOpacity disabled={passcodeInput.length < 6} style={[s.btnGold, glassButton, { marginTop: 12, opacity: passcodeInput.length < 6 ? 0.5 : 1 }]} onPress={() => tryPasscode(txConfirmed)}>
+                  <Text style={s.btnText}>CONFIRM WITH APP PASSCODE</Text>
+                </TouchableOpacity>
               </View>
-            </TouchableOpacity>
+            ) : null}
 
             <TouchableOpacity style={s.btnSkip} onPress={cancelTxModal}>
               <Text style={s.btnSkipText}>Cancel trade</Text>
             </TouchableOpacity>
           </View>
+          </KeyboardSafe>
         </SafeAreaView>
       </Modal>
 
       {/* ── Recipient QR scan ───────────────────────────────────────────── */}
       <Modal visible={recipientScanVisible} animationType="slide" statusBarTranslucent onRequestClose={cancelRecipientScan}>
+        <BuildTag />
         <SafeAreaView style={[s.root, { backgroundColor: '#0a0500' }]}>
           <View style={s.cameraContainer}>
 
@@ -2790,7 +3064,6 @@ function AppInner() {
             <View style={s.sealBadge}><Text style={s.sealBadgeText}>🔐 SEAL ACTIVE</Text></View>
           )}
           {/* Network toggle — tap to switch mainnet ⇄ testnet, no rebuild required */}
-          <View style={s.badgeRow}>
           <TouchableOpacity
             style={[s.networkBadge, network === 'testnet' && s.networkBadgeTestnet, switchingNet && { opacity: 0.5 }]}
             onPress={requestNetworkToggle}
@@ -2801,8 +3074,6 @@ function AppInner() {
               {switchingNet ? 'Switching network…' : network === 'testnet' ? '🧪 TESTNET · tap for Mainnet' : '🌐 MAINNET · tap for Testnet'}
             </Text>
           </TouchableOpacity>
-          <Text style={s.versionInline}>v{APP_VERSION} ({APP_BUILD})</Text>
-          </View>
           {userCount === 0 ? (
             <View style={{ flexDirection:'row', flexWrap:'wrap', alignItems:'center', justifyContent:'center', paddingHorizontal: 8 }}>
               <Text style={s.stat}>Be the first — claim your founding share of </Text>
@@ -2955,6 +3226,7 @@ function AppInner() {
 
         {/* CONTACTS — list / pick / rename / delete + manual add */}
         <Modal visible={contactsVisible} animationType="slide" transparent onRequestClose={() => setContactsVisible(false)}>
+          <BuildTag />
           <KeyboardSafe scroll={false}><SafeAreaView edges={['bottom']} style={s.contactsBackdrop}>
             <View style={s.contactsSheet}>
               <Text style={s.label}>📇 CONTACTS</Text>
@@ -2982,8 +3254,47 @@ function AppInner() {
           </SafeAreaView></KeyboardSafe>
         </Modal>
 
+        {/* UNLOCK METHOD — phone lock / app passcode / either (item 2) */}
+        <Modal visible={unlockSettingsVisible} animationType="slide" transparent onRequestClose={closeUnlockSettings}>
+          <BuildTag />
+          <KeyboardSafe scroll={false}><SafeAreaView edges={['bottom']} style={s.contactsBackdrop}>
+            <View style={s.contactsSheet}>
+              <Text style={s.label}>🔒 UNLOCK METHOD</Text>
+              {!settingsAuthed ? (
+                <>
+                  <Text style={[s.sublabel, { marginBottom: 12 }]}>Confirm it's you before changing how MONEY unlocks.</Text>
+                  {unlockMode !== 'passcode' ? (
+                    <TouchableOpacity style={s.btnLapis} onPress={settingsAuthWithPhone}><Text style={s.btnText}>CONFIRM WITH PHONE LOCK</Text></TouchableOpacity>
+                  ) : null}
+                  {unlockMode !== 'device' ? (
+                    <>
+                      <TextInput value={passcodeInput} onChangeText={(t) => setPasscodeInput(t.replace(/[^0-9]/g, ''))} placeholder="Current app passcode" placeholderTextColor="#5A3D1A" keyboardType="number-pad" secureTextEntry maxLength={12} style={[s.passcodeInput, { marginTop: 10 }]} />
+                      <TouchableOpacity disabled={passcodeInput.length < 6} style={[s.btnLapis, { marginTop: 8, opacity: passcodeInput.length < 6 ? 0.5 : 1 }]} onPress={() => tryPasscode(async () => setSettingsAuthed(true))}><Text style={s.btnText}>CONFIRM WITH APP PASSCODE</Text></TouchableOpacity>
+                    </>
+                  ) : null}
+                  {passcodeMsg ? <Text style={s.passcodeMsg}>{passcodeMsg}</Text> : null}
+                </>
+              ) : (
+                <>
+                  <TouchableOpacity onPress={() => chooseUnlockMode('device')} style={[s.modeRow, unlockMode === 'device' && s.modeRowOn]}><Text style={s.modeTitle}>{unlockMode === 'device' ? '● ' : '○ '}Phone lock only</Text><Text style={s.modeDesc}>Fingerprint, face, PIN, pattern or password — the strongest.</Text></TouchableOpacity>
+                  <TouchableOpacity onPress={() => chooseUnlockMode('passcode')} style={[s.modeRow, unlockMode === 'passcode' && s.modeRowOn]}><Text style={s.modeTitle}>{unlockMode === 'passcode' ? '● ' : '○ '}App passcode only</Text><Text style={s.modeDesc}>Needs your 24-word backup first.</Text></TouchableOpacity>
+                  <TouchableOpacity onPress={() => chooseUnlockMode('either')} style={[s.modeRow, unlockMode === 'either' && s.modeRowOn]}><Text style={s.modeTitle}>{unlockMode === 'either' ? '● ' : '○ '}Phone lock OR app passcode</Text><Text style={s.modeDesc}>The passcode is a backup if the phone lock fails.</Text></TouchableOpacity>
+                  <Text style={[s.label, { marginTop: 14 }]}>{hasAppPasscode ? 'CHANGE APP PASSCODE' : 'CREATE APP PASSCODE'}</Text>
+                  <TextInput value={newPass1} onChangeText={(t) => setNewPass1(t.replace(/[^0-9]/g, ''))} placeholder="New passcode (6–12 digits)" placeholderTextColor="#5A3D1A" keyboardType="number-pad" secureTextEntry maxLength={12} style={s.passcodeInput} />
+                  <TextInput value={newPass2} onChangeText={(t) => setNewPass2(t.replace(/[^0-9]/g, ''))} placeholder="Repeat it" placeholderTextColor="#5A3D1A" keyboardType="number-pad" secureTextEntry maxLength={12} style={[s.passcodeInput, { marginTop: 8 }]} />
+                  <TouchableOpacity style={[s.btnLapis, { marginTop: 8 }]} onPress={saveAppPasscode}><Text style={s.btnText}>SAVE PASSCODE</Text></TouchableOpacity>
+                  <Text style={[s.modeDesc, { marginTop: 10 }]}>Honest note: a 6-digit app passcode is weaker than your phone lock — the phone lock is protected by secure hardware, the passcode only by this app. Forgot it? Only your 24 words get you back in.</Text>
+                </>
+              )}
+              {settingsMsg ? <Text style={[s.passcodeMsg, { color: '#C4956A' }]}>{settingsMsg}</Text> : null}
+              <TouchableOpacity style={[s.btnSage, { marginTop: 12 }]} onPress={closeUnlockSettings}><Text style={s.btnText}>CLOSE</Text></TouchableOpacity>
+            </View>
+          </SafeAreaView></KeyboardSafe>
+        </Modal>
+
         {/* SAVE / RENAME a contact */}
         <Modal visible={saveContactAddr !== null} animationType="fade" transparent onRequestClose={() => { setSaveContactAddr(null); setEditContactAddr(null); }}>
+          <BuildTag />
           <KeyboardSafe scroll={false}><SafeAreaView edges={['bottom']} style={s.contactsBackdrop}>
             <View style={s.contactsSheet}>
               <Text style={s.label}>{editContactAddr ? '✏️ RENAME CONTACT' : '＋ SAVE CONTACT'}</Text>
@@ -3010,10 +3321,14 @@ function AppInner() {
           <TouchableOpacity onPress={() => setOnboardingStep(50)}>
             <Text style={{ color: '#9A7B4A', fontSize: 12, letterSpacing: 1 }}>🔑 BACK UP WALLET</Text>
           </TouchableOpacity>
-          <TouchableOpacity onPress={() => { setSeedInput(''); setRestorePreview(null); setOnboardingStep(51); }}>
+          <TouchableOpacity onPress={() => openRestore(0)}>
             <Text style={{ color: '#9A7B4A', fontSize: 12, letterSpacing: 1 }}>♻️ RESTORE WALLET</Text>
           </TouchableOpacity>
         </View>
+        {/* How the app unlocks — phone lock / app passcode / either (item 2) */}
+        <TouchableOpacity onPress={openUnlockSettings} style={{ alignItems: 'center', paddingVertical: 6, marginBottom: 10 }}>
+          <Text style={{ color: '#9A7B4A', fontSize: 12, letterSpacing: 1 }}>🔒 UNLOCK: {unlockMode === 'device' ? 'PHONE LOCK' : unlockMode === 'passcode' ? 'APP PASSCODE' : 'PHONE LOCK OR PASSCODE'} ›</Text>
+        </TouchableOpacity>
 
         {/* CLAY TABLETS (ledger) */}
         <View style={s.section}>
@@ -3025,7 +3340,7 @@ function AppInner() {
               <View key={i} style={[s.tablet, tx.reason === 'disconnect_penalty' && s.tabletPenalty]}>
                 <View style={s.tabletHeader}>
                   <Text style={s.tabletNum}>ENTRY {txs.length - i}</Text>
-                  <Text style={s.tabletTime}>{tx.time}</Text>
+                  <Text style={s.tabletTime}>{formatTxTime(tx)}</Text>
                 </View>
                 <View style={s.tabletRow}>
                   <Text style={s.tabletFromLabel}>FROM</Text>
@@ -3070,6 +3385,7 @@ export default function App() {
         {Platform.OS !== 'web' && <HoloBackground tilt={tilt} />}
         {Platform.OS !== 'web' && <DepthFrame />}
         <AppInner />
+        <BuildTag />
       </View>
     </SafeAreaProvider>
   );
@@ -3110,9 +3426,15 @@ const s = StyleSheet.create({
   },
   networkBadgeTestnet: { borderColor: 'rgba(230,160,40,0.7)', backgroundColor: 'rgba(60,38,4,0.85)' },
   networkBadgeText:    { color: '#7DB87A', fontSize: 11, fontWeight: 'bold', letterSpacing: 1 },
-  // Build/version display — small, grey, unobtrusive
-  badgeRow:       { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8 },
-  versionInline:  { color: '#6B5A44', fontSize: 10, letterSpacing: 0.5, marginBottom: 10 },
+  // Build footer — small, grey, unobtrusive (the per-screen label is BuildTag)
+  // Unlock method + app passcode (Oct device test, items 1 + 2)
+  altAuthLink:    { color: '#C4956A', fontSize: 13, letterSpacing: 0.5, textAlign: 'center', textDecorationLine: 'underline' },
+  passcodeInput:  { backgroundColor: 'rgba(28,17,4,0.6)', borderWidth: 1, borderColor: 'rgba(212,175,55,0.35)', borderRadius: 12, paddingVertical: 12, paddingHorizontal: 16, color: '#F1E2C0', fontSize: 18, letterSpacing: 6, textAlign: 'center' },
+  passcodeMsg:    { color: '#ef4444', fontSize: 13, textAlign: 'center', marginTop: 10 },
+  modeRow:        { borderWidth: 1, borderColor: 'rgba(212,175,55,0.25)', borderRadius: 12, padding: 12, marginTop: 8 },
+  modeRowOn:      { borderColor: '#D4AF37', backgroundColor: 'rgba(212,175,55,0.08)' },
+  modeTitle:      { color: '#E8C873', fontSize: 14, fontWeight: 'bold' },
+  modeDesc:       { color: '#9A7B4A', fontSize: 12, marginTop: 3, lineHeight: 17 },
   versionFooter:  { color: '#5A4A36', fontSize: 10, letterSpacing: 0.5, textAlign: 'center', marginTop: 18, marginBottom: 8 },
   // Unmistakable — high-contrast, full-width, always the first thing visible on testnet.
   testnetBanner: {
