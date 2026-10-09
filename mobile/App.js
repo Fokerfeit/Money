@@ -141,12 +141,27 @@ import {
   ClayWhatIsThis, ClayWhoMadeThis, ClayIsItSafe, ClayBuildItBetter, ClayWhyTrust,
 } from './Icons';
 import QRCode from 'react-native-qrcode-svg';
+import * as Clipboard from 'expo-clipboard';
+import { nodeIndicator } from './phone_node';
 import {
   useHoloBackground, useHoloTransition, HoloBackground, DepthFrame, useTilt,
   glassCard, glassButton, glassOnboardCard, glassTermBox,
 } from './HoloFX';
 
 const { width } = Dimensions.get('window');
+
+// ── Copy the seal address (tester feedback Oct 8, item A) ───────────────────
+// Only a well-formed public seal address (M_ + hex) is ever put on the clipboard.
+const copySealAddress = async (address, clipboard) => {
+  if (typeof address !== 'string' || !/^M_[0-9A-F]{16,64}$/i.test(address)) return false;
+  try { await clipboard.setStringAsync(address); return true; } catch { return false; }
+};
+
+// ── The phone's own node (tester feedback Oct 8, item C) ────────────────────
+// No node runs inside the app yet, so this is null and PHONE NODE shows OFF. The
+// swarm bridge will put its live node here (an object with stats()); nothing else
+// may. There is no setting, flag or state that can change it.
+const PHONE_NODE = null;
 
 // ── Platform guard ──────────────────────────────────────────────────────────
 // On web, biometrics and native camera don't exist.
@@ -351,7 +366,7 @@ const REAUTH_AWAY_MS = 5 * 60 * 1000; // 5 minutes
 // (Identity/KYC contribution cards removed with the suns mechanic.)
 
 // ── Screen entry animation — every screen fades + scales in from slightly zoomed-out ─
-const ScreenWrapper = ({ children, style }) => {
+const ScreenWrapper = ({ children, style, domainBar = true }) => {
   const anim = useRef(new Animated.Value(0)).current;
   useEffect(() => {
     Animated.spring(anim, { toValue: 1, tension: 55, friction: 9, useNativeDriver: NATIVE_DRIVER }).start();
@@ -363,8 +378,9 @@ const ScreenWrapper = ({ children, style }) => {
           root (see App() at the bottom) so EVERY screen shows them — not just
           the ones wrapped in ScreenWrapper. */}
       {children}
-      {/* Domain bar — floats above all screens on native (web is handled by HoloFX CSS) */}
-      {Platform.OS !== 'web' && (
+      {/* Domain bar — floats above all screens on native (web is handled by HoloFX CSS).
+          The wallet screen draws its own pinned glass DomainStrip instead. */}
+      {Platform.OS !== 'web' && domainBar && (
         <View style={{ position: 'absolute', top: 0, left: 0, right: 0 }} pointerEvents="none">
           <SafeAreaView edges={['top']} style={{ backgroundColor: 'transparent' }}>
             <Text style={{
@@ -384,6 +400,64 @@ const ScreenWrapper = ({ children, style }) => {
         </View>
       )}
     </Animated.View>
+  );
+};
+
+// ── DomainStrip — the pinned "moneyforeveryone.app" bar on the wallet screen ──
+// (tester feedback Oct 8, B1). It sits in the layout ABOVE the scroll view, so it
+// stays put while the wallet scrolls, and its own glass backing means scrolled
+// content never shows through its text.
+const DomainStrip = () => (
+  <View style={s.domainStrip} pointerEvents="none">
+    <Text style={s.domainStripText}>moneyforeveryone.app</Text>
+  </View>
+);
+
+// ── PhoneNodeStatus — "⛏️ PHONE NODE" (tester feedback Oct 8, item C) ────────
+// What it shows comes ONLY from nodeIndicator() (phone_node.js) applied to the
+// live stats of a node running inside the app. Today `node` is null → OFF (dim,
+// no motion). ON (green, pulsing) needs a real node reporting running + relay
+// connected + ≥1 fresh peer + a trade it checked itself in the last 2 minutes.
+const PhoneNodeStatus = ({ node }) => {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!node) return undefined;                 // nothing to watch → no timer
+    const t = setInterval(() => setNow(Date.now()), 5000);
+    return () => clearInterval(t);
+  }, [node]);
+  let stats = null;
+  try { stats = node && typeof node.stats === 'function' ? node.stats() : null; } catch { stats = null; }
+  const view = nodeIndicator(stats, now);
+  const pulse = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    if (view.on !== true) { pulse.setValue(0); return undefined; }
+    const loop = Animated.loop(Animated.sequence([
+      Animated.timing(pulse, { toValue: 1, duration: 900, useNativeDriver: NATIVE_DRIVER }),
+      Animated.timing(pulse, { toValue: 0, duration: 900, useNativeDriver: NATIVE_DRIVER }),
+    ]));
+    loop.start();
+    return () => loop.stop();
+  }, [view.on]);
+  if (view.on !== true) {
+    return (
+      <View style={[s.nodeRow, s.nodeRowOff]}>
+        <Text style={[s.nodeIcon, { opacity: 0.45 }]}>⛏️</Text>
+        <View style={{ flex: 1 }}>
+          <Text style={[s.nodeTitle, { color: '#7A6548' }]}>PHONE NODE · OFF</Text>
+          <Text style={[s.nodeSub, { color: '#6B5A43' }]}>Your phone isn't validating yet — coming with the swarm bridge.</Text>
+        </View>
+      </View>
+    );
+  }
+  const dotOpacity = pulse.interpolate({ inputRange: [0, 1], outputRange: [0.45, 1] });
+  return (
+    <View style={[s.nodeRow, s.nodeRowOn]}>
+      <Animated.View style={[s.nodeDot, { opacity: dotOpacity }]} />
+      <View style={{ flex: 1 }}>
+        <Text style={[s.nodeTitle, { color: '#9BE098' }]}>⛏️ PHONE NODE · ON</Text>
+        <Text style={[s.nodeSub, { color: '#C9E8C6' }]}>Validating trades with {view.peers} {view.peers === 1 ? 'peer' : 'peers'} · flat share, no extra reward</Text>
+      </View>
+    </View>
   );
 };
 
@@ -682,6 +756,9 @@ function AppInner() {
   const [recipientFaceCountdown, setRecipientFaceCountdown] = useState(3);
   const [recipientQrScanned,     setRecipientQrScanned]     = useState(false);
   const [showMyQR,               setShowMyQR]               = useState(false);
+  const [sealCopied,             setSealCopied]             = useState(false);   // "✓ Copied" for 2 s (Oct 8, item A)
+  const sealCopiedTimer = useRef(null);
+  useEffect(() => () => clearTimeout(sealCopiedTimer.current), []);
   const recipientFaceTimer = useRef(null);
   const recipientCamRef    = useRef(null);
 
@@ -1953,6 +2030,17 @@ function AppInner() {
     ]);
   };
 
+  // Seal address: copy (shows "Copied" for 2 s) and share (tester feedback Oct 8, item A).
+  // Only the public address — never anything secret.
+  const copySeal = async () => {
+    const ok = await copySealAddress(address, Clipboard);
+    if (!ok) { Alert.alert('Copy failed', 'Could not copy your seal address. Use SHARE instead.'); return; }
+    setSealCopied(true);
+    clearTimeout(sealCopiedTimer.current);
+    sealCopiedTimer.current = setTimeout(() => setSealCopied(false), 2000);
+  };
+  const shareSeal = () => { if (address) Share.share({ message: address }).catch(() => {}); };
+
   const invite = () => Share.share({
     message: `I just joined the Swarm.\nNo banks. No CEOs. Just people and phones.\n\nMy seal mark: ${address}\n\nMoney. For Everyone. Forever.`,
   }).catch(() => {});
@@ -2924,7 +3012,7 @@ function AppInner() {
   const isMillion = reward === 1_000_000;
 
   return (
-    <ScreenWrapper>
+    <ScreenWrapper domainBar={false}>
     <SafeAreaView style={s.root}>
       <GlowOrbs />
 
@@ -3029,6 +3117,9 @@ function AppInner() {
         </SafeAreaView>
       </Modal>
 
+      {/* Pinned domain bar — stays at the top while the wallet scrolls (Oct 8, B1) */}
+      <DomainStrip />
+
       {/* KeyboardSafe (items 6 + 8) + pull-to-refresh (item 9) */}
       <KeyboardSafe
         contentContainerStyle={s.scroll}
@@ -3040,7 +3131,7 @@ function AppInner() {
           </View>
         )}
         {/* HEADER */}
-        <View nativeID="app-header" style={s.header}>
+        <View nativeID="app-header" style={[glassCard, s.header]}>
           {/* Native: pulsing clock-ring logo with pulse rings
                Web:    logo image only — 3D chrome orb sits beside it in the header */}
           {Platform.OS !== 'web' ? (
@@ -3089,10 +3180,14 @@ function AppInner() {
           )}
         </View>
 
-        {/* CLAY SEAL (wallet) */}
+        {/* CLAY SEAL (wallet) — tap the address to copy it; tap the card for the QR,
+            which has COPY + SHARE (tester feedback Oct 8, item A) */}
         <TouchableOpacity style={[s.card, glassCard]} onPress={() => setShowMyQR(v => !v)} activeOpacity={0.85}>
           <Text style={s.label}>YOUR CLAY SEAL</Text>
-          <Text style={s.addr} numberOfLines={1}>{address || '…'}</Text>
+          <Pressable style={s.addrRow} onPress={copySeal} disabled={!address} hitSlop={6}>
+            <Text style={[s.addr, { flexShrink: 1 }]} numberOfLines={1}>{address || '…'}</Text>
+            <Text style={sealCopied ? s.copiedTag : s.copyTag}>{sealCopied ? '✓ Copied' : '📋 copy'}</Text>
+          </Pressable>
           {showMyQR && address ? (
             <View style={s.myQrWrap}>
               <QRCode
@@ -3103,9 +3198,17 @@ function AppInner() {
                 quietZone={10}
               />
               <Text style={s.qrLabel}>Show this to receive trades</Text>
+              <View style={s.qrBtnRow}>
+                <TouchableOpacity style={s.qrBtn} onPress={copySeal} activeOpacity={0.8}>
+                  <Text style={s.qrBtnText}>{sealCopied ? '✓ COPIED' : '📋 COPY'}</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={s.qrBtn} onPress={shareSeal} activeOpacity={0.8}>
+                  <Text style={s.qrBtnText}>↗ SHARE</Text>
+                </TouchableOpacity>
+              </View>
             </View>
           ) : (
-            <Text style={s.hint}>Tap to show your QR seal</Text>
+            <Text style={s.hint}>Tap the seal to copy · tap the card for your QR</Text>
           )}
         </TouchableOpacity>
 
@@ -3126,6 +3229,9 @@ function AppInner() {
             <Text style={s.millionaire}>🎉 FOUNDING MEMBER OF THE SWARM</Text>
           )}
         </View>
+
+        {/* PHONE NODE (Oct 8, item C) — driven only by a real in-app node; none yet → OFF */}
+        <PhoneNodeStatus node={PHONE_NODE} />
 
         {/* INVITE */}
         <AnimatedPress style={[s.btnAmber, glassButton]} onPress={invite}>
@@ -3397,10 +3503,13 @@ const s = StyleSheet.create({
   scroll: { paddingBottom: 60 },
 
   // ── Header ──────────────────────────────────────────────────────────────
+  // A glass card like the others (glassCard supplies fill, rim, radius, glow) —
+  // tester feedback Oct 8, B1 (was a solid edge-to-edge #130A00 block).
   header: {
-    alignItems: 'center', paddingVertical: 40, paddingHorizontal: 20,
-    backgroundColor: '#130A00',
-    borderBottomWidth: 1, borderBottomColor: 'rgba(212,175,55,0.15)',
+    alignItems: 'center', paddingVertical: 18, paddingHorizontal: 16,
+    marginHorizontal: 16, marginTop: 14,
+    borderTopWidth: 2, borderTopColor: 'rgba(255,236,170,0.22)',
+    borderBottomWidth: 4, borderBottomColor: 'rgba(0,0,0,0.7)',
   },
   logoRing: {
     width: 130, height: 130, borderRadius: 65, overflow: 'hidden',
@@ -3456,7 +3565,7 @@ const s = StyleSheet.create({
   label:      { color: '#C4956A', fontSize: 11, letterSpacing: 2.5, marginBottom: 8 },
   sublabel:   { color: '#5A3D1A', fontSize: 11, letterSpacing: 1, marginBottom: 12, fontStyle: 'italic' },
   addr:       { color: '#E8C87A', fontSize: 13, fontFamily: 'monospace', letterSpacing: 0.5 },
-  hint:       { color: '#4A2E10', fontSize: 11, marginTop: 6 },
+  hint:       { color: '#9A7B4A', fontSize: 11, marginTop: 6 },   // readable on the card (Oct 8, B2; was #4A2E10)
   balanceRow: { flexDirection: 'row', alignItems: 'center', marginVertical: 4 },
   balance:    { color: '#7DB87A', fontSize: 40, fontWeight: 'bold', letterSpacing: -1 },
   millionaire:{ color: '#D4AF37', fontSize: 12, marginTop: 8, fontWeight: 'bold', textAlign: 'center', letterSpacing: 1.5 },
@@ -3835,6 +3944,24 @@ const s = StyleSheet.create({
   qrLabel: {
     color: '#B8956A', fontSize: 12, letterSpacing: 1.5, marginTop: 12, textAlign: 'center',
   },
+  // Seal address copy/share (Oct 8, item A)
+  addrRow:   { flexDirection: 'row', alignItems: 'center', maxWidth: '100%', paddingVertical: 6, paddingHorizontal: 10, borderRadius: 10, borderWidth: 1, borderStyle: 'dashed', borderColor: 'rgba(212,175,55,0.35)' },
+  copyTag:   { color: '#C4956A', fontSize: 11, marginLeft: 8 },
+  copiedTag: { color: '#7DB87A', fontSize: 11, fontWeight: 'bold', marginLeft: 8 },
+  qrBtnRow:  { flexDirection: 'row', marginTop: 14 },
+  qrBtn:     { marginHorizontal: 5, paddingVertical: 10, paddingHorizontal: 18, borderRadius: 12, backgroundColor: 'rgba(90,55,10,0.85)', borderWidth: 1.5, borderColor: 'rgba(255,236,175,0.6)', borderBottomColor: 'rgba(70,42,4,0.85)' },
+  qrBtnText: { color: '#F5E6C8', fontWeight: 'bold', fontSize: 13, letterSpacing: 1 },
+  // Pinned domain strip on the wallet (Oct 8, B1)
+  domainStrip:     { paddingVertical: 7, backgroundColor: 'rgba(14,8,2,0.78)', borderBottomWidth: 1, borderBottomColor: 'rgba(212,175,55,0.28)' },
+  domainStripText: { textAlign: 'center', color: 'rgba(232,200,122,0.9)', fontSize: 10, letterSpacing: 3.5, fontWeight: '600', textShadowColor: 'rgba(212,175,55,0.35)', textShadowOffset: { width: 0, height: 0 }, textShadowRadius: 8 },
+  // Phone node row (Oct 8, item C)
+  nodeRow:    { flexDirection: 'row', alignItems: 'center', marginHorizontal: 16, marginTop: 4, marginBottom: 12, paddingVertical: 12, paddingHorizontal: 14, borderRadius: 14, borderWidth: 1 },
+  nodeRowOff: { backgroundColor: 'rgba(20,12,3,0.70)', borderColor: 'rgba(154,123,74,0.22)' },
+  nodeRowOn:  { backgroundColor: 'rgba(14,26,12,0.82)', borderColor: 'rgba(125,184,122,0.55)' },
+  nodeIcon:   { fontSize: 20, marginRight: 12 },
+  nodeDot:    { width: 10, height: 10, borderRadius: 5, backgroundColor: '#7DB87A', marginRight: 12 },
+  nodeTitle:  { fontSize: 12, fontWeight: 'bold', letterSpacing: 1.5 },
+  nodeSub:    { fontSize: 12, lineHeight: 16, marginTop: 2 },
   recipientRow: {
     flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 10,
   },
