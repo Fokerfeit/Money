@@ -54,5 +54,33 @@ check(/② Enter your beta code/.test(SRC), 'forging ritual step 2 says "Enter y
 check(!/invite code/i.test(stripped), 'no "invite code" in anything the user can read');
 check(!/Allow face capture|Allow device check/.test(SRC), 'old oath strings are gone from the file');
 
+console.log('\n── Rulings: Oath card, step-3 screen, no face-capture claims ──');
+check(/Your keys never leave your phone\. Press each tablet to swear:/.test(SRC), 'Oath card says "Your keys never leave your phone."');
+check(!/stored raw|Only hashes/i.test(stripped), 'the "Nothing is stored raw. Only hashes." claim is gone');
+const STEP35 = (() => { const i = SRC.indexOf('if (onboardingStep === 35) {'); const j = SRC.indexOf('onPress={testPin}', i); return i >= 0 && j > i ? SRC.slice(i, j) : ''; })();
+check(STEP35.length > 200, 'step 35 screen found');
+check(/<Text style=\{s\.onboardTitle\}>Seal Set<\/Text>/.test(STEP35), 'step 35 title is "Seal Set"');
+check(/Your phone lock now guards your wallet\./.test(STEP35), 'step 35 body: "Your phone lock now guards your wallet."');
+check(!/Face Inscribed|binds your face|body seal — /.test(stripped), 'no "Face Inscribed" / "binds your face" anywhere');
+// every user-visible string: no claim that the app captures, scans or stores a face
+const BANNED = /face capture|binds your face|Face Inscribed|Face ✅|image deleted|face scan|scan your face|your face is|face data|[^_A-Za-z]facial[^_A-Za-z]|(we|will) (scan|capture|store|keep) (your )?face/i;
+const visible = stripped.split(String.fromCharCode(10));   // every code line: a claim can sit in any string or JSX text
+const hit = visible.filter((l) => BANNED.test(l));
+check(hit.length === 0, 'sweep: no visible line claims face capture / scan / storage', hit.map((l) => l.trim().slice(0, 80)).join(' | '));
+// dead pose-ritual code can never be reached: nothing sends the user to step 2
+check(!/setOnboardingStep\(2\)/.test(stripped) && !/onboardingStep === 2\) \{\s*\n\s*return \(/.test(stripped), 'the old face-pose step (2) is unreachable: nothing navigates to it and no screen renders for it');
+
+console.log('\n── Server invite-code wording → beta code (executed) ──');
+const fe = require('./friendly_errors');
+check(fe.friendlyServerError('A valid invite code is required to seal.') === 'Beta code not valid.', 'server "A valid invite code is required to seal." → "Beta code not valid."');
+check(fe.friendlyServerError('This invite code has already been used — one seal per code.') === 'Beta code already used.', 'server "This invite code has already been used…" → "Beta code already used."');
+check(fe.friendlyServerError('Too many attempts, slow down') === 'Too many attempts, slow down', 'other server messages pass through unchanged');
+check(fe.friendlyServerError('Invalid invite code') === 'Invalid beta code' && fe.friendlyServerError('bad Invite Code!') === 'bad Beta code!', 'any other message that says "invite code" still gets "beta code"');
+check(fe.friendlyServerError(undefined) === '' && fe.friendlyServerError(null) === '' && fe.friendlyServerError({}) === '', 'non-string error → empty string (never "undefined")');
+const sites = [...stripped.matchAll(/Rejected by \$\{netName\(net\)\}: \$\{([^}]+)\}/g)].map((x) => x[1]);
+check(sites.length === 2 && sites.every((x) => x === 'friendlyServerError(r.error)'), 'both rejection alerts (ignition + claim) show the translated message', sites.join(', '));
+check(!/\$\{r\.error\}/.test(stripped), 'no alert still prints the raw server error');
+check(/import \{ friendlyServerError \} from '\.\/friendly_errors'/.test(SRC), 'App.js imports friendly_errors');
+
 console.log(`\n  ${fails === 0 ? '🎉' : '💥'}  Onboarding honesty: ${fails === 0 ? 'ALL PROBES PASS' : fails + ' FAILURE(S)'}\n`);
 process.exit(fails === 0 ? 0 : 1);

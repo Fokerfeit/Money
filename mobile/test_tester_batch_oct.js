@@ -79,7 +79,7 @@ const fnText = (re) => (stripped.match(re) || [''])[0];
       'igniteLocally() runs ONLY on a server yes, or when the ledger proves the claim landed (2 call sites, both guarded)');
     const msg = "Couldn't reach the network — your code was not used.";
     check(trig.includes(msg) && claim.includes(msg), `both IGNITE and CLAIM show the honest "${msg}" when nothing landed`);
-    check(/`Rejected by \$\{netName\(net\)\}: \$\{r\.error\}`/.test(trig) && /`Rejected by \$\{netName\(net\)\}: \$\{r\.error\}`/.test(claim),
+    check(/`Rejected by \$\{netName\(net\)\}: \$\{friendlyServerError\(r\.error\)\}`/.test(trig) && /`Rejected by \$\{netName\(net\)\}: \$\{friendlyServerError\(r\.error\)\}`/.test(claim),
       'both rejections read "Rejected by TESTNET: …" / "Rejected by MAINNET: …"');
 
     // EXECUTED: lift postIgnition + ignitedOnServer out of App.js verbatim and run them

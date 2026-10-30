@@ -145,6 +145,7 @@ import * as Clipboard from 'expo-clipboard';
 import { nodeIndicator } from './phone_node';
 import * as humanCheck from './human_check';
 import { routeOf, tabBarModel, restoreBackLabel } from './tab_nav';
+import { friendlyServerError } from './friendly_errors';
 import {
   useHoloBackground, useHoloTransition, HoloBackground, DepthFrame, useTilt,
   glassCard, glassButton, glassOnboardCard, glassTermBox,
@@ -1907,7 +1908,7 @@ function AppInner() {
     } else if (r.kind === 'rejected') {
       // Server explicitly rejected (bad/used code, throttle, duplicate seal…) — do NOT
       // ignite. The message names the network that said no.
-      Alert.alert('⛔ Ignition Rejected', `Rejected by ${netName(net)}: ${r.error}`);
+      Alert.alert('⛔ Ignition Rejected', `Rejected by ${netName(net)}: ${friendlyServerError(r.error)}`);
     } else if (await ignitedOnServer(addrRef.current) === true) {
       // The reply was lost but the ledger shows the claim landed — that IS a success.
       await igniteLocally();
@@ -2163,7 +2164,7 @@ function AppInner() {
       Alert.alert('🎉 WELCOME, FOUNDING MEMBER!', `${fmt(reward)} MONEY on ${netName(net)}\nYour entry is inscribed on the tablets.\nWelcome to the Swarm.`);
       sync();
     } else if (r.kind === 'rejected') {
-      Alert.alert('Claim failed', `Rejected by ${netName(net)}: ${r.error}`);
+      Alert.alert('Claim failed', `Rejected by ${netName(net)}: ${friendlyServerError(r.error)}`);
     } else {
       Alert.alert('Couldn\'t reach the network', `Couldn't reach the network — your code was not used.\n\nCheck your connection and try again (${netName(net)}).`);
     }
@@ -2663,7 +2664,7 @@ function AppInner() {
             <View style={[s.onboardCard, glassOnboardCard]}>
               <Text style={s.onboardCardTitle}>THE OATH</Text>
               <Text style={{ color: '#7A5C3A', fontSize: 12, marginBottom: 12 }}>
-                Nothing is stored raw. Only hashes. Press each tablet to swear:
+                Your keys never leave your phone. Press each tablet to swear:
               </Text>
               {TERMS.map((term, i) => (
                 <TouchableOpacity
@@ -2765,11 +2766,11 @@ function AppInner() {
         <ScrollView contentContainerStyle={s.onboardScroll}>
           <View style={s.onboardCenter}>
             <View style={{ marginBottom: 16 }}><CheckSeal size={80} /></View>
-            <Text style={s.onboardTitle}>Face Inscribed</Text>
+            <Text style={s.onboardTitle}>Seal Set</Text>
             <Text style={s.onboardSub}>Confirm your identity with your {authLabel.toLowerCase()}.</Text>
             <View style={[s.onboardCard, glassOnboardCard]}>
               <Text style={s.onboardCardTitle}>{authLabel} SEAL</Text>
-              <Text style={s.onboardBody}>Your {authLabel.toLowerCase()} is your body seal — it binds your face to your wallet.{'\n\n'}{authHint}</Text>
+              <Text style={s.onboardBody}>Your phone lock now guards your wallet.{'\n\n'}{authHint}</Text>
             </View>
             <TouchableOpacity style={[s.btnGold, glassButton]} onPress={testPin}>
               <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>

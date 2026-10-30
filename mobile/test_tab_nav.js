@@ -99,7 +99,8 @@ console.log('\n  (3) tabs never bypass the passcode gate or PIN-to-send');
       applyPenalty: /const applyPenalty = async \(\) => \{[\s\S]*?\n  \};/,
     };
     for (const [name, re] of Object.entries(defs)) {
-      const a = grab(base, re), b = grab(SRC, re);
+      // the ONE deliberate change since then: the rejection alert shows friendlyServerError(r.error) (invite code -> beta code); undo it to compare the rest byte-for-byte
+      const a = grab(base, re), b = grab(SRC, re).split('friendlyServerError(r.error)').join('r.error');
       check(a.length > 100 && a === b, `${name}() is byte-for-byte unchanged since the commit before the tab bar`);
     }
     const txModalOf = (t) => between(t, '<Modal visible={txModalVisible}', '</Modal>');
