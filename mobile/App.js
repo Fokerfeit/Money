@@ -421,6 +421,7 @@ const DomainStrip = () => (
 // field (onBetaCode). No mint logic here.
 const HumanCheckCard = ({ view, busy, onVerify, onBetaCode, onRecheck }) => {
   const T = humanCheck.TEXT;
+  const [privacyOpen, setPrivacyOpen] = useState(false);   // closed by default; same text when opened
   const at = (ms) => new Date(ms).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
   return (
     <View style={[s.onboardCard, glassOnboardCard, s.hcCard]}>
@@ -460,8 +461,16 @@ const HumanCheckCard = ({ view, busy, onVerify, onBetaCode, onRecheck }) => {
       )}
 
       <View style={s.hcPrivacy}>
-        <Text style={s.hcPrivacyTitle}>{T.privacyTitle}</Text>
-        <Text style={s.hcPrivacyText}>{T.privacy}</Text>
+        <TouchableOpacity
+          onPress={() => setPrivacyOpen((o) => !o)}
+          accessibilityRole="button"
+          accessibilityState={{ expanded: privacyOpen }}
+          activeOpacity={0.8}
+          style={s.hcPrivacyHead}>
+          <Text style={s.hcPrivacyTitle}>{T.privacyTitle}</Text>
+          <Text style={s.hcPrivacyChevron}>{privacyOpen ? '▲' : '▼'}</Text>
+        </TouchableOpacity>
+        {privacyOpen ? <Text style={s.hcPrivacyText}>{T.privacy}</Text> : null}
       </View>
 
       <TouchableOpacity onPress={onRecheck} disabled={busy} style={{ alignSelf: 'center', marginTop: 10, padding: 6 }}>
@@ -802,7 +811,7 @@ function AppInner() {
   const [authMethod,     setAuthMethod]     = useState('credential');
 
   // Terms checkboxes (step 1)
-  const [termChecks, setTermChecks] = useState([false, false, false]);
+  const [termChecks, setTermChecks] = useState([false, false]);
 
   // Face scan
   const [faceStepIdx,      setFaceStepIdx]      = useState(0);
@@ -2620,8 +2629,7 @@ function AppInner() {
   // ── Step 12: The Oath — first screen after the on-device keypair exists ──
   if (onboardingStep === 12) {
     const TERMS = [
-      'Allow face capture for identity sealing (hash only — image deleted immediately)',
-      'Allow device check (no personal data stored on any server)',
+      'Confirm it is you with your phone lock (fingerprint, face or PIN) — nothing biometric leaves your phone',
       'Swear: one seal per human — any forgery voids your MONEY',
     ];
     const allChecked = termChecks.every(Boolean);
@@ -2672,10 +2680,10 @@ function AppInner() {
                   {i === TERMS.length - 1 ? (
                     <View style={{ flex: 1, alignItems: 'flex-start' }}>
                       <Text style={s.termText}>{'Swear: one seal per human —'}</Text>
-                      <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 2 }}>
-                        <Text style={s.termText}>{'any forgery voids your '}</Text>
+                      <View style={{ flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', marginTop: 2 }}>
+                        <Text style={[s.termText, s.termInline]}>{'any forgery voids your '}</Text>
                         <MoneySymbol size={14} color="#D4AF37" style={{ marginHorizontal: 2 }} />
-                        <Text style={[s.termText, { color: '#D4AF37', fontWeight: 'bold' }]}>{'MONEY'}</Text>
+                        <Text style={[s.termText, s.termInline, { color: '#D4AF37', fontWeight: 'bold' }]}>{'MONEY'}</Text>
                       </View>
                     </View>
                   ) : (
@@ -2879,7 +2887,7 @@ function AppInner() {
             <CheckSeal size={80} />
           </View>
           <Text style={s.onboardTitle}>Seal Forged</Text>
-          <Text style={s.onboardSub}>Face ✅  Phone lock ✅</Text>
+          <Text style={s.onboardSub}>Phone lock ✅</Text>
           <View style={[s.onboardCard, glassOnboardCard]}>
             <Text style={s.onboardCardTitle}>YOUR STAR IS READY</Text>
             <Text style={s.onboardBody}>Your seal is forged.{'\n\n'}</Text>
@@ -3999,6 +4007,8 @@ const s = StyleSheet.create({
   },
   termCheck: { color: '#160B00', fontWeight: 'bold', fontSize: 14 },
   termText:  { color: '#8B7355', fontSize: 13, flex: 1, lineHeight: 20 },
+  // a termText that sizes to its own words (so the logo can sit right after it); NOT `flex: 0` — on web that collapses it to zero width
+  termInline: { flexGrow: 0, flexShrink: 1, flexBasis: 'auto' },
 
   // ── Camera / face scan ──────────────────────────────────────────────────
   cameraContainer:      { flex: 1, backgroundColor: '#060300', alignItems: 'center' },
@@ -4295,7 +4305,7 @@ const s = StyleSheet.create({
   // Bottom tab bar + panes + Back button (human-check job)
   pane:       { flex: 1 },
   paneHidden: { display: 'none' },
-  tabBar:     { flexDirection: 'row', backgroundColor: 'rgba(14,8,2,0.94)', borderTopWidth: 1, borderTopColor: 'rgba(212,175,55,0.35)' },
+  tabBar:     { flexDirection: 'row', zIndex: 10, backgroundColor: '#0E0802', borderTopWidth: 1, borderTopColor: 'rgba(212,175,55,0.35)' },
   tabItem:    { flex: 1, alignItems: 'center', justifyContent: 'center', paddingTop: 7, paddingBottom: 6, borderTopWidth: 2, borderTopColor: 'transparent' },
   tabItemActive: { borderTopColor: '#D4AF37', backgroundColor: 'rgba(90,55,10,0.45)' },
   tabIcon:    { fontSize: 19 },
@@ -4328,8 +4338,10 @@ const s = StyleSheet.create({
   hcBtnSub:  { color: '#C9A877', fontSize: 11, marginTop: 3, textAlign: 'center' },
   hcMock:    { color: '#EBC39B', fontSize: 11, textAlign: 'center', marginTop: 6 },
   hcPrivacy: { marginTop: 14, padding: 12, borderRadius: 12, backgroundColor: 'rgba(10,6,1,0.55)', borderWidth: 1, borderColor: 'rgba(212,175,55,0.15)' },
-  hcPrivacyTitle: { color: '#D4AF37', fontSize: 10, letterSpacing: 2, fontWeight: 'bold', marginBottom: 6 },
-  hcPrivacyText:  { color: '#B8956A', fontSize: 12, lineHeight: 18 },
+  hcPrivacyHead:  { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 2 },
+  hcPrivacyTitle: { color: '#D4AF37', fontSize: 10, letterSpacing: 2, fontWeight: 'bold' },
+  hcPrivacyChevron: { color: '#D4AF37', fontSize: 11 },
+  hcPrivacyText:  { color: '#B8956A', fontSize: 12, lineHeight: 18, marginTop: 8 },
   recipientRow: {
     flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 10,
   },

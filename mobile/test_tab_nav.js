@@ -198,5 +198,21 @@ console.log('\n  (7) the five tabs');
   check(nonAbout === 2, 'domainBar={false} stays on exactly two screens: the wallet shell and the first-launch About');
 }
 
+// ── Decorative layers (HoloFX / GlowOrbs) never cover the tab bar ──
+{
+  const bar = (SRC.match(/tabBar:\s*\{([^}]*)\}/) || [])[1] || '';
+  const bg = (bar.match(/backgroundColor:\s*'([^']+)'/) || [])[1] || '';
+  const opaque = /^#[0-9a-fA-F]{6}$/.test(bg) || /^rgba?\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*(,\s*1(\.0+)?)?\s*\)$/.test(bg);
+  check(opaque, 'tab bar background is fully opaque, so orbs / starfield / frame brackets behind it cannot show through', `backgroundColor: ${bg || '(none)'}`);
+  const z = Number((bar.match(/zIndex:\s*(\d+)/) || [])[1] || 0);
+  check(z >= 1, 'tab bar has a zIndex above the background layers');
+  const orbs = SRC.slice(SRC.indexOf('const GlowOrbs ='), SRC.indexOf('// ── Expanding pulse ring'));
+  check(/pointerEvents="none"/.test(orbs) && !/zIndex/.test(orbs), 'GlowOrbs (phone build) is decorative: pointerEvents none, no zIndex that could lift it over the bar');
+  const MAINR = SRC.slice(SRC.indexOf('  const reward    = calcReward(userCount);'));
+  const iOrbs = MAINR.indexOf('<GlowOrbs />'), iBar = MAINR.indexOf('<TabBar model=');
+  check(iOrbs > 0 && iBar > iOrbs, 'in the main screen GlowOrbs is drawn first and the TabBar last, so the bar is on top');
+  check(/<AppInner \/>/.test(SRC) && SRC.indexOf('<DepthFrame />') < SRC.indexOf('<AppInner />') && SRC.indexOf('<HoloBackground') < SRC.indexOf('<AppInner />'), 'HoloBackground + DepthFrame are mounted BEFORE the app, i.e. underneath it');
+}
+
 console.log(`\n  ${fails === 0 ? '🎉' : '💥'}  Tab bar: ${fails === 0 ? 'ALL PROBES PASS' : fails + ' FAILURE(S)'}\n`);
 process.exit(fails === 0 ? 0 : 1);

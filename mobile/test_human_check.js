@@ -191,5 +191,17 @@ console.log('\n  (4) protected files + server proposal');
   }
 }
 
+// ── "What the passport check shares" is tap-to-expand, closed by default ──
+{
+  const CARD2 = between('const HumanCheckCard =', '// ── PhoneNodeStatus');
+  const hdr = CARD2.indexOf('{T.privacyTitle}'), body = CARD2.indexOf('{T.privacy}');
+  check(/const \[privacyOpen, setPrivacyOpen\] = useState\(false\)/.test(CARD2), 'privacy section starts CLOSED (useState(false))');
+  check(hdr > 0 && body > hdr && /\{privacyOpen \? <Text style=\{s\.hcPrivacyText\}>\{T\.privacy\}<\/Text> : null\}/.test(CARD2), 'title is always shown; the full text is rendered ONLY when open');
+  check(/onPress=\{\(\) => setPrivacyOpen\(\(o\) => !o\)\}/.test(CARD2) && /accessibilityState=\{\{ expanded: privacyOpen \}\}/.test(CARD2), 'tapping the title toggles it; screen readers are told expanded/collapsed');
+  check(/\{privacyOpen \? '▲' : '▼'\}/.test(CARD2), 'a ▼/▲ chevron shows it can be tapped');
+  check((CARD2.match(/\{T\.privacy\}/g) || []).length === 1, 'the text is the same single T.privacy string (nothing reworded or duplicated)');
+  check(/confirmAsync\([\s\S]*?humanCheck\.TEXT\.privacy[\s\S]*?'Open Self'/.test(SRC), 'Verify still shows the FULL privacy text before opening Self, whether or not the section was expanded');
+}
+
 console.log(`\n  ${fails === 0 ? '🎉' : '💥'}  Human check: ${fails === 0 ? 'ALL PROBES PASS' : fails + ' FAILURE(S)'}\n`);
 process.exit(fails === 0 ? 0 : 1);
