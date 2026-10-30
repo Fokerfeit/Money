@@ -143,6 +143,7 @@ import {
 import QRCode from 'react-native-qrcode-svg';
 import * as Clipboard from 'expo-clipboard';
 import { nodeIndicator } from './phone_node';
+import * as humanCheck from './human_check';
 import {
   useHoloBackground, useHoloTransition, HoloBackground, DepthFrame, useTilt,
   glassCard, glassButton, glassOnboardCard, glassTermBox,
@@ -412,6 +413,62 @@ const DomainStrip = () => (
     <Text style={s.domainStripText}>moneyforeveryone.app</Text>
   </View>
 );
+
+// ── HumanCheckCard — "🛂 Prove you're human" (About screen) ──────────────────
+// Renders humanCheckView() (human_check.js). It only READS status and routes the
+// buttons: Verify → the Self app (onVerify), beta code → the existing invite-code
+// field (onBetaCode). No mint logic here.
+const HumanCheckCard = ({ view, busy, onVerify, onBetaCode, onRecheck }) => {
+  const T = humanCheck.TEXT;
+  const at = (ms) => new Date(ms).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+  return (
+    <View style={[s.onboardCard, glassOnboardCard, s.hcCard]}>
+      <Text style={s.hcTitle}>{T.title}</Text>
+      <Text style={s.hcBody}>{T.intro}</Text>
+
+      <View style={s.hcRows}>
+        {view.rows.map((r) => (
+          <View key={r.net} style={[s.hcRow, r.active && s.hcRowActive]}>
+            <Text style={s.hcNet}>{r.label}</Text>
+            <View style={{ alignItems: 'flex-end' }}>
+              <Text style={[s.hcState, r.state === 'yes' ? s.hcYes : s.hcWait]}>{busy && !r.cachedAt && r.state === 'unknown' ? '⏳ Checking…' : r.line}</Text>
+              {r.cachedAt ? <Text style={s.hcCached}>saved {at(r.cachedAt)} · couldn't refresh</Text> : null}
+            </View>
+          </View>
+        ))}
+      </View>
+
+      {view.joined ? (
+        <Text style={s.hcJoined}>{view.joinedLine}</Text>
+      ) : (
+        <>
+          <TouchableOpacity
+            disabled={!view.verify.enabled}
+            onPress={onVerify}
+            activeOpacity={0.8}
+            style={[s.hcBtn, view.verify.enabled ? s.hcBtnOn : s.hcBtnOff]}>
+            <Text style={[s.hcBtnText, { color: view.verify.enabled ? '#1A0A00' : '#7A5C3A' }]}>{view.verify.label}</Text>
+            {view.verify.sub ? <Text style={s.hcBtnSub}>{view.verify.sub}</Text> : null}
+          </TouchableOpacity>
+          {view.mock ? <Text style={s.hcMock}>{T.mock}</Text> : null}
+          <TouchableOpacity onPress={onBetaCode} activeOpacity={0.8} style={[s.hcBtn, s.hcBtnBeta]}>
+            <Text style={s.hcBtnText}>{view.beta.label}</Text>
+            <Text style={s.hcBtnSub}>{view.beta.sub}</Text>
+          </TouchableOpacity>
+        </>
+      )}
+
+      <View style={s.hcPrivacy}>
+        <Text style={s.hcPrivacyTitle}>{T.privacyTitle}</Text>
+        <Text style={s.hcPrivacyText}>{T.privacy}</Text>
+      </View>
+
+      <TouchableOpacity onPress={onRecheck} disabled={busy} style={{ alignSelf: 'center', marginTop: 10, padding: 6 }}>
+        <Text style={{ color: busy ? '#5A3D1A' : '#D4AF37', fontSize: 12, letterSpacing: 0.5 }}>{busy ? 'Checking…' : T.recheck}</Text>
+      </TouchableOpacity>
+    </View>
+  );
+};
 
 // ── PhoneNodeStatus — "⛏️ PHONE NODE" (tester feedback Oct 8, item C) ────────
 // What it shows comes ONLY from nodeIndicator() (phone_node.js) applied to the
@@ -1641,6 +1698,99 @@ function AppInner() {
     } catch { return null; }
   };
 
+  // ── 🛂 Human check (About card) — READ-ONLY: status + routing, no mint logic ──
+  // ✅/⏳ per network come from that network's ledger (a FAUCET → wallet entry, the
+  // same proof ignitedOnServer uses); the result is cached on the phone for display
+  // only. The passport button follows GET /ignite/self/status on that network.
+  const [humanStatus, setHumanStatus] = useState(null);   // mergeStatus().shown
+  const [humanGate,   setHumanGate]   = useState({});     // { [net]: status body | null }
+  const [humanBusy,   setHumanBusy]   = useState(false);
+  const walletCodeInputRef = useRef(null);
+  const focusWalletCodeRef = useRef(false);
+  // About jump-chips: where each card sits in the scroll content, and the chip bar height.
+  const aboutScrollRef = useRef(null);
+  const aboutY = useRef({});
+  const aboutChipsH = useRef(0);
+
+  // GET → parsed JSON, or null for anything that isn't a readable 2xx JSON answer.
+  const getJson = async (url, ms = 8000) => {
+    const ctrl = new AbortController(); const t = setTimeout(() => ctrl.abort(), ms);
+    try {
+      const res = await fetch(url, { signal: ctrl.signal });
+      if (!res.ok) return null;
+      return await res.json();
+    } catch { return null; } finally { clearTimeout(t); }
+  };
+
+  const checkHumanStatus = async () => {
+    if (IS_WEB) return;
+    setHumanBusy(true);
+    try {
+      const urls = { testnet: TESTNET_URL, mainnet: MAINNET_URL };
+      const fresh = {}, gate = {};
+      await Promise.all(humanCheck.NETWORKS.map(async (net) => {
+        // Read-only peek at the stored PUBLIC address — never forges a wallet here.
+        let wallet = humanCheck.walletAddress(await SecureStore.getItemAsync(walletKey(net)).catch(() => null));
+        if (!wallet && net === getNetwork() && addrRef.current) wallet = addrRef.current;
+        let state = 'none';
+        if (wallet) {
+          state = humanCheck.joinedFromTxs(await getJson(`${urls[net]}/tx?from=FAUCET&to=${wallet}&limit=1`), wallet);
+          if (state === 'unknown') state = humanCheck.joinedFromTxs(await getJson(`${urls[net]}/ledger`, 10_000), wallet);
+        }
+        fresh[net] = { wallet, state };
+        gate[net] = await getJson(`${urls[net]}/ignite/self/status`);
+      }));
+      let cache = null;
+      try { cache = JSON.parse(await AsyncStorage.getItem(humanCheck.CACHE_KEY)); } catch {}
+      const { shown, nextCache } = humanCheck.mergeStatus(fresh, cache, Date.now());
+      await AsyncStorage.setItem(humanCheck.CACHE_KEY, JSON.stringify(nextCache)).catch(() => {});
+      setHumanStatus(shown);
+      setHumanGate(gate);
+      // A passport ignition lands server-side — let the wallet pick it up too.
+      if (shown[getNetwork()] && shown[getNetwork()].state === 'yes') sync();
+    } finally {
+      setHumanBusy(false);
+    }
+  };
+
+  // Check whenever About opens, and again when the user comes back from the Self app.
+  useEffect(() => {
+    if (!showAboutScreen) return undefined;
+    checkHumanStatus();
+    const sub = AppState.addEventListener('change', (next) => { if (next === 'active') checkHumanStatus(); });
+    return () => sub.remove();
+  }, [showAboutScreen]);
+
+  // "I have a beta code" from the wallet → land on the existing invite-code box.
+  useEffect(() => {
+    if (showAboutScreen || !focusWalletCodeRef.current) return undefined;
+    focusWalletCodeRef.current = false;
+    const t = setTimeout(() => { try { walletCodeInputRef.current && walletCodeInputRef.current.focus(); } catch {} }, 400);
+    return () => clearTimeout(t);
+  }, [showAboutScreen]);
+
+  const verifyWithPassport = async () => {
+    const net = getNetwork();
+    const wallet = addrRef.current;
+    if (!wallet) return;
+    const go = await confirmAsync(
+      `Verify on ${humanCheck.NET_LABEL[net]}?`,
+      `${humanCheck.TEXT.privacy}\n\nWallet: ${wallet}`,
+      'Open Self',
+    );
+    if (!go) return;
+    const j = await getJson(`${BACKEND_URL}/ignite/self/link?wallet=${wallet}`);
+    if (getNetwork() !== net || addrRef.current !== wallet) {
+      return Alert.alert('Network changed', 'The network changed while you were confirming — nothing was opened.');
+    }
+    if (!humanCheck.isSelfLink(j && j.link)) {
+      return Alert.alert('Couldn\'t start the passport check', `${netName(net)} didn't send a Self link — nothing was opened. Use a beta code for now.`);
+    }
+    const { Linking } = require('react-native');
+    try { await Linking.openURL(j.link); }
+    catch { Alert.alert('Couldn\'t open Self', 'Install the free Self app, then tap Verify again.'); }
+  };
+
   // (claim() reuses the restore guard's confirmAsync(title, message, confirmText) below.)
 
   const triggerIgnition = async () => {
@@ -2113,11 +2263,32 @@ function AppInner() {
 
   if (showAboutScreen) {
     const openLink = (url) => { const { Linking } = require('react-native'); Linking.openURL(url); };
+    const inWallet = onboardingStep === 0 && !!address;
+    const hcView = humanCheck.humanCheckView({ status: humanStatus, gate: humanGate, network, inWallet });
+    const onBetaCode = async () => {
+      // From the wallet: the invite-code box right there. At first launch: carry on
+      // with setup — the same box comes right after the seal (step 4).
+      if (hcView.beta && hcView.beta.action === 'focus-wallet-code') focusWalletCodeRef.current = true;
+      await closeAboutScreen();
+    };
+    // Sticky tap-to-jump chips → one per card (the y comes from each card's onLayout).
+    const ABOUT_CHIPS = [
+      ['human', '🛂 Human check'], ['what', 'What is this?'], ['who', 'Who made this?'],
+      ['safe', 'Is it safe?'], ['better', 'Builds it better?'], ['trust', 'Why trust it?'],
+    ];
+    const markY = (key) => (e) => { aboutY.current[key] = e.nativeEvent.layout.y; };
+    const jumpTo = (key) => {
+      const y = aboutY.current[key];
+      if (Number.isFinite(y) && aboutScrollRef.current) aboutScrollRef.current.scrollTo({ y: Math.max(0, y - aboutChipsH.current - 6), animated: true });
+    };
 
     return (
-      <ScreenWrapper>
+      // Pinned glass domain strip (as on the wallet) instead of the floating one,
+      // so the sticky jump-chips park right under it instead of beneath its text.
+      <ScreenWrapper domainBar={false}>
       <SafeAreaView style={s.root}>
-        <ScrollView contentContainerStyle={[s.onboardScroll, { paddingBottom: 40 }]}>
+        <DomainStrip />
+        <ScrollView ref={aboutScrollRef} stickyHeaderIndices={[1]} contentContainerStyle={[s.onboardScroll, { paddingBottom: 40 }]}>
 
           {/* Header — plain logo, no clock/ticks */}
           <View style={{ alignItems: 'center', paddingTop: 24, paddingBottom: 8 }}>
@@ -2126,26 +2297,51 @@ function AppInner() {
             <Text style={[s.onboardSub, { color: '#9A7B4A', fontSize: 13 }]}>The Honest Version</Text>
           </View>
 
+          {/* Sticky jump-chips (child index 1 = stickyHeaderIndices) */}
+          <View style={s.chipBar} onLayout={(e) => { aboutChipsH.current = e.nativeEvent.layout.height; }}>
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ paddingHorizontal: 10 }}>
+              {ABOUT_CHIPS.map(([key, label]) => (
+                <TouchableOpacity key={key} onPress={() => jumpTo(key)} activeOpacity={0.75} style={[s.chip, key === 'human' && s.chipHuman]}>
+                  <Text style={[s.chipText, key === 'human' && { color: '#F5E6C8' }]}>{label}</Text>
+                </TouchableOpacity>
+              ))}
+            </ScrollView>
+          </View>
+
           <GoldDivider width={width - 40} opacity={0.5} />
 
+          {/* ── 🛂 Prove you're human — status ✅/⏳ per network + Verify / beta code ── */}
+          <View onLayout={markY('human')} style={{ width: '100%' }}>
+            <HumanCheckCard
+              view={hcView}
+              busy={humanBusy}
+              onVerify={verifyWithPassport}
+              onBetaCode={onBetaCode}
+              onRecheck={checkHumanStatus}
+            />
+          </View>
+
           {/* ── Tile 1: What is this? ── */}
+          <View onLayout={markY('what')} style={{ width: '100%' }}>
           <WobbleTile delay={0}>
             <View style={[s.onboardCard, glassOnboardCard, { alignItems: 'center', marginTop: 18 }]}>
               <ClayWhatIsThis size={130} />
               <Text style={[s.onboardCardTitle, { marginTop: 12, fontSize: 15 }]}>What is this?</Text>
               <View style={{ flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', marginTop: 6 }}>
                 <Text style={[s.onboardBody, { textAlign: 'center', lineHeight: 20 }]}>
-                  {'Every verified human gets 1,000,000 '}
+                  {'Every verified human will get 1,000,000 '}
                 </Text>
                 <MoneySymbol size={14} color="#D4AF37" style={{ marginTop: 2 }} />
                 <Text style={[s.onboardBody, { textAlign: 'center', lineHeight: 20 }]}>
-                  {' MONEY. That\'s it. No mining. No watching ads. You prove you\'re a real person, it\'s yours.'}
+                  {' MONEY. During testing, joining needs a beta code; the passport check is coming.'}
                 </Text>
               </View>
             </View>
           </WobbleTile>
+          </View>
 
           {/* ── Tile 2: Who made this? ── */}
+          <View onLayout={markY('who')} style={{ width: '100%' }}>
           <WobbleTile delay={400}>
             <View style={[s.onboardCard, glassOnboardCard, { alignItems: 'center', marginTop: 18 }]}>
               <ClayWhoMadeThis size={130} />
@@ -2153,18 +2349,21 @@ function AppInner() {
               <Text style={[s.onboardBody, { textAlign: 'center', marginTop: 6, lineHeight: 20 }]}>
                 {'One person built the first version — Luca Urbani. An average dude wearing a hoodie and joggings. He was tired of the scams, the ads and the lies.'}
               </Text>
-              <View style={{ flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', marginTop: 8 }}>
-                <Text style={[s.onboardBody, { textAlign: 'center', lineHeight: 20 }]}>{'He got 1,000,000 '}</Text>
-                <MoneySymbol size={14} color="#D4AF37" style={{ marginTop: 3 }} />
-                <Text style={[s.onboardBody, { textAlign: 'center', lineHeight: 20 }]}>{' — the same as you. No secret stash. No hidden advantage. Being first was the only reward.'}</Text>
-              </View>
+              <Text style={[s.onboardBody, { textAlign: 'center', marginTop: 8, lineHeight: 20 }]}>
+                {'During testing the founder runs several test wallets — every one is listed in the founder statement. Before public launch he holds one share, like everyone else.'}
+              </Text>
+              <TouchableOpacity style={{ marginTop: 10 }} onPress={() => openLink('https://github.com/Fokerfeit/Money#founder-statement')}>
+                <Text style={{ color: '#D4AF37', fontSize: 13, letterSpacing: 0.5 }}>Founder statement →</Text>
+              </TouchableOpacity>
               <TouchableOpacity style={{ marginTop: 10 }} onPress={() => openLink('https://m.facebook.com/Luca.Urbani007/')}>
                 <Text style={{ color: '#D4AF37', fontSize: 13, letterSpacing: 0.5 }}>Meet Luca →</Text>
               </TouchableOpacity>
             </View>
           </WobbleTile>
+          </View>
 
           {/* ── Tile 3: Is it safe? ── */}
+          <View onLayout={markY('safe')} style={{ width: '100%' }}>
           <WobbleTile delay={800}>
             <View style={[s.onboardCard, glassOnboardCard, { alignItems: 'center', marginTop: 18 }]}>
               <ClayIsItSafe size={130} />
@@ -2172,15 +2371,17 @@ function AppInner() {
               <View style={{ flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', marginTop: 6 }}>
                 <Text style={[s.onboardBody, { textAlign: 'center', lineHeight: 20 }]}>{'Right now your '}</Text>
                 <MoneySymbol size={14} color="#D4AF37" style={{ marginTop: 3 }} />
-                <Text style={[s.onboardBody, { textAlign: 'center', lineHeight: 20 }]}>{' lives on one computer in Germany — the initial node. That\'s the honest truth. The dream is for it to live on your phone, so no single person, company, or government can touch it. You can run the node yourself — the code is open source.'}</Text>
+                <Text style={[s.onboardBody, { textAlign: 'center', lineHeight: 20 }]}>{' lives on one computer in Germany — the initial node. That\'s the honest truth. The dream is for it to live on your phone, so no single person, company, or government can touch it. You can run the node yourself — the code is open source — but joining the network needs an invite during testing.'}</Text>
               </View>
               <TouchableOpacity style={{ marginTop: 10 }} onPress={() => openLink('https://github.com/Fokerfeit/Money')}>
                 <Text style={{ color: '#D4AF37', fontSize: 13, letterSpacing: 0.5 }}>See the code →</Text>
               </TouchableOpacity>
             </View>
           </WobbleTile>
+          </View>
 
           {/* ── Tile 4: What if someone builds it better? ── */}
+          <View onLayout={markY('better')} style={{ width: '100%' }}>
           <WobbleTile delay={1200}>
             <View style={[s.onboardCard, glassOnboardCard, { alignItems: 'center', marginTop: 18 }]}>
               <ClayBuildItBetter size={130} />
@@ -2190,8 +2391,10 @@ function AppInner() {
               </Text>
             </View>
           </WobbleTile>
+          </View>
 
           {/* ── Tile 5: Why should I trust it? ── */}
+          <View onLayout={markY('trust')} style={{ width: '100%' }}>
           <WobbleTile delay={1600}>
             <View style={[s.onboardCard, glassOnboardCard, { alignItems: 'center', marginTop: 18 }]}>
               <ClayWhyTrust size={130} />
@@ -2201,6 +2404,7 @@ function AppInner() {
               </Text>
             </View>
           </WobbleTile>
+          </View>
 
           <GoldDivider width={280} opacity={0.3} style={{ marginTop: 24 }} />
 
@@ -2367,7 +2571,7 @@ function AppInner() {
               {hasFingerprint
                 ? <Text style={s.onboardBody}>① Fingerprint seal</Text>
                 : <Text style={s.onboardBody}>① {authLabel} confirmation</Text>}
-              <Text style={s.onboardBody}>② Enter your invite code</Text>
+              <Text style={s.onboardBody}>② Enter your beta code</Text>
               <View style={{ flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', marginBottom: 4 }}>
                 <Text style={s.onboardBody}>③ IGNITION — </Text>
                 <MoneySymbol size={14} color="#B8956A" style={{ marginHorizontal: 3 }} />
@@ -2610,7 +2814,7 @@ function AppInner() {
               <MoneySymbol size={13} color="#B8956A" style={{ marginRight:4, marginTop:2 }} />
               <Text style={[s.onboardBody, { flex:1 }]}>1,000,000 is waiting in the Common Treasury.</Text>
             </View>
-            <Text style={s.onboardBody}>{'\n'}Enter your invite code, then press IGNITE to claim your founding share.</Text>
+            <Text style={s.onboardBody}>{'\n'}Enter your beta code, then press IGNITE to claim your founding share.</Text>
           </View>
 
           {/* Network picker (beta): TESTNET pre-selected on entry (see the step-4
@@ -2649,12 +2853,12 @@ function AppInner() {
           {/* Invite (ignition) code — the server's one-per-human faucet gate */}
           <View style={{ width: '100%', marginBottom: 14, paddingHorizontal: 24 }}>
             <Text style={{ color: '#9A7B4A', fontSize: 11, letterSpacing: 3, textAlign: 'center', marginBottom: 8 }}>
-              ✦ INVITE CODE
+              ✦ BETA CODE
             </Text>
             <TextInput
               value={ignitionCode}
               onChangeText={setIgnitionCode}
-              placeholder="enter your invite code"
+              placeholder="enter your beta code"
               placeholderTextColor="#5A3D1A"
               autoCapitalize="characters"
               autoCorrect={false}
@@ -3247,12 +3451,13 @@ function AppInner() {
                 first-time onboarding. */}
             <View style={{ width: '100%', marginBottom: 10, paddingHorizontal: 16 }}>
               <Text style={{ color: '#9A7B4A', fontSize: 11, letterSpacing: 3, textAlign: 'center', marginBottom: 8 }}>
-                ✦ INVITE CODE
+                ✦ BETA CODE
               </Text>
               <TextInput
+                ref={walletCodeInputRef}
                 value={ignitionCode}
                 onChangeText={setIgnitionCode}
-                placeholder="enter your invite code"
+                placeholder="enter your beta code"
                 placeholderTextColor="#5A3D1A"
                 autoCapitalize="characters"
                 autoCorrect={false}
@@ -3962,6 +4167,33 @@ const s = StyleSheet.create({
   nodeDot:    { width: 10, height: 10, borderRadius: 5, backgroundColor: '#7DB87A', marginRight: 12 },
   nodeTitle:  { fontSize: 12, fontWeight: 'bold', letterSpacing: 1.5 },
   nodeSub:    { fontSize: 12, lineHeight: 16, marginTop: 2 },
+  // About: sticky jump-chips + 🛂 human-check card
+  chipBar:   { paddingVertical: 8, backgroundColor: 'rgba(14,8,2,0.92)', borderBottomWidth: 1, borderBottomColor: 'rgba(212,175,55,0.28)' },
+  chip:      { marginHorizontal: 4, paddingVertical: 7, paddingHorizontal: 12, borderRadius: 16, borderWidth: 1, borderColor: 'rgba(212,175,55,0.35)', backgroundColor: 'rgba(28,17,4,0.85)' },
+  chipHuman: { backgroundColor: 'rgba(90,55,10,0.9)', borderColor: 'rgba(255,236,175,0.6)' },
+  chipText:  { color: '#E8C87A', fontSize: 12, letterSpacing: 0.4 },
+  hcCard:    { marginTop: 18, alignItems: 'stretch', backgroundColor: 'rgba(20,12,3,0.88)', borderColor: 'rgba(212,175,55,0.45)' },
+  hcTitle:   { color: '#D4AF37', fontSize: 17, fontWeight: 'bold', textAlign: 'center', letterSpacing: 0.5 },
+  hcBody:    { color: '#C9A877', fontSize: 13, lineHeight: 19, textAlign: 'center', marginTop: 6 },
+  hcRows:    { marginTop: 14, borderRadius: 12, borderWidth: 1, borderColor: 'rgba(212,175,55,0.2)', overflow: 'hidden' },
+  hcRow:     { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 10, paddingHorizontal: 12, backgroundColor: 'rgba(28,17,4,0.55)' },
+  hcRowActive: { backgroundColor: 'rgba(90,55,10,0.35)' },
+  hcNet:     { color: '#E8C87A', fontSize: 12, fontWeight: 'bold', letterSpacing: 1 },
+  hcState:   { fontSize: 13, fontWeight: 'bold' },
+  hcYes:     { color: '#7DB87A' },
+  hcWait:    { color: '#C9A877' },
+  hcCached:  { color: '#8B7355', fontSize: 10, marginTop: 2 },
+  hcJoined:  { color: '#7DB87A', fontSize: 14, fontWeight: 'bold', textAlign: 'center', marginTop: 14 },
+  hcBtn:     { marginTop: 12, paddingVertical: 12, paddingHorizontal: 14, borderRadius: 14, borderWidth: 1.5, alignItems: 'center' },
+  hcBtnOn:   { backgroundColor: '#C9A832', borderColor: 'rgba(255,242,200,0.9)', borderBottomColor: 'rgba(70,42,4,0.85)' },
+  hcBtnOff:  { backgroundColor: 'rgba(28,17,4,0.6)', borderColor: 'rgba(154,123,74,0.3)' },
+  hcBtnBeta: { backgroundColor: 'rgba(90,55,10,0.85)', borderColor: 'rgba(255,236,175,0.6)', borderBottomColor: 'rgba(70,42,4,0.85)' },
+  hcBtnText: { color: '#F5E6C8', fontSize: 14, fontWeight: 'bold', letterSpacing: 0.8 },
+  hcBtnSub:  { color: '#C9A877', fontSize: 11, marginTop: 3, textAlign: 'center' },
+  hcMock:    { color: '#EBC39B', fontSize: 11, textAlign: 'center', marginTop: 6 },
+  hcPrivacy: { marginTop: 14, padding: 12, borderRadius: 12, backgroundColor: 'rgba(10,6,1,0.55)', borderWidth: 1, borderColor: 'rgba(212,175,55,0.15)' },
+  hcPrivacyTitle: { color: '#D4AF37', fontSize: 10, letterSpacing: 2, fontWeight: 'bold', marginBottom: 6 },
+  hcPrivacyText:  { color: '#B8956A', fontSize: 12, lineHeight: 18 },
   recipientRow: {
     flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 10,
   },

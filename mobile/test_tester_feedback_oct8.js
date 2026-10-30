@@ -71,9 +71,12 @@ const HOLO = fs.readFileSync(path.join(__dirname, 'HoloFX.js'), 'utf8').replace(
     check(/<View nativeID="app-header" style=\{\[glassCard, s\.header\]\}>/.test(stripped), 'the header is drawn with the cards\' own glassCard style');
     const hdr = fnText(/ {2}header: \{[\s\S]*?\n {2}\},/);
     check(!/#130A00/.test(hdr) && /marginHorizontal: 16/.test(hdr) && /borderBottomWidth: 4/.test(hdr), 'the solid edge-to-edge #130A00 block is gone — inset 16 dp, same bevel as the cards');
-    check((stripped.match(/<ScreenWrapper domainBar=\{false\}>/g) || []).length === 1 && /<ScreenWrapper domainBar=\{false\}>\n {4}<SafeAreaView style=\{s\.root\}>\n {6}<GlowOrbs \/>/.test(SRC),
-      'only the wallet screen swaps the floating domain text for its own strip (every other screen unchanged)');
-    const iStrip = SRC.indexOf('<DomainStrip />'), iKS = SRC.indexOf('<KeyboardSafe', iStrip);
+    // (human-check job: the About screen pins the same strip, so its sticky jump-chips
+    //  park under it — still exactly these two screens, every other screen unchanged)
+    check((stripped.match(/<ScreenWrapper domainBar=\{false\}>/g) || []).length === 2 && /<ScreenWrapper domainBar=\{false\}>\n {4}<SafeAreaView style=\{s\.root\}>\n {6}<GlowOrbs \/>/.test(SRC)
+      && /<ScreenWrapper domainBar=\{false\}>\n {6}<SafeAreaView style=\{s\.root\}>\n {8}<DomainStrip \/>\n {8}<ScrollView ref=\{aboutScrollRef\}/.test(SRC),
+      'only the wallet + About screens swap the floating domain text for the pinned strip (every other screen unchanged)');
+    const iStrip = SRC.indexOf('<DomainStrip />', SRC.indexOf('<GlowOrbs />\n')), iKS = SRC.indexOf('<KeyboardSafe', iStrip);
     check(iStrip > 0 && iKS > iStrip && SRC.slice(iStrip, iKS).split('\n').length < 6, 'DomainStrip sits in the layout ABOVE the scroll view → pinned while the wallet scrolls, content never under its text');
     check(/domainStrip: +\{[^}]*backgroundColor: 'rgba\(14,8,2,0\.78\)'/.test(stripped) && /<Text style=\{s\.domainStripText\}>moneyforeveryone\.app<\/Text>/.test(stripped), 'the strip has its own glass backing');
     check(/\{Platform\.OS !== 'web' && domainBar && \(/.test(stripped), 'ScreenWrapper keeps the floating domain text for all other screens (domainBar defaults to true)');
