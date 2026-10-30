@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import {
   View, Text, TextInput, Alert, StyleSheet, ScrollView,
   TouchableOpacity, Pressable, Share, Image, AppState,
-  Dimensions, Modal, Animated, Platform, KeyboardAvoidingView, RefreshControl,
+  Dimensions, Modal, Animated, Platform, KeyboardAvoidingView, RefreshControl, Keyboard,
 } from 'react-native';
 // Real safe-area insets on Android too (tester batch, item 8). react-native's own
 // SafeAreaView only pads on iOS; with edgeToEdgeEnabled the app draws under the
@@ -144,6 +144,7 @@ import QRCode from 'react-native-qrcode-svg';
 import * as Clipboard from 'expo-clipboard';
 import { nodeIndicator } from './phone_node';
 import * as humanCheck from './human_check';
+import { routeOf, tabBarModel, restoreBackLabel } from './tab_nav';
 import {
   useHoloBackground, useHoloTransition, HoloBackground, DepthFrame, useTilt,
   glassCard, glassButton, glassOnboardCard, glassTermBox,
@@ -551,6 +552,51 @@ const BuildTag = () => {
   );
 };
 
+// ── Bottom tab bar (human-check job) ────────────────────────────────────────
+// useKeyboardOpen: the bar steps aside while the keyboard is up.
+function useKeyboardOpen() {
+  const [open, setOpen] = useState(false);
+  useEffect(() => {
+    const ios = Platform.OS === 'ios';
+    const a = Keyboard.addListener(ios ? 'keyboardWillShow' : 'keyboardDidShow', () => setOpen(true));
+    const b = Keyboard.addListener(ios ? 'keyboardWillHide' : 'keyboardDidHide', () => setOpen(false));
+    return () => { a.remove(); b.remove(); };
+  }, []);
+  return open;
+}
+
+// TabBar draws tabBarModel() (tab_nav.js) — nothing else. A tab press only calls
+// onSelect(key): no lock, passcode, signing or send logic is reachable from here.
+// It sits INSIDE the screen's safe-area view, so it rides above the Android
+// navigation buttons.
+const TabBar = ({ model, onSelect }) => {
+  if (!model.visible) return null;
+  return (
+    <View style={s.tabBar} accessibilityRole="tablist">
+      {model.tabs.map((t) => (
+        <TouchableOpacity
+          key={t.key}
+          accessibilityRole="tab"
+          accessibilityLabel={t.label}
+          accessibilityState={{ selected: t.active }}
+          onPress={() => onSelect(t.key)}
+          activeOpacity={0.75}
+          style={[s.tabItem, t.active && s.tabItemActive]}>
+          <Text style={[s.tabIcon, !t.active && { opacity: 0.55 }]}>{t.icon}</Text>
+          <Text style={[s.tabLabel, t.active && s.tabLabelActive]}>{t.label}</Text>
+        </TouchableOpacity>
+      ))}
+    </View>
+  );
+};
+
+// A clear way out of Back up (50) / Restore (51), where the tab bar is hidden.
+const BackButton = ({ label, onPress }) => (
+  <TouchableOpacity onPress={onPress} accessibilityRole="button" activeOpacity={0.75} style={s.backBtn}>
+    <Text style={s.backBtnText}>← {label}</Text>
+  </TouchableOpacity>
+);
+
 // ── NavRow — the way out of an onboarding screen (Oct device test, item 3) ───
 const NavRow = ({ onBack, onRestore }) => (
   <View style={{ alignItems: 'center', marginTop: 18, gap: 10 }}>
@@ -745,6 +791,7 @@ function AppInner() {
   // 99=reAuth | 0=mainApp
   const [onboardingStep,  setOnboardingStep]  = useState(null);
   const [showAboutScreen, setShowAboutScreen] = useState(false);
+  const [mainTab, setMainTab] = useState('wallet');   // wallet | ledger | contacts | human | about
   // ── Intro video ───────────────────────────────────────────────────────
   const [showIntroVideo,  setShowIntroVideo]  = useState(true);   // plays on first launch only
   const [introFirstTime,  setIntroFirstTime]  = useState(true);  // false if seen before
@@ -1497,6 +1544,14 @@ function AppInner() {
     } catch (e) { setSettingsMsg(e.message); }
   };
 
+  // Leave Restore (51) → wherever opened it (the wallet when opened from there).
+  const leaveRestore = () => {
+    setSeedInput(''); setRestorePreview(null);
+    const back = restoreBackTarget(restoreReturnTo.current, isIgnitedRef.current);
+    restoreReturnTo.current = null;
+    setOnboardingStep(back);
+  };
+
   // Open Restore (51) remembering where we came from (item 3).
   const openRestore = (from) => {
     restoreReturnTo.current = from;
@@ -1711,6 +1766,9 @@ function AppInner() {
   const aboutScrollRef = useRef(null);
   const aboutY = useRef({});
   const aboutChipsH = useRef(0);
+  const keyboardOpen = useKeyboardOpen();
+  // The lock screen always wins (routeOf) — and after an unlock you land on the Wallet tab.
+  useEffect(() => { if (onboardingStep === 99) setMainTab('wallet'); }, [onboardingStep]);
 
   // GET → parsed JSON, or null for anything that isn't a readable 2xx JSON answer.
   const getJson = async (url, ms = 8000) => {
@@ -1755,19 +1813,19 @@ function AppInner() {
 
   // Check whenever About opens, and again when the user comes back from the Self app.
   useEffect(() => {
-    if (!showAboutScreen) return undefined;
+    if (!showAboutScreen && !(onboardingStep === 0 && mainTab === 'human')) return undefined;
     checkHumanStatus();
     const sub = AppState.addEventListener('change', (next) => { if (next === 'active') checkHumanStatus(); });
     return () => sub.remove();
-  }, [showAboutScreen]);
+  }, [showAboutScreen, mainTab, onboardingStep]);
 
   // "I have a beta code" from the wallet → land on the existing invite-code box.
   useEffect(() => {
-    if (showAboutScreen || !focusWalletCodeRef.current) return undefined;
+    if (showAboutScreen || mainTab !== 'wallet' || !focusWalletCodeRef.current) return undefined;
     focusWalletCodeRef.current = false;
     const t = setTimeout(() => { try { walletCodeInputRef.current && walletCodeInputRef.current.focus(); } catch {} }, 400);
     return () => clearTimeout(t);
-  }, [showAboutScreen]);
+  }, [showAboutScreen, mainTab]);
 
   const verifyWithPassport = async () => {
     const net = getNetwork();
@@ -2261,33 +2319,41 @@ function AppInner() {
     setShowAboutScreen(false);
   };
 
-  if (showAboutScreen) {
-    const openLink = (url) => { const { Linking } = require('react-native'); Linking.openURL(url); };
-    const inWallet = onboardingStep === 0 && !!address;
-    const hcView = humanCheck.humanCheckView({ status: humanStatus, gate: humanGate, network, inWallet });
-    const onBetaCode = async () => {
-      // From the wallet: the invite-code box right there. At first launch: carry on
-      // with setup — the same box comes right after the seal (step 4).
-      if (hcView.beta && hcView.beta.action === 'focus-wallet-code') focusWalletCodeRef.current = true;
-      await closeAboutScreen();
-    };
-    // Sticky tap-to-jump chips → one per card (the y comes from each card's onLayout).
-    const ABOUT_CHIPS = [
-      ['human', '🛂 Human check'], ['what', 'What is this?'], ['who', 'Who made this?'],
-      ['safe', 'Is it safe?'], ['better', 'Builds it better?'], ['trust', 'Why trust it?'],
-    ];
-    const markY = (key) => (e) => { aboutY.current[key] = e.nativeEvent.layout.y; };
-    const jumpTo = (key) => {
-      const y = aboutY.current[key];
-      if (Number.isFinite(y) && aboutScrollRef.current) aboutScrollRef.current.scrollTo({ y: Math.max(0, y - aboutChipsH.current - 6), animated: true });
-    };
-
-    return (
-      // Pinned glass domain strip (as on the wallet) instead of the floating one,
-      // so the sticky jump-chips park right under it instead of beneath its text.
-      <ScreenWrapper domainBar={false}>
-      <SafeAreaView style={s.root}>
-        <DomainStrip />
+  // ── About + Human pieces (shared) ─────────────────────────────────────
+  // In the wallet, About and the 🛂 human check are two tabs. On the FIRST-LAUNCH
+  // About (no wallet yet, no tab bar) the human card sits inline under the chips.
+  const route = routeOf({ introActive: showIntroVideo && !IS_WEB, onboardingStep, showAboutScreen });
+  const aboutInline = route === 'about-first';
+  const openLink = (url) => { const { Linking } = require('react-native'); Linking.openURL(url); };
+  const inWallet = onboardingStep === 0 && !!address;
+  const hcView = humanCheck.humanCheckView({ status: humanStatus, gate: humanGate, network, inWallet });
+  const onBetaCode = async () => {
+    // From the wallet: the beta-code box right there (Wallet tab). At first launch:
+    // carry on with setup — the same box comes right after the seal (step 4).
+    if (hcView.beta && hcView.beta.action === 'focus-wallet-code') focusWalletCodeRef.current = true;
+    if (aboutInline) await closeAboutScreen(); else setMainTab('wallet');
+  };
+  const humanCard = (
+    <HumanCheckCard
+      view={hcView}
+      busy={humanBusy}
+      onVerify={verifyWithPassport}
+      onBetaCode={onBetaCode}
+      onRecheck={checkHumanStatus}
+    />
+  );
+  // Sticky tap-to-jump chips → one per card (the y comes from each card's onLayout).
+  const ABOUT_CHIPS = [
+    ['human', '🛂 Human check'], ['what', 'What is this?'], ['who', 'Who made this?'],
+    ['safe', 'Is it safe?'], ['better', 'Builds it better?'], ['trust', 'Why trust it?'],
+  ];
+  const markY = (key) => (e) => { aboutY.current[key] = e.nativeEvent.layout.y; };
+  const jumpTo = (key) => {
+    if (key === 'human' && !aboutInline) { setMainTab('human'); return; }   // its own tab in the wallet
+    const y = aboutY.current[key];
+    if (Number.isFinite(y) && aboutScrollRef.current) aboutScrollRef.current.scrollTo({ y: Math.max(0, y - aboutChipsH.current - 6), animated: true });
+  };
+  const aboutScroll = (
         <ScrollView ref={aboutScrollRef} stickyHeaderIndices={[1]} contentContainerStyle={[s.onboardScroll, { paddingBottom: 40 }]}>
 
           {/* Header — plain logo, no clock/ticks */}
@@ -2310,16 +2376,12 @@ function AppInner() {
 
           <GoldDivider width={width - 40} opacity={0.5} />
 
-          {/* ── 🛂 Prove you're human — status ✅/⏳ per network + Verify / beta code ── */}
-          <View onLayout={markY('human')} style={{ width: '100%' }}>
-            <HumanCheckCard
-              view={hcView}
-              busy={humanBusy}
-              onVerify={verifyWithPassport}
-              onBetaCode={onBetaCode}
-              onRecheck={checkHumanStatus}
-            />
-          </View>
+          {/* ── 🛂 Prove you're human — inline on the first-launch About; in the wallet it is the Human tab ── */}
+          {aboutInline && (
+            <View onLayout={markY('human')} style={{ width: '100%' }}>
+              {humanCard}
+            </View>
+          )}
 
           {/* ── Tile 1: What is this? ── */}
           <View onLayout={markY('what')} style={{ width: '100%' }}>
@@ -2411,16 +2473,27 @@ function AppInner() {
           {/* CTA */}
           <TouchableOpacity
             style={[s.btnGold, glassButton, { marginTop: 28, marginHorizontal: 24 }]}
-            onPress={closeAboutScreen}
+            onPress={aboutInline ? closeAboutScreen : () => setMainTab('wallet')}
           >
-            <Text style={s.btnText}>I UNDERSTAND — LET'S GO →</Text>
+            <Text style={s.btnText}>{aboutInline ? "I UNDERSTAND — LET'S GO →" : 'BACK TO WALLET →'}</Text>
           </TouchableOpacity>
 
           <Text style={{ color: '#5A3D1A', fontSize: 11, textAlign: 'center', marginTop: 14, letterSpacing: 0.3 }}>
-            You can always find this page again inside the app.
+            You can always find this page again in the About tab.
           </Text>
 
         </ScrollView>
+  );
+
+  // First-launch About (before any wallet). Not routed while the lock screen is due.
+  if (route === 'about-first') {
+    return (
+      // Pinned glass domain strip (as on the wallet) instead of the floating one,
+      // so the sticky jump-chips park right under it instead of beneath its text.
+      <ScreenWrapper domainBar={false}>
+      <SafeAreaView style={s.root}>
+        <DomainStrip />
+        {aboutScroll}
       </SafeAreaView>
       </ScreenWrapper>
     );
@@ -3094,6 +3167,7 @@ function AppInner() {
       <SafeAreaView style={s.root}>
         <ScrollView contentContainerStyle={s.onboardScroll}>
           <View style={s.onboardCenter}>
+            <BackButton label="Back to wallet" onPress={() => setOnboardingStep(0)} />
             <Text style={s.onboardTitle}>Back Up Your Wallet</Text>
             <Text style={s.onboardSub}>Your 24-word recovery phrase restores this wallet.</Text>
 
@@ -3164,6 +3238,7 @@ function AppInner() {
       <SafeAreaView style={s.root}>
         <KeyboardSafe contentContainerStyle={s.onboardScroll}>
           <View style={s.onboardCenter}>
+            <BackButton label={restoreBackLabel(restoreBackTarget(restoreReturnTo.current, isIgnitedRef.current))} onPress={leaveRestore} />
             <Text style={s.onboardTitle}>Restore Your Wallet</Text>
             <Text style={s.onboardSub}>Enter your 24-word recovery phrase (or your raw recovery key).</Text>
 
@@ -3199,8 +3274,8 @@ function AppInner() {
               </View>
             )}
 
-            <TouchableOpacity style={{ marginTop: 16, paddingVertical: 10 }} onPress={() => { setSeedInput(''); setRestorePreview(null); const back = restoreBackTarget(restoreReturnTo.current, isIgnitedRef.current); restoreReturnTo.current = null; setOnboardingStep(back); }}>
-              <Text style={{ color: '#888', textAlign: 'center' }}>← Cancel</Text>
+            <TouchableOpacity style={{ marginTop: 16, paddingVertical: 10 }} onPress={leaveRestore}>
+              <Text style={{ color: '#888', textAlign: 'center' }}>← {restoreBackLabel(restoreBackTarget(restoreReturnTo.current, isIgnitedRef.current))}</Text>
             </TouchableOpacity>
           </View>
         </KeyboardSafe>
@@ -3321,11 +3396,96 @@ function AppInner() {
         </SafeAreaView>
       </Modal>
 
+      {/* Sheets — mounted whatever tab is showing (a rename can start on the Ledger tab) */}
+        {/* CONTACTS — list / pick / rename / delete + manual add */}
+        <Modal visible={contactsVisible} animationType="slide" transparent onRequestClose={() => setContactsVisible(false)}>
+          <BuildTag />
+          <KeyboardSafe scroll={false}><SafeAreaView edges={['bottom']} style={s.contactsBackdrop}>
+            <View style={s.contactsSheet}>
+              <Text style={s.label}>📇 CONTACTS</Text>
+              <ScrollView style={{ maxHeight: 300 }}>
+                {contacts.length === 0
+                  ? <Text style={s.empty}>No saved contacts yet. Send to an address, then save it — or add one below.</Text>
+                  : contacts.map((c) => (
+                    <View key={c.address} style={s.contactRow}>
+                      <TouchableOpacity style={{ flex: 1 }} onPress={() => pickContact(c.address)}>
+                        <Text style={s.suggestNick}>{c.nickname}</Text>
+                        <Text style={s.suggestAddr} numberOfLines={1}>{c.address}</Text>
+                      </TouchableOpacity>
+                      <TouchableOpacity onPress={() => startEditContact(c)}><Text style={s.contactAction}>✏️</Text></TouchableOpacity>
+                      <TouchableOpacity onPress={() => deleteContact(c.address)}><Text style={s.contactAction}>🗑️</Text></TouchableOpacity>
+                    </View>
+                  ))}
+              </ScrollView>
+              <View style={s.contactAddForm}>
+                <TextInput style={[s.input, { marginBottom: 6 }]} placeholder="Nickname" placeholderTextColor="#5A3D1A" value={addNick} onChangeText={setAddNick} />
+                <TextInput style={[s.input, { marginBottom: 6 }]} placeholder="Seal mark (M_…)" placeholderTextColor="#5A3D1A" value={addAddr} onChangeText={setAddAddr} autoCapitalize="none" />
+                <TouchableOpacity style={s.btnLapis} onPress={addManualContact}><Text style={s.btnText}>＋ ADD CONTACT</Text></TouchableOpacity>
+              </View>
+              <TouchableOpacity style={[s.btnSage, { marginTop: 10 }]} onPress={() => setContactsVisible(false)}><Text style={s.btnText}>CLOSE</Text></TouchableOpacity>
+            </View>
+          </SafeAreaView></KeyboardSafe>
+        </Modal>
+
+        {/* UNLOCK METHOD — phone lock / app passcode / either (item 2) */}
+        <Modal visible={unlockSettingsVisible} animationType="slide" transparent onRequestClose={closeUnlockSettings}>
+          <BuildTag />
+          <KeyboardSafe scroll={false}><SafeAreaView edges={['bottom']} style={s.contactsBackdrop}>
+            <View style={s.contactsSheet}>
+              <Text style={s.label}>🔒 UNLOCK METHOD</Text>
+              {!settingsAuthed ? (
+                <>
+                  <Text style={[s.sublabel, { marginBottom: 12 }]}>Confirm it's you before changing how MONEY unlocks.</Text>
+                  {unlockMode !== 'passcode' ? (
+                    <TouchableOpacity style={s.btnLapis} onPress={settingsAuthWithPhone}><Text style={s.btnText}>CONFIRM WITH PHONE LOCK</Text></TouchableOpacity>
+                  ) : null}
+                  {unlockMode !== 'device' ? (
+                    <>
+                      <TextInput value={passcodeInput} onChangeText={(t) => setPasscodeInput(t.replace(/[^0-9]/g, ''))} placeholder="Current app passcode" placeholderTextColor="#5A3D1A" keyboardType="number-pad" secureTextEntry maxLength={12} style={[s.passcodeInput, { marginTop: 10 }]} />
+                      <TouchableOpacity disabled={passcodeInput.length < 6} style={[s.btnLapis, { marginTop: 8, opacity: passcodeInput.length < 6 ? 0.5 : 1 }]} onPress={() => tryPasscode(async () => setSettingsAuthed(true))}><Text style={s.btnText}>CONFIRM WITH APP PASSCODE</Text></TouchableOpacity>
+                    </>
+                  ) : null}
+                  {passcodeMsg ? <Text style={s.passcodeMsg}>{passcodeMsg}</Text> : null}
+                </>
+              ) : (
+                <>
+                  <TouchableOpacity onPress={() => chooseUnlockMode('device')} style={[s.modeRow, unlockMode === 'device' && s.modeRowOn]}><Text style={s.modeTitle}>{unlockMode === 'device' ? '● ' : '○ '}Phone lock only</Text><Text style={s.modeDesc}>Fingerprint, face, PIN, pattern or password — the strongest.</Text></TouchableOpacity>
+                  <TouchableOpacity onPress={() => chooseUnlockMode('passcode')} style={[s.modeRow, unlockMode === 'passcode' && s.modeRowOn]}><Text style={s.modeTitle}>{unlockMode === 'passcode' ? '● ' : '○ '}App passcode only</Text><Text style={s.modeDesc}>Needs your 24-word backup first.</Text></TouchableOpacity>
+                  <TouchableOpacity onPress={() => chooseUnlockMode('either')} style={[s.modeRow, unlockMode === 'either' && s.modeRowOn]}><Text style={s.modeTitle}>{unlockMode === 'either' ? '● ' : '○ '}Phone lock OR app passcode</Text><Text style={s.modeDesc}>The passcode is a backup if the phone lock fails.</Text></TouchableOpacity>
+                  <Text style={[s.label, { marginTop: 14 }]}>{hasAppPasscode ? 'CHANGE APP PASSCODE' : 'CREATE APP PASSCODE'}</Text>
+                  <TextInput value={newPass1} onChangeText={(t) => setNewPass1(t.replace(/[^0-9]/g, ''))} placeholder="New passcode (6–12 digits)" placeholderTextColor="#5A3D1A" keyboardType="number-pad" secureTextEntry maxLength={12} style={s.passcodeInput} />
+                  <TextInput value={newPass2} onChangeText={(t) => setNewPass2(t.replace(/[^0-9]/g, ''))} placeholder="Repeat it" placeholderTextColor="#5A3D1A" keyboardType="number-pad" secureTextEntry maxLength={12} style={[s.passcodeInput, { marginTop: 8 }]} />
+                  <TouchableOpacity style={[s.btnLapis, { marginTop: 8 }]} onPress={saveAppPasscode}><Text style={s.btnText}>SAVE PASSCODE</Text></TouchableOpacity>
+                  <Text style={[s.modeDesc, { marginTop: 10 }]}>Honest note: a 6-digit app passcode is weaker than your phone lock — the phone lock is protected by secure hardware, the passcode only by this app. Forgot it? Only your 24 words get you back in.</Text>
+                </>
+              )}
+              {settingsMsg ? <Text style={[s.passcodeMsg, { color: '#C4956A' }]}>{settingsMsg}</Text> : null}
+              <TouchableOpacity style={[s.btnSage, { marginTop: 12 }]} onPress={closeUnlockSettings}><Text style={s.btnText}>CLOSE</Text></TouchableOpacity>
+            </View>
+          </SafeAreaView></KeyboardSafe>
+        </Modal>
+
+        {/* SAVE / RENAME a contact */}
+        <Modal visible={saveContactAddr !== null} animationType="fade" transparent onRequestClose={() => { setSaveContactAddr(null); setEditContactAddr(null); }}>
+          <BuildTag />
+          <KeyboardSafe scroll={false}><SafeAreaView edges={['bottom']} style={s.contactsBackdrop}>
+            <View style={s.contactsSheet}>
+              <Text style={s.label}>{editContactAddr ? '✏️ RENAME CONTACT' : '＋ SAVE CONTACT'}</Text>
+              <Text style={[s.suggestAddr, { marginBottom: 10 }]} numberOfLines={1}>{saveContactAddr}</Text>
+              <TextInput style={s.input} placeholder="Nickname" placeholderTextColor="#5A3D1A" value={contactNick} onChangeText={setContactNick} autoFocus />
+              <View style={{ flexDirection: 'row', gap: 12 }}>
+                <TouchableOpacity style={[s.btnSage, { flex: 1 }]} onPress={() => { setSaveContactAddr(null); setEditContactAddr(null); }}><Text style={s.btnText}>SKIP</Text></TouchableOpacity>
+                <TouchableOpacity style={[s.btnLapis, { flex: 1 }]} onPress={submitSaveContact}><Text style={s.btnText}>SAVE</Text></TouchableOpacity>
+              </View>
+            </View>
+          </SafeAreaView></KeyboardSafe>
+        </Modal>
+
       {/* Pinned domain bar — stays at the top while the wallet scrolls (Oct 8, B1) */}
       <DomainStrip />
 
-      {/* KeyboardSafe (items 6 + 8) + pull-to-refresh (item 9) */}
-      <KeyboardSafe
+      {/* Wallet tab */}
+      <View style={[s.pane, mainTab !== 'wallet' && s.paneHidden]}><KeyboardSafe
         contentContainerStyle={s.scroll}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor="#D4AF37" colors={['#D4AF37']} progressBackgroundColor="#1A0E04" />}>
         {/* TESTNET BANNER — unmistakable, only rendered on testnet, nothing shown on mainnet */}
@@ -3535,94 +3695,10 @@ function AppInner() {
           </AnimatedPress>
         </View>
 
-        {/* CONTACTS — list / pick / rename / delete + manual add */}
-        <Modal visible={contactsVisible} animationType="slide" transparent onRequestClose={() => setContactsVisible(false)}>
-          <BuildTag />
-          <KeyboardSafe scroll={false}><SafeAreaView edges={['bottom']} style={s.contactsBackdrop}>
-            <View style={s.contactsSheet}>
-              <Text style={s.label}>📇 CONTACTS</Text>
-              <ScrollView style={{ maxHeight: 300 }}>
-                {contacts.length === 0
-                  ? <Text style={s.empty}>No saved contacts yet. Send to an address, then save it — or add one below.</Text>
-                  : contacts.map((c) => (
-                    <View key={c.address} style={s.contactRow}>
-                      <TouchableOpacity style={{ flex: 1 }} onPress={() => pickContact(c.address)}>
-                        <Text style={s.suggestNick}>{c.nickname}</Text>
-                        <Text style={s.suggestAddr} numberOfLines={1}>{c.address}</Text>
-                      </TouchableOpacity>
-                      <TouchableOpacity onPress={() => startEditContact(c)}><Text style={s.contactAction}>✏️</Text></TouchableOpacity>
-                      <TouchableOpacity onPress={() => deleteContact(c.address)}><Text style={s.contactAction}>🗑️</Text></TouchableOpacity>
-                    </View>
-                  ))}
-              </ScrollView>
-              <View style={s.contactAddForm}>
-                <TextInput style={[s.input, { marginBottom: 6 }]} placeholder="Nickname" placeholderTextColor="#5A3D1A" value={addNick} onChangeText={setAddNick} />
-                <TextInput style={[s.input, { marginBottom: 6 }]} placeholder="Seal mark (M_…)" placeholderTextColor="#5A3D1A" value={addAddr} onChangeText={setAddAddr} autoCapitalize="none" />
-                <TouchableOpacity style={s.btnLapis} onPress={addManualContact}><Text style={s.btnText}>＋ ADD CONTACT</Text></TouchableOpacity>
-              </View>
-              <TouchableOpacity style={[s.btnSage, { marginTop: 10 }]} onPress={() => setContactsVisible(false)}><Text style={s.btnText}>CLOSE</Text></TouchableOpacity>
-            </View>
-          </SafeAreaView></KeyboardSafe>
-        </Modal>
-
-        {/* UNLOCK METHOD — phone lock / app passcode / either (item 2) */}
-        <Modal visible={unlockSettingsVisible} animationType="slide" transparent onRequestClose={closeUnlockSettings}>
-          <BuildTag />
-          <KeyboardSafe scroll={false}><SafeAreaView edges={['bottom']} style={s.contactsBackdrop}>
-            <View style={s.contactsSheet}>
-              <Text style={s.label}>🔒 UNLOCK METHOD</Text>
-              {!settingsAuthed ? (
-                <>
-                  <Text style={[s.sublabel, { marginBottom: 12 }]}>Confirm it's you before changing how MONEY unlocks.</Text>
-                  {unlockMode !== 'passcode' ? (
-                    <TouchableOpacity style={s.btnLapis} onPress={settingsAuthWithPhone}><Text style={s.btnText}>CONFIRM WITH PHONE LOCK</Text></TouchableOpacity>
-                  ) : null}
-                  {unlockMode !== 'device' ? (
-                    <>
-                      <TextInput value={passcodeInput} onChangeText={(t) => setPasscodeInput(t.replace(/[^0-9]/g, ''))} placeholder="Current app passcode" placeholderTextColor="#5A3D1A" keyboardType="number-pad" secureTextEntry maxLength={12} style={[s.passcodeInput, { marginTop: 10 }]} />
-                      <TouchableOpacity disabled={passcodeInput.length < 6} style={[s.btnLapis, { marginTop: 8, opacity: passcodeInput.length < 6 ? 0.5 : 1 }]} onPress={() => tryPasscode(async () => setSettingsAuthed(true))}><Text style={s.btnText}>CONFIRM WITH APP PASSCODE</Text></TouchableOpacity>
-                    </>
-                  ) : null}
-                  {passcodeMsg ? <Text style={s.passcodeMsg}>{passcodeMsg}</Text> : null}
-                </>
-              ) : (
-                <>
-                  <TouchableOpacity onPress={() => chooseUnlockMode('device')} style={[s.modeRow, unlockMode === 'device' && s.modeRowOn]}><Text style={s.modeTitle}>{unlockMode === 'device' ? '● ' : '○ '}Phone lock only</Text><Text style={s.modeDesc}>Fingerprint, face, PIN, pattern or password — the strongest.</Text></TouchableOpacity>
-                  <TouchableOpacity onPress={() => chooseUnlockMode('passcode')} style={[s.modeRow, unlockMode === 'passcode' && s.modeRowOn]}><Text style={s.modeTitle}>{unlockMode === 'passcode' ? '● ' : '○ '}App passcode only</Text><Text style={s.modeDesc}>Needs your 24-word backup first.</Text></TouchableOpacity>
-                  <TouchableOpacity onPress={() => chooseUnlockMode('either')} style={[s.modeRow, unlockMode === 'either' && s.modeRowOn]}><Text style={s.modeTitle}>{unlockMode === 'either' ? '● ' : '○ '}Phone lock OR app passcode</Text><Text style={s.modeDesc}>The passcode is a backup if the phone lock fails.</Text></TouchableOpacity>
-                  <Text style={[s.label, { marginTop: 14 }]}>{hasAppPasscode ? 'CHANGE APP PASSCODE' : 'CREATE APP PASSCODE'}</Text>
-                  <TextInput value={newPass1} onChangeText={(t) => setNewPass1(t.replace(/[^0-9]/g, ''))} placeholder="New passcode (6–12 digits)" placeholderTextColor="#5A3D1A" keyboardType="number-pad" secureTextEntry maxLength={12} style={s.passcodeInput} />
-                  <TextInput value={newPass2} onChangeText={(t) => setNewPass2(t.replace(/[^0-9]/g, ''))} placeholder="Repeat it" placeholderTextColor="#5A3D1A" keyboardType="number-pad" secureTextEntry maxLength={12} style={[s.passcodeInput, { marginTop: 8 }]} />
-                  <TouchableOpacity style={[s.btnLapis, { marginTop: 8 }]} onPress={saveAppPasscode}><Text style={s.btnText}>SAVE PASSCODE</Text></TouchableOpacity>
-                  <Text style={[s.modeDesc, { marginTop: 10 }]}>Honest note: a 6-digit app passcode is weaker than your phone lock — the phone lock is protected by secure hardware, the passcode only by this app. Forgot it? Only your 24 words get you back in.</Text>
-                </>
-              )}
-              {settingsMsg ? <Text style={[s.passcodeMsg, { color: '#C4956A' }]}>{settingsMsg}</Text> : null}
-              <TouchableOpacity style={[s.btnSage, { marginTop: 12 }]} onPress={closeUnlockSettings}><Text style={s.btnText}>CLOSE</Text></TouchableOpacity>
-            </View>
-          </SafeAreaView></KeyboardSafe>
-        </Modal>
-
-        {/* SAVE / RENAME a contact */}
-        <Modal visible={saveContactAddr !== null} animationType="fade" transparent onRequestClose={() => { setSaveContactAddr(null); setEditContactAddr(null); }}>
-          <BuildTag />
-          <KeyboardSafe scroll={false}><SafeAreaView edges={['bottom']} style={s.contactsBackdrop}>
-            <View style={s.contactsSheet}>
-              <Text style={s.label}>{editContactAddr ? '✏️ RENAME CONTACT' : '＋ SAVE CONTACT'}</Text>
-              <Text style={[s.suggestAddr, { marginBottom: 10 }]} numberOfLines={1}>{saveContactAddr}</Text>
-              <TextInput style={s.input} placeholder="Nickname" placeholderTextColor="#5A3D1A" value={contactNick} onChangeText={setContactNick} autoFocus />
-              <View style={{ flexDirection: 'row', gap: 12 }}>
-                <TouchableOpacity style={[s.btnSage, { flex: 1 }]} onPress={() => { setSaveContactAddr(null); setEditContactAddr(null); }}><Text style={s.btnText}>SKIP</Text></TouchableOpacity>
-                <TouchableOpacity style={[s.btnLapis, { flex: 1 }]} onPress={submitSaveContact}><Text style={s.btnText}>SAVE</Text></TouchableOpacity>
-              </View>
-            </View>
-          </SafeAreaView></KeyboardSafe>
-        </Modal>
-
         {/* About MONEY link */}
         <TouchableOpacity
           style={{ alignItems: 'center', paddingVertical: 10, marginBottom: 4 }}
-          onPress={() => setShowAboutScreen(true)}
+          onPress={() => setMainTab('about')}
         >
           <Text style={{ color: '#5A3D1A', fontSize: 12, letterSpacing: 1 }}>WHAT IS MONEY? →</Text>
         </TouchableOpacity>
@@ -3641,6 +3717,13 @@ function AppInner() {
           <Text style={{ color: '#9A7B4A', fontSize: 12, letterSpacing: 1 }}>🔒 UNLOCK: {unlockMode === 'device' ? 'PHONE LOCK' : unlockMode === 'passcode' ? 'APP PASSCODE' : 'PHONE LOCK OR PASSCODE'} ›</Text>
         </TouchableOpacity>
 
+        {/* Build footer — which binary + commit is running (tester screenshots) */}
+        <Text style={s.versionFooter}>MONEY v{APP_VERSION} · build {APP_BUILD} · {GIT_COMMIT}</Text>
+      </KeyboardSafe></View>
+
+      {/* Ledger tab — the public record, with its own pull-to-refresh */}
+      <View style={[s.pane, mainTab !== 'ledger' && s.paneHidden]}>
+        <ScrollView contentContainerStyle={s.scroll} refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor="#D4AF37" colors={['#D4AF37']} progressBackgroundColor="#1A0E04" />}>
         {/* CLAY TABLETS (ledger) */}
         <View style={s.section}>
           <Text style={s.label}>THE CLAY TABLETS — PUBLIC RECORD</Text>
@@ -3678,9 +3761,51 @@ function AppInner() {
               </View>
             ))}
         </View>
-        {/* Build footer — which binary + commit is running (tester screenshots) */}
-        <Text style={s.versionFooter}>MONEY v{APP_VERSION} · build {APP_BUILD} · {GIT_COMMIT}</Text>
-      </KeyboardSafe>
+        </ScrollView>
+      </View>
+
+      {/* Contacts tab — same list / rename / delete / add as the pick-a-recipient sheet */}
+      <View style={[s.pane, mainTab !== 'contacts' && s.paneHidden]}>
+        <KeyboardSafe contentContainerStyle={s.scroll}>
+          <View style={[s.card, glassCard, { marginTop: 14 }]}>
+            <Text style={s.label}>📇 CONTACTS</Text>
+            {contacts.length === 0
+              ? <Text style={s.empty}>No saved contacts yet. Send to an address, then save it — or add one below.</Text>
+              : contacts.map((c) => (
+                <View key={c.address} style={s.contactRow}>
+                  <TouchableOpacity style={{ flex: 1 }} onPress={() => { setRecipient(c.address); setMainTab('wallet'); }}>
+                    <Text style={s.suggestNick}>{c.nickname}</Text>
+                    <Text style={s.suggestAddr} numberOfLines={1}>{c.address}</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity onPress={() => startEditContact(c)}><Text style={s.contactAction}>✏️</Text></TouchableOpacity>
+                  <TouchableOpacity onPress={() => deleteContact(c.address)}><Text style={s.contactAction}>🗑️</Text></TouchableOpacity>
+                </View>
+              ))}
+            <View style={s.contactAddForm}>
+              <TextInput style={[s.input, { marginBottom: 6 }]} placeholder="Nickname" placeholderTextColor="#5A3D1A" value={addNick} onChangeText={setAddNick} />
+              <TextInput style={[s.input, { marginBottom: 6 }]} placeholder="Seal mark (M_…)" placeholderTextColor="#5A3D1A" value={addAddr} onChangeText={setAddAddr} autoCapitalize="none" />
+              <TouchableOpacity style={s.btnLapis} onPress={addManualContact}><Text style={s.btnText}>＋ ADD CONTACT</Text></TouchableOpacity>
+            </View>
+          </View>
+        </KeyboardSafe>
+      </View>
+
+      {/* Human tab — 🛂 Prove you're human */}
+      {/* (Human and About mount only while showing — nothing to keep, and the animated
+          tiles start fresh each visit.) */}
+      {mainTab === 'human' && (
+        <View style={s.pane}>
+          <ScrollView contentContainerStyle={[s.scroll, { paddingTop: 8, paddingHorizontal: 12 }]}>
+            {humanCard}
+          </ScrollView>
+        </View>
+      )}
+
+      {/* About tab */}
+      {mainTab === 'about' && <View style={s.pane}>{aboutScroll}</View>}
+
+      {/* Bottom tab bar — only on the wallet route; never on lock / onboarding / backup / restore */}
+      <TabBar model={tabBarModel({ route, mainTab, keyboardOpen })} onSelect={setMainTab} />
     </SafeAreaView>
     </ScreenWrapper>
   );
@@ -4167,6 +4292,17 @@ const s = StyleSheet.create({
   nodeDot:    { width: 10, height: 10, borderRadius: 5, backgroundColor: '#7DB87A', marginRight: 12 },
   nodeTitle:  { fontSize: 12, fontWeight: 'bold', letterSpacing: 1.5 },
   nodeSub:    { fontSize: 12, lineHeight: 16, marginTop: 2 },
+  // Bottom tab bar + panes + Back button (human-check job)
+  pane:       { flex: 1 },
+  paneHidden: { display: 'none' },
+  tabBar:     { flexDirection: 'row', backgroundColor: 'rgba(14,8,2,0.94)', borderTopWidth: 1, borderTopColor: 'rgba(212,175,55,0.35)' },
+  tabItem:    { flex: 1, alignItems: 'center', justifyContent: 'center', paddingTop: 7, paddingBottom: 6, borderTopWidth: 2, borderTopColor: 'transparent' },
+  tabItemActive: { borderTopColor: '#D4AF37', backgroundColor: 'rgba(90,55,10,0.45)' },
+  tabIcon:    { fontSize: 19 },
+  tabLabel:   { color: '#8B7355', fontSize: 10, letterSpacing: 0.6, marginTop: 2, fontWeight: '600' },
+  tabLabelActive: { color: '#F1D98A' },
+  backBtn:    { alignSelf: 'flex-start', marginBottom: 14, paddingVertical: 10, paddingHorizontal: 16, borderRadius: 14, borderWidth: 1.5, borderColor: 'rgba(212,175,55,0.5)', backgroundColor: 'rgba(90,55,10,0.55)' },
+  backBtnText:{ color: '#F5E6C8', fontSize: 14, fontWeight: 'bold', letterSpacing: 0.8 },
   // About: sticky jump-chips + 🛂 human-check card
   chipBar:   { paddingVertical: 8, backgroundColor: 'rgba(14,8,2,0.92)', borderBottomWidth: 1, borderBottomColor: 'rgba(212,175,55,0.28)' },
   chip:      { marginHorizontal: 4, paddingVertical: 7, paddingHorizontal: 12, borderRadius: 16, borderWidth: 1, borderColor: 'rgba(212,175,55,0.35)', backgroundColor: 'rgba(28,17,4,0.85)' },

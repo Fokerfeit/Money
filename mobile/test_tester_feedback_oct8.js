@@ -74,7 +74,7 @@ const HOLO = fs.readFileSync(path.join(__dirname, 'HoloFX.js'), 'utf8').replace(
     // (human-check job: the About screen pins the same strip, so its sticky jump-chips
     //  park under it — still exactly these two screens, every other screen unchanged)
     check((stripped.match(/<ScreenWrapper domainBar=\{false\}>/g) || []).length === 2 && /<ScreenWrapper domainBar=\{false\}>\n {4}<SafeAreaView style=\{s\.root\}>\n {6}<GlowOrbs \/>/.test(SRC)
-      && /<ScreenWrapper domainBar=\{false\}>\n {6}<SafeAreaView style=\{s\.root\}>\n {8}<DomainStrip \/>\n {8}<ScrollView ref=\{aboutScrollRef\}/.test(SRC),
+      && /<ScreenWrapper domainBar=\{false\}>\n {6}<SafeAreaView style=\{s\.root\}>\n {8}<DomainStrip \/>\n {8}\{aboutScroll\}/.test(SRC),
       'only the wallet + About screens swap the floating domain text for the pinned strip (every other screen unchanged)');
     const iStrip = SRC.indexOf('<DomainStrip />', SRC.indexOf('<GlowOrbs />\n')), iKS = SRC.indexOf('<KeyboardSafe', iStrip);
     check(iStrip > 0 && iKS > iStrip && SRC.slice(iStrip, iKS).split('\n').length < 6, 'DomainStrip sits in the layout ABOVE the scroll view → pinned while the wallet scrolls, content never under its text');

@@ -97,10 +97,10 @@ console.log('  (1) human_check.js — executed');
 
 // ── (2) APP WIRING ─────────────────────────────────────────────────────────
 console.log('\n  (2) App.js wiring');
-const ABOUT = between('  if (showAboutScreen) {', '  // ── Step 99: Seal Lock');
+const ABOUT = between('  // ── About + Human pieces (shared)', '  // ── Step 99: Seal Lock');
 {
   check(ABOUT.length > 1000, 'About screen found');
-  const iCard = ABOUT.indexOf('<HumanCheckCard'), iT1 = ABOUT.indexOf('Tile 1: What is this?'), iChips = ABOUT.indexOf('s.chipBar');
+  const iCard = ABOUT.indexOf('{aboutInline && ('), iT1 = ABOUT.indexOf('Tile 1: What is this?'), iChips = ABOUT.indexOf('s.chipBar');
   check(iChips > 0 && iCard > iChips && iCard < iT1, 'order: header → sticky chips → 🛂 card → tile 1 (card near the top)');
   check(/stickyHeaderIndices=\{\[1\]\}/.test(ABOUT) && /\{\/\* Sticky jump-chips/.test(ABOUT), 'chips are child 1 of the About ScrollView = sticky');
   // child index 1 really is the chip bar: count direct children before it
@@ -110,14 +110,14 @@ const ABOUT = between('  if (showAboutScreen) {', '  // ── Step 99: Seal Loc
   const marks = [...ABOUT.matchAll(/markY\('(\w+)'\)/g)].map((x) => x[1]);
   check(keys.length === 6 && keys.every((k) => marks.includes(k)) && marks.length === keys.length, `every chip jumps to a card that exists (${keys.join(', ')})`);
   check(/scrollTo\(\{ y: Math\.max\(0, y - aboutChipsH\.current - 6\)/.test(ABOUT), 'jump lands the card just under the sticky bar');
-  check(/<ScreenWrapper domainBar=\{false\}>\s*\n\s*<SafeAreaView style=\{s\.root\}>\s*\n\s*<DomainStrip \/>\s*\n\s*<ScrollView ref=\{aboutScrollRef\}/.test(ABOUT.replace(/\r\n/g, '\n')),
+  check(/<ScreenWrapper domainBar=\{false\}>\s*\n\s*<SafeAreaView style=\{s\.root\}>\s*\n\s*<DomainStrip \/>\s*\n\s*\{aboutScroll\}/.test(ABOUT.replace(/\r\n/g, '\n')),
     'About: floating domain label off, pinned DomainStrip above the scroll (chips never park under its text)');
   check(/aboutScrollRef = useRef/.test(SRC) && SRC.indexOf('const aboutY = useRef') < SRC.indexOf('  if (showIntroVideo && !IS_WEB) {'), 'all new hooks sit before the first conditional screen (hook order safe)');
 
   // beta code → EXISTING field / flow
   check(/ref=\{walletCodeInputRef\}\s*\n\s*value=\{ignitionCode\}/.test(SRC), 'wallet\'s existing invite-code box gets the focus ref');
   check((SRC.match(/value=\{ignitionCode\}/g) || []).length === 2, 'still exactly the two existing invite-code boxes — no new code field');
-  check(/focusWalletCodeRef\.current = true;\s*\n\s*await closeAboutScreen\(\)/.test(ABOUT), 'beta code: close About, then focus the wallet box (first launch: setup continues to step 4)');
+  check(/focusWalletCodeRef\.current = true;\s*\n\s*if \(aboutInline\) await closeAboutScreen\(\); else setMainTab\('wallet'\);/.test(ABOUT), 'beta code: from the wallet → Wallet tab + focus the code box; first launch → close About, setup continues to step 4');
 
   // NO new mint logic
   const HC = between('// ── 🛂 Human check (About card)', '// (claim() reuses the restore guard');
@@ -129,7 +129,7 @@ const ABOUT = between('  if (showAboutScreen) {', '  // ── Step 99: Seal Loc
   check(/if \(!humanCheck\.isSelfLink\(j && j\.link\)\)[\s\S]*?return Alert[\s\S]*?Linking\.openURL\(j\.link\)/.test(HC), 'Verify opens the link ONLY after isSelfLink() passes');
   check(/confirmAsync\([\s\S]*?humanCheck\.TEXT\.privacy[\s\S]*?'Open Self'/.test(HC), 'Verify asks first, showing the privacy text + wallet');
   check(/getNetwork\(\) !== net \|\| addrRef\.current !== wallet/.test(HC), 'network/wallet change during the prompt → nothing opened');
-  check(/if \(!showAboutScreen\) return undefined;\s*\n\s*checkHumanStatus\(\);[\s\S]*?next === 'active'\) checkHumanStatus\(\)/.test(HC), 'status re-checked when About opens and when the user returns from Self');
+  check(/if \(!showAboutScreen && !\(onboardingStep === 0 && mainTab === 'human'\)\) return undefined;\s*\n\s*checkHumanStatus\(\);[\s\S]*?next === 'active'\) checkHumanStatus\(\)/.test(HC), 'status re-checked when the Human tab / first-launch About opens and when the user returns from Self');
   const CARD = between('const HumanCheckCard =', '// ── PhoneNodeStatus');
   check(CARD.length > 200 && !/fetch\(|AsyncStorage|SecureStore/.test(CARD), 'card component is display-only (no fetch / storage)');
   check(/disabled=\{!view\.verify\.enabled\}/.test(CARD), 'Verify button is truly disabled when OFF (not just dimmed)');
